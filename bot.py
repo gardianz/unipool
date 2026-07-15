@@ -341,6 +341,8 @@ async def on_address(update: Update, _):
                         "amount_pct": s["amount_pct"], "amount_fixed": s["amount_fixed"],
                         "gap": int(s.get("gap", 1)), "vol": None, "rec": None}
         label = f"{i}. [v3] {p['quote_sym']} {p['fee'] / 10000:.2f}% · {ch.fmt_usd(p['tvl_usd'])}"
+        if p.get("apr_pct"):
+            label += f" · APR {p['apr_pct']:,.0f}%"
         buttons.append([InlineKeyboardButton(label, callback_data=f"pool|{key}")])
     buttons.append([InlineKeyboardButton("✖ Cancel", callback_data="cancel")])
     await edit(status,
@@ -508,7 +510,12 @@ def build_preview(ctx_data: dict) -> str:
         strat_desc = f"+{ctx_data['up_pct']:g}%"
 
     vol = ctx_data["vol"]
-    vol_txt = f"vol 24j ≈ {vol:.0f}%" if vol is not None else "vol 24j: ? (oracle kosong)"
+    if p.get("vol24_usd") is not None:
+        vol_txt = f"vol 24j {ch.fmt_usd(p['vol24_usd'])}"
+        if p.get("apr_pct"):
+            vol_txt += f" · APR pool ~{p['apr_pct']:,.0f}%"
+    else:
+        vol_txt = f"vol 24j ≈ {vol:.0f}%" if vol is not None else "vol 24j: ?"
     rec = ctx_data["rec"]
 
     return (
@@ -675,6 +682,25 @@ async def handle_awaiting(update: Update) -> bool:
     st = AWAITING.get(chat_id)
     if not st:
         return False
+    if st["kind"] == "addamt":
+        text = (update.message.text or "").strip()
+        try:
+            t = text.replace("%", " %").split()
+            val = float(t[0].replace(",", "."))
+            is_pct = "%" in text
+        except (ValueError, IndexError):
+            await reply(update, "❌ Format tidak valid. Contoh: <code>0.005</code> atau <code>30%</code>")
+            return True
+        AWAITING.pop(chat_id, None)
+        tid = int(st["key"])
+        desc = f"{val:g}% saldo" if is_pct else f"{val:g} quote"
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"✅ Tambah {desc} ke #{tid}",
+                                  callback_data=f"addok|{tid}|{val}|{'p' if is_pct else 'f'}")],
+            [InlineKeyboardButton("❌ Cancel", callback_data="cancel")],
+        ])
+        await reply(update, f"Konfirmasi tambah dana ke posisi #{tid}:", kb)
+        return True
     key = st["key"]
     ctx = PENDING.get(key)
     if not ctx:
@@ -847,19 +873,32 @@ async def cmd_list(update: Update, _, status_msg=None):
         age = store.fmt_age(store.mint_ts(cid, p["token_id"]))
         in_out = "🟢 IN" if p["in_range"] else "🔴 OUT"
         dep = store.mint_usd(cid, p["token_id"])
+        claimed = store.fees_claimed_usd(cid, p["token_id"])
         cur_total = p["value_usd"] + p["unclaimed_usd"]
         if dep:
-            d = cur_total - dep
+            d = cur_total + claimed - dep
             pos_pnl = f"PnL: {'+' if d >= 0 else '−'}${abs(d):.2f} ({d / dep * 100:+.1f}%)"
         else:
             pos_pnl = "PnL: ? (mint di luar bot)"
+        # APR riil posisi: fee (unclaimed + terklaim) vs modal vs umur
+        apr_txt = ""
+        mts = store.mint_ts(cid, p["token_id"])
+        if dep and mts:
+            age_days = max((int(time.time()) - mts) / 86400, 0.01)
+            apr = (p["unclaimed_usd"] + claimed) / dep / age_days * 365 * 100
+            apr_txt = f" | APR ~{apr:,.0f}%"
         lines.append(
             f"<b>{esc(meme_sym)}</b> #{p['token_id']} | Age: {age} | Val: {ch.fmt_usd(p['value_usd'])} | "
-            f"Unclaimed: {ch.fmt_usd(p['unclaimed_usd'])} | {pos_pnl} | {in_out} | Range: {esc(range_str(p))}")
+            f"Unclaimed: {ch.fmt_usd(p['unclaimed_usd'])} | {pos_pnl}{apr_txt} | {in_out} | "
+            f"Range: {esc(range_str(p))}")
         lines.append(ch.pos_link(cid, p["token_id"]))
         lines.append("")
         buttons.append([
             InlineKeyboardButton(f"📈 Chart #{p['token_id']}", callback_data=f"chart|{p['token_id']}"),
+            InlineKeyboardButton(f"➕ Add #{p['token_id']}", callback_data=f"add|{p['token_id']}"),
+        ])
+        buttons.append([
+            InlineKeyboardButton(f"➖ Reduce #{p['token_id']}", callback_data=f"red|{p['token_id']}"),
             InlineKeyboardButton(f"🗑 Close {meme_sym} #{p['token_id']}", callback_data=f"close|{p['token_id']}"),
         ])
     buttons.insert(0, [InlineKeyboardButton("🔄 Refresh", callback_data="refresh")])
@@ -996,6 +1035,98 @@ async def do_chart(update: Update, token_id: int):
         f"<i>link pertama = server lokal bot, buka di browser PC ini</i>"))
 
 
+# ---------- Add / Reduce flow ----------
+async def ask_add(update: Update, token_id: int):
+    s = store.load_settings()
+    qsym = ch.CHAINS[s["chain"]]["wrapped_symbol"]
+    await update.effective_chat.send_message(
+        (f"➕ <b>Balas pesan ini</b> dengan jumlah dana untuk ditambah ke #{token_id}:\n"
+         f"· nilai pasti: <code>0.005</code> (satuan quote posisi, umumnya {esc(qsym)})\n"
+         f"· persen saldo: <code>30%</code>\n\n"
+         f"<i>Komposisi quote/meme dihitung otomatis mengikuti range posisi; "
+         f"meme existing di wallet dipakai duluan.</i>"),
+        parse_mode=ParseMode.HTML,
+        reply_markup=ForceReply(selective=True, input_field_placeholder="contoh: 0.005 atau 30%"))
+    AWAITING[update.effective_chat.id] = {"kind": "addamt", "key": str(token_id)}
+
+
+async def do_add_exec(update: Update, token_id: int, val: float, is_pct: bool):
+    s = store.load_settings()
+    cid = s["chain"]
+    status = await reply(update, f"⏳ Menambah dana ke #{token_id}...")
+
+    def work():
+        budget = val
+        if is_pct:
+            w3 = ch.get_w3(cid)
+            cfg = ch.CHAINS[cid]
+            npm = w3.eth.contract(address=ch.Web3.to_checksum_address(cfg["npm"]), abi=ch.NPM_ABI)
+            pos = npm.functions.positions(token_id).call()
+            quotes_lc = {a.lower() for a in cfg["quotes"].values()}
+            quote = pos[3] if pos[3].lower() in quotes_lc else pos[2]
+            qc = ch.erc20(w3, quote)
+            bal = qc.functions.balanceOf(wallet_address()).call()
+            if quote.lower() == cfg["wrapped"].lower():
+                bal += max(0, w3.eth.get_balance(wallet_address()) - int(0.0005e18))
+            budget = (bal * val / 100) / 10 ** qc.functions.decimals().call()
+        return ch.increase_position(cid, pk(), token_id, budget, s["slippage_pct"])
+
+    async with TX_LOCK:
+        try:
+            r = await asyncio.to_thread(work)
+        except Exception as e:
+            await edit(status, f"❌ Add gagal: {esc(e)}")
+            return
+    store.record_event(cid, "mint", token_id, r["added_usd"], "add", wallet=wallet_address())
+    lines = [f"✅ <b>Added #{token_id}</b> (~{ch.fmt_usd(r['added_usd'])})"]
+    for label, h in r["steps"]:
+        lines.append(f"{label}: {ch.tx_link(cid, h)}")
+    lines.append(ch.pos_link(cid, token_id))
+    await edit(status, "\n".join(lines))
+
+
+async def ask_reduce(update: Update, token_id: int):
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"➖ {pct}%", callback_data=f"redok|{token_id}|{pct}")
+         for pct in (25, 50, 75)],
+        [InlineKeyboardButton("❌ Cancel", callback_data="cancel")],
+    ])
+    await reply(update, (
+        f"➖ <b>Kurangi posisi #{token_id}?</b>\n"
+        f"Pilih persentase yang ditarik. Fee unclaimed ikut terambil.\n"
+        f"<i>Token hasil penarikan tetap di wallet (tanpa auto-swap). "
+        f"Untuk 100% pakai tombol Close.</i>"), kb)
+
+
+async def do_reduce_exec(update: Update, token_id: int, pct: int):
+    s = store.load_settings()
+    cid = s["chain"]
+
+    def snapshot():
+        return next((p for p in ch.list_positions(cid, pk()) if p["token_id"] == token_id), None)
+
+    pos = await asyncio.to_thread(snapshot)
+    status = await reply(update, f"⏳ Menarik {pct}% dari #{token_id}...")
+    async with TX_LOCK:
+        try:
+            r = await asyncio.to_thread(ch.decrease_position, cid, pk(), token_id, pct)
+        except Exception as e:
+            await edit(status, f"❌ Reduce gagal: {esc(e)}")
+            return
+    if pos:
+        store.record_event(cid, "close", token_id, pos["value_usd"] * pct / 100,
+                           f"reduce {pct}%", wallet=wallet_address())
+        if pos["unclaimed_usd"] > 0:
+            store.record_event(cid, "fees", token_id, pos["unclaimed_usd"], wallet=wallet_address())
+    lines = [f"✅ <b>Reduced #{token_id} −{pct}%</b>",
+             f"Received ~{ch.fmt_amount(r['got0'])} {esc(r['sym0'])} + "
+             f"{ch.fmt_amount(r['got1'])} {esc(r['sym1'])} (termasuk fee)"]
+    for label, h in r["steps"]:
+        lines.append(f"{label}: {ch.tx_link(cid, h)}")
+    lines.append(ch.pos_link(cid, token_id))
+    await edit(status, "\n".join(lines))
+
+
 # ---------- Close flow ----------
 async def ask_close(update: Update, token_id: int):
     s = store.load_settings()
@@ -1129,6 +1260,22 @@ async def on_callback(update: Update, _):
         return
     if data.startswith("chart|"):
         await do_chart(update, int(data.split("|", 1)[1]))
+        return
+    if data.startswith("add|"):
+        await ask_add(update, int(data.split("|", 1)[1]))
+        return
+    if data.startswith("addok|"):
+        _, tid, val, kind = data.split("|")
+        await q.edit_message_reply_markup(None)
+        await do_add_exec(update, int(tid), float(val), kind == "p")
+        return
+    if data.startswith("red|"):
+        await ask_reduce(update, int(data.split("|", 1)[1]))
+        return
+    if data.startswith("redok|"):
+        _, tid, pct = data.split("|")
+        await q.edit_message_reply_markup(None)
+        await do_reduce_exec(update, int(tid), int(pct))
         return
     if data.startswith("close|"):
         await ask_close(update, int(data.split("|", 1)[1]))

@@ -138,6 +138,14 @@ NPM_ABI = [
      "name": "decreaseLiquidity", "outputs": [{"name": "amount0", "type": "uint256"}, {"name": "amount1", "type": "uint256"}],
      "type": "function", "stateMutability": "payable"},
     {"inputs": [{"components": [
+        {"name": "tokenId", "type": "uint256"},
+        {"name": "amount0Desired", "type": "uint256"}, {"name": "amount1Desired", "type": "uint256"},
+        {"name": "amount0Min", "type": "uint256"}, {"name": "amount1Min", "type": "uint256"},
+        {"name": "deadline", "type": "uint256"}], "name": "params", "type": "tuple"}],
+     "name": "increaseLiquidity", "outputs": [{"name": "liquidity", "type": "uint128"},
+        {"name": "amount0", "type": "uint256"}, {"name": "amount1", "type": "uint256"}],
+     "type": "function", "stateMutability": "payable"},
+    {"inputs": [{"components": [
         {"name": "tokenId", "type": "uint256"}, {"name": "recipient", "type": "address"},
         {"name": "amount0Max", "type": "uint128"}, {"name": "amount1Max", "type": "uint128"}],
         "name": "params", "type": "tuple"}], "name": "collect",
@@ -443,6 +451,21 @@ def quote_usd_price(w3: Web3, chain_id: int, quote_sym: str, _cache={}) -> float
     return 0.0
 
 
+def dex_volumes(chain_id: int, token_addr: str) -> dict:
+    """Volume 24 jam per pool dari dexscreener: {pool_addr_lower: vol_usd}."""
+    cfg = CHAINS[chain_id]
+    try:
+        r = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{token_addr}", timeout=8)
+        out = {}
+        for pr in (r.json().get("pairs") or []):
+            if pr.get("chainId") != cfg.get("dexscreener"):
+                continue
+            out[(pr.get("pairAddress") or "").lower()] = float((pr.get("volume") or {}).get("h24") or 0)
+        return out
+    except Exception:
+        return {}
+
+
 # ---------- Discovery pool ----------
 def discover_pools(chain_id: int, token_addr: str) -> dict:
     """Scan semua quote × fee tier (paralel). Return {token, pools} urut TVL desc."""
@@ -488,6 +511,7 @@ def discover_pools(chain_id: int, token_addr: str) -> dict:
                 "token0": t0, "token1": t1, "quote_is_token1": q == t1,
             }
 
+        vols_f = ex.submit(dex_volumes, chain_id, token)
         pools = []
         for fut in [ex.submit(detail, it) for it in found]:
             try:
@@ -495,7 +519,13 @@ def discover_pools(chain_id: int, token_addr: str) -> dict:
             except Exception:
                 continue
         tinfo = tinfo_f.result()
+        vols = vols_f.result()
 
+    for p in pools:
+        v = vols.get(p["pool"].lower())
+        p["vol24_usd"] = v
+        # APR estimasi pool: fee 24 jam × 365 ÷ TVL
+        p["apr_pct"] = (v * p["fee"] / 1e6 / p["tvl_usd"] * 365 * 100) if (v and p["tvl_usd"]) else None
     pools.sort(key=lambda p: p["tvl_usd"], reverse=True)
     return {"token": tinfo, "pools": pools}
 
@@ -990,6 +1020,124 @@ def price_history(chain_id: int, pool_addr: str, span_secs: int, points: int = 7
     if len(out) < 5:
         raise RuntimeError("Riwayat harga tidak tersedia di RPC ini (butuh archive node / Alchemy).")
     return out
+
+
+# ---------- Add / Reduce posisi ----------
+def increase_position(chain_id: int, pk: str, token_id: int, budget_quote: float,
+                      slippage_pct: float) -> dict:
+    """Tambah dana ke posisi yang ada. Budget dalam satuan quote; komposisi
+    (quote/meme) dihitung otomatis dari posisi range vs harga sekarang —
+    meme existing di wallet dipakai duluan, swap cuma nutup kekurangan."""
+    w3 = get_w3(chain_id)
+    cfg = CHAINS[chain_id]
+    account = w3.eth.account.from_key(pk)
+    npm_addr = Web3.to_checksum_address(cfg["npm"])
+    npm = w3.eth.contract(address=npm_addr, abi=NPM_ABI)
+
+    (_, _, t0, t1, fee, tick_lo, tick_hi, liq, _, _, _, _) = npm.functions.positions(token_id).call()
+    quotes_lc = {a.lower(): s for s, a in cfg["quotes"].items()}
+    if t1.lower() in quotes_lc:
+        quote, meme, q_is_t1, qsym = t1, t0, True, quotes_lc[t1.lower()]
+    elif t0.lower() in quotes_lc:
+        quote, meme, q_is_t1, qsym = t0, t1, False, quotes_lc[t0.lower()]
+    else:
+        raise RuntimeError("Pair tanpa quote yang dikenal bot.")
+    qdec = token_info(w3, quote)["decimals"]
+    budget_wei = int(Decimal(str(budget_quote)) * Decimal(10) ** qdec)
+    if budget_wei <= 0:
+        raise RuntimeError("Amount 0.")
+
+    factory = w3.eth.contract(address=Web3.to_checksum_address(cfg["factory"]), abi=FACTORY_ABI)
+    pool_addr = factory.functions.getPool(t0, t1, fee).call()
+    pool = w3.eth.contract(address=Web3.to_checksum_address(pool_addr), abi=POOL_ABI)
+
+    steps = []
+    slip = (100 - slippage_pct) / 100
+    steps += ensure_quote_balance(w3, chain_id, pk, quote, budget_wei)
+
+    slot0 = pool.functions.slot0().call()
+    # rasio quote:meme mengikuti posisi range vs harga (plan_two_sided nge-clamp
+    # harga ke dalam range → out-of-range otomatis jadi 100% satu sisi)
+    keep_wei, swap_wei = plan_two_sided(slot0[0], tick_lo, tick_hi, budget_wei, q_is_t1)
+    raw = (slot0[0] / Q96) ** 2
+    meme_price_q = raw if q_is_t1 else (1 / raw if raw else 0)
+    meme_bal = erc20(w3, meme).functions.balanceOf(account.address).call()
+    meme_val_q = int(meme_bal * meme_price_q)
+    keep_frac = keep_wei / budget_wei if budget_wei else 0
+    quote_dep = min(int((budget_wei + meme_val_q) * keep_frac), budget_wei)
+    swap_wei = max(0, budget_wei - quote_dep)
+    if swap_wei > budget_wei // 500:
+        h = swap_to_token(chain_id, pk, quote, meme, fee, swap_wei, slippage_pct)
+        if h:
+            steps.append(("swap", h))
+    else:
+        swap_wei = 0
+    meme_have = erc20(w3, meme).functions.balanceOf(account.address).call()
+    if quote_dep > 0:
+        steps += ensure_approval(w3, pk, quote, npm_addr, quote_dep)
+    if meme_have > 0:
+        steps += ensure_approval(w3, pk, meme, npm_addr, meme_have)
+
+    receipt = None
+    last_err = None
+    for attempt in range(3):
+        s0 = pool.functions.slot0().call()
+        a0d, a1d = (meme_have, quote_dep) if q_is_t1 else (quote_dep, meme_have)
+        lq = int(liquidity_for_amounts(s0[0], tick_lo, tick_hi, a0d, a1d))
+        u0, u1 = amounts_from_liquidity(lq, s0[0], tick_lo, tick_hi)
+        a0m, a1m = int(u0 * slip * 0.95), int(u1 * slip * 0.95)
+        params = (token_id, a0d, a1d, a0m, a1m, int(time.time()) + DEADLINE_SECS)
+        try:
+            h = send_tx(w3, pk, {"to": npm_addr,
+                                 "data": calldata(npm.functions.increaseLiquidity(params))})
+            receipt = wait_ok(w3, h, "increaseLiquidity")
+            steps.append(("increase", h))
+            break
+        except Exception as e:
+            last_err = e
+            if attempt < 2:
+                time.sleep(2)
+    if receipt is None:
+        raise RuntimeError(f"Add gagal 3× (harga bergerak / saldo kurang). Detail: {last_err}")
+
+    qusd = quote_usd_price(w3, chain_id, qsym)
+    implied_total = int(quote_dep / keep_frac) if keep_frac > 0 else budget_wei + meme_val_q
+    added_usd = min(budget_wei + meme_val_q, implied_total) / 10 ** qdec * qusd
+    return {"steps": steps, "added_usd": added_usd, "quote_sym": qsym,
+            "quote_dep": quote_dep / 10 ** qdec}
+
+
+def decrease_position(chain_id: int, pk: str, token_id: int, pct: int) -> dict:
+    """Kurangi posisi pct% (decrease + collect). Fee unclaimed ikut terambil.
+    Token hasil pengurangan tetap di wallet (tanpa auto-swap)."""
+    if not 1 <= pct <= 99:
+        raise RuntimeError("Persen harus 1–99 (100% = pakai Close).")
+    w3 = get_w3(chain_id)
+    cfg = CHAINS[chain_id]
+    account = w3.eth.account.from_key(pk)
+    npm = w3.eth.contract(address=Web3.to_checksum_address(cfg["npm"]), abi=NPM_ABI)
+
+    (_, _, t0, t1, fee, _, _, liq, _, _, _, _) = npm.functions.positions(token_id).call()
+    part = liq * pct // 100
+    if part == 0:
+        raise RuntimeError("Liquidity 0 — posisi sudah kosong.")
+    i0, i1 = token_info(w3, t0), token_info(w3, t1)
+
+    steps = []
+    params = (token_id, part, 0, 0, int(time.time()) + DEADLINE_SECS)
+    h = send_tx(w3, pk, {"to": cfg["npm"], "data": calldata(npm.functions.decreaseLiquidity(params))})
+    wait_ok(w3, h, "decreaseLiquidity")
+    steps.append(("decrease", h))
+
+    got0, got1 = npm.functions.collect((token_id, account.address, MAX_UINT128, MAX_UINT128)).call(
+        {"from": account.address})
+    h = send_tx(w3, pk, {"to": cfg["npm"],
+                         "data": calldata(npm.functions.collect((token_id, account.address, MAX_UINT128, MAX_UINT128)))})
+    wait_ok(w3, h, "collect")
+    steps.append(("collect", h))
+
+    return {"steps": steps, "got0": got0 / 10 ** i0["decimals"], "got1": got1 / 10 ** i1["decimals"],
+            "sym0": i0["symbol"], "sym1": i1["symbol"]}
 
 
 # ---------- Close + auto-swap ----------

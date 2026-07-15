@@ -84,10 +84,15 @@ def mint_ts(chain_id: int, token_id: int) -> int | None:
 
 
 def mint_usd(chain_id: int, token_id: int) -> float | None:
-    for e in _hist()["events"].get(str(chain_id), []):
-        if e["kind"] == "mint" and e["token_id"] == token_id:
-            return e["usd"]
-    return None
+    """Total deposit posisi (mint awal + semua add)."""
+    total = sum(e["usd"] for e in _hist()["events"].get(str(chain_id), [])
+                if e["kind"] == "mint" and e["token_id"] == token_id)
+    return total or None
+
+
+def fees_claimed_usd(chain_id: int, token_id: int) -> float:
+    return sum(e["usd"] for e in _hist()["events"].get(str(chain_id), [])
+               if e["kind"] == "fees" and e["token_id"] == token_id)
 
 
 def portfolio_summary(chain_id: int, wallet: str = "") -> dict:
