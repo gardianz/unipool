@@ -1,0 +1,16 @@
+# Rahasia — private key, token bot, API key. JANGAN PERNAH di-commit.
+.env
+
+# State runtime lokal
+settings.json
+history.json
+charts/
+
+# Python
+__pycache__/
+*.pyc
+
+# Lain-lain
+*.log
+.playwright-mcp/
+*:Zone.Identifier
