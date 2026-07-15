@@ -398,6 +398,22 @@ def send_tx(w3: Web3, pk: str, tx: dict) -> str:
     raise RuntimeError(f"Gagal kirim tx setelah 4 percobaan (nonce): {last_err}")
 
 
+def poll_balance(w3: Web3, token: str, addr: str, min_expected: int,
+                 tries: int = 10, delay: float = 0.7) -> int:
+    """Baca saldo dengan retry — replika RPC bisa telat sinkron sesaat setelah tx
+    (read-after-write). Berhenti begitu saldo >= min_expected atau kehabisan percobaan."""
+    bal = 0
+    for i in range(tries):
+        try:
+            bal = erc20(w3, token).functions.balanceOf(Web3.to_checksum_address(addr)).call()
+        except Exception:
+            bal = 0
+        if bal >= min_expected:
+            return bal
+        time.sleep(delay)
+    return bal
+
+
 def wait_ok(w3: Web3, txhash: str, what: str):
     r = w3.eth.wait_for_transaction_receipt(txhash, timeout=180)
     if r.status != 1:
@@ -698,13 +714,17 @@ def mint_position(chain_id: int, pk: str, pool_info: dict, budget: float,
         keep_frac = keep_wei / budget_wei if budget_wei else 0
         quote_dep = min(int((budget_wei + meme_val_q) * keep_frac), budget_wei)
         swap_wei = max(0, budget_wei - quote_dep)
+        swapped = False
         if swap_wei > budget_wei // 500:  # <0.2% budget = dust, skip
             h = swap_to_token(chain_id, pk, quote, meme, pool_info["fee"], swap_wei, slippage_pct)
             if h:
                 steps.append(("swap", h))
+                swapped = True
         keep_wei = quote_dep
-        # deposit desired = SEMUA meme di wallet (kelebihan dikembalikan NPM otomatis)
-        meme_got = erc20(w3, meme).functions.balanceOf(account.address).call()
+        # deposit desired = SEMUA meme di wallet (kelebihan dikembalikan NPM otomatis);
+        # polling karena replika RPC bisa telat lihat hasil swap
+        meme_got = poll_balance(w3, meme, account.address, meme_bal + 1) if swapped \
+            else erc20(w3, meme).functions.balanceOf(account.address).call()
         steps += ensure_approval(w3, pk, quote, npm_addr, keep_wei)
         steps += ensure_approval(w3, pk, meme, npm_addr, meme_got)
         implied_total_q = int(quote_dep / keep_frac) if keep_frac > 0 else budget_wei + meme_val_q
@@ -1066,13 +1086,16 @@ def increase_position(chain_id: int, pk: str, token_id: int, budget_quote: float
     keep_frac = keep_wei / budget_wei if budget_wei else 0
     quote_dep = min(int((budget_wei + meme_val_q) * keep_frac), budget_wei)
     swap_wei = max(0, budget_wei - quote_dep)
+    swapped = False
     if swap_wei > budget_wei // 500:
         h = swap_to_token(chain_id, pk, quote, meme, fee, swap_wei, slippage_pct)
         if h:
             steps.append(("swap", h))
+            swapped = True
     else:
         swap_wei = 0
-    meme_have = erc20(w3, meme).functions.balanceOf(account.address).call()
+    meme_have = poll_balance(w3, meme, account.address, meme_bal + 1) if swapped \
+        else erc20(w3, meme).functions.balanceOf(account.address).call()
     if quote_dep > 0:
         steps += ensure_approval(w3, pk, quote, npm_addr, quote_dep)
     if meme_have > 0:
@@ -1206,6 +1229,9 @@ def close_position(chain_id: int, pk: str, token_id: int, slippage_pct: float,
     p = npm.functions.positions(token_id).call()
     (_, _, t0, t1, fee, tick_lo, tick_hi, liq, _, _, _, _) = p
     i0, i1 = token_info(w3, t0), token_info(w3, t1)
+    # saldo sebelum close — dipakai menghitung ekspektasi saldo setelah collect
+    pre0 = erc20(w3, t0).functions.balanceOf(account.address).call()
+    pre1 = erc20(w3, t1).functions.balanceOf(account.address).call()
     steps = []
 
     if liq > 0:
@@ -1225,13 +1251,16 @@ def close_position(chain_id: int, pk: str, token_id: int, slippage_pct: float,
     swaps = []
     if autoswap:
         wrapped = Web3.to_checksum_address(cfg["wrapped"])
-        for taddr, info in ((t0, i0), (t1, i1)):
+        for taddr, got, pre, info in ((t0, got0, pre0, i0), (t1, got1, pre1, i1)):
             if Web3.to_checksum_address(taddr) == wrapped:
                 continue
-            # jual SELURUH saldo token (termasuk sisa dari posisi/close sebelumnya),
-            # bukan cuma hasil close ini
-            bal = erc20(w3, taddr).functions.balanceOf(account.address).call()
+            # jual SELURUH saldo token (termasuk sisa lama). Saldo dibaca dengan
+            # polling: replika RPC bisa masih 0 sesaat setelah collect (toleransi
+            # 90% untuk token fee-on-transfer).
+            expected = pre + int(got * 0.9)
+            bal = poll_balance(w3, taddr, account.address, max(expected, 1))
             if bal == 0:
+                swaps.append((info["symbol"], "SWAP GAGAL: saldo terbaca 0 (RPC lag) — jual manual/close lagi"))
                 continue
             try:
                 sh = swap_to_token(chain_id, pk, taddr, wrapped, fee, bal, slippage_pct)
