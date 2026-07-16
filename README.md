@@ -11,7 +11,7 @@ Paste alamat token → bot cari pool → pilih strategi → mint posisi LP. Pant
 - ✏️ **Custom range** via persen atau **market cap** (`mc 300k 800k`), custom amount (persen saldo / nilai pasti)
 - 🔁 **Auto-wrap** ETH→WETH, **auto-swap** komposisi dua sisi (token existing di wallet dipakai duluan); pair non-WETH (mis. USDG) otomatis dibeli dari saldo WETH/ETH saat mint
 - 📊 **/list** — nilai posisi, fee unclaimed, PnL per posisi & portfolio, status IN/OUT range
-- 📈 **Chart live** — grafik market cap + kotak range posisi, refresh 3 detik, link dexscreener
+- 📈 **Chart** — tombol langsung ke GMGN & DexScreener per posisi/pool
 - 🔔 **Alert** otomatis saat posisi keluar/masuk range
 - 🧭 **Menu navigasi** — `/start` membuka dashboard (saldo + tombol Posisi/Dompet/Pengaturan/Chain); semua setting bisa diubah lewat tombol tanpa hafal perintah
 - 🛡️ **Failover RPC** multi-endpoint + bypass blokir DNS ISP Indonesia (DoH + koneksi IP langsung, sertifikat tetap diverifikasi)
@@ -47,7 +47,7 @@ Chat [@userinfobot](https://t.me/userinfobot) → dia membalas dengan angka **Id
 
 Daftar gratis di [dashboard.alchemy.com](https://dashboard.alchemy.com) → buat app → enable network **Robinhood Mainnet** (dan **BNB Mainnet** kalau perlu) → salin API key.
 
-Tanpa Alchemy bot tetap jalan lewat RPC publik, tapi fitur **chart** butuh archive node (Alchemy menyediakannya) dan RPC-nya lebih stabil.
+Tanpa Alchemy bot tetap jalan lewat RPC publik, tapi RPC Alchemy lebih stabil dan tidak kena blokir DNS ISP.
 
 ### 6. Konfigurasi `.env`
 
@@ -81,7 +81,7 @@ Log `LP bot jalan. Wallet: 0x...` = siap. Buka chat bot kamu di Telegram, kirim 
 2. Pilih pool → muncul **kartu konfirmasi**: strategi, range (dalam market cap), komposisi deposit, rencana wrap/swap
 3. Atur pakai tombol (strategi / preset range / amount) atau **✏️ Custom** — balas dengan `40 120` (persen) atau `mc 300k 800k`
 4. **✅ Confirm mint** → bot eksekusi wrap → approve → mint, kirim semua link transaksi
-5. `/list` → pantau; tombol **📈 Chart** (grafik live + box range), **➕ Add**, **➖ Reduce**, **💰 Fee** (collect fee tanpa close), **🗑 Close**
+5. `/list` → klik posisi untuk kartu detail; tombol **📈 GMGN** / **📊 DexScreener** (chart), **➕ Add**, **➖ Reduce**, **💰 Fee** (collect fee tanpa close), **🗑 Close**
 6. Close → pilih **swap semua → WETH** atau **tahan token**
 
 ## Perintah
@@ -105,8 +105,6 @@ Log `LP bot jalan. Wallet: 0x...` = siap. Buka chat bot kamu di Telegram, kirim 
 ## Troubleshooting
 
 **SSL "Hostname mismatch" ke `rpc.mainnet.chain.robinhood.com`** — DNS ISP Indonesia memblokir domain robinhood.com (redirect internetpositif.id). Bot otomatis bypass: resolve IP asli via DNS-over-HTTPS lalu konek langsung (sertifikat tetap diverifikasi). Alternatif permanen: ganti DNS Windows/router ke `1.1.1.1`.
-
-**Chart gagal / "riwayat tidak tersedia"** — RPC yang dipakai bukan archive node. Isi `ALCHEMY_API_KEY`.
 
 **Mint revert saat token lagi ramai** — harga bergerak melewati range saat transaksi disiapkan. Bot sudah retry 3× otomatis; kalau tetap gagal, perlebar range atau naikkan `/set gap`.
 

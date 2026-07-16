@@ -9,16 +9,12 @@ Env (.env): TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, PRIVATE_KEY, [RPC_4663, RPC_56
 import asyncio
 import functools
 import html
-import http.server
-import json
 import logging
 import os
 import re
 import sys
-import threading
 import time
 import uuid
-from pathlib import Path
 
 from dotenv import load_dotenv
 from telegram import (BotCommand, ForceReply, InlineKeyboardButton,
@@ -44,57 +40,6 @@ PENDING: dict[str, dict] = {}  # konteks tombol pilih pool
 LAST_CONFIRM: dict[int, tuple] = {}  # chat_id → (key, message kartu konfirmasi aktif)
 AWAITING: dict[int, dict] = {}  # chat_id → {"kind": "range"|"amount", "key": ...} nunggu balasan user
 RANGE_STATE: dict[tuple, bool] = {}  # (chain_id, token_id) → in_range terakhir (untuk alert)
-
-CHARTS_DIR = Path(__file__).parent / "charts"
-CHART_PORT = int(os.environ.get("CHART_PORT", "8787"))
-
-
-_LIVE_RE = re.compile(r"^/live/(\d+)/(0x[0-9a-fA-F]{40})$")
-
-
-def start_chart_server():
-    """Server HTTP lokal (127.0.0.1): halaman chart statis + endpoint /live untuk polling harga."""
-    CHARTS_DIR.mkdir(exist_ok=True)
-
-    class Handler(http.server.SimpleHTTPRequestHandler):
-        def __init__(self, *a, **kw):
-            super().__init__(*a, directory=str(CHARTS_DIR), **kw)
-
-        def log_message(self, *a):
-            pass
-
-        def do_GET(self):
-            m = _LIVE_RE.match(self.path.split("?")[0])
-            if not m:
-                return super().do_GET()
-            try:
-                cid = int(m.group(1))
-                if cid not in ch.CHAINS:
-                    raise ValueError("chain tidak dikenal")
-                w3 = ch.get_w3(cid)
-                pool = w3.eth.contract(address=ch.Web3.to_checksum_address(m.group(2)), abi=ch.POOL_ABI)
-                tick = pool.functions.slot0().call()[1]
-                body = json.dumps({"ts": int(time.time()), "tick": tick}).encode()
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Cache-Control", "no-store")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-            except Exception:
-                try:
-                    self.send_error(500)
-                except Exception:
-                    pass
-
-    try:
-        srv = http.server.ThreadingHTTPServer(("127.0.0.1", CHART_PORT), Handler)
-    except OSError as e:
-        log.warning("Chart server gagal start di port %s: %s", CHART_PORT, e)
-        return
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    log.info("Chart server: http://127.0.0.1:%s", CHART_PORT)
-
 
 # ---------- Auth ----------
 def allowed_chat_ids() -> set[int]:
@@ -766,7 +711,9 @@ def build_preview(ctx_data: dict) -> str:
     return (
         f"<b>Confirm mint · {esc(cfg['name'])} · v3</b>\n"
         f"CA: <code>{esc(ctx_data['token']['address'])}</code>\n"
-        f"{esc(tsym)}/{esc(p['quote_sym'])} {p['fee'] / 10000:.2f}% · TVL {ch.fmt_usd(p['tvl_usd'])} · {vol_txt}\n\n"
+        f"{esc(tsym)}/{esc(p['quote_sym'])} {p['fee'] / 10000:.2f}% · TVL {ch.fmt_usd(p['tvl_usd'])} · {vol_txt}\n"
+        f"📈 <a href=\"https://gmgn.ai/{cfg['gmgn']}/token/{ctx_data['token']['address']}\">GMGN</a> · "
+        f"<a href=\"https://dexscreener.com/{cfg['dexscreener']}/{p['pool']}\">DexScreener</a>\n\n"
         f"<b>Strategi: {STRAT_LABEL[mode]} {strat_desc}</b>"
         f"{' ⭐' if mode == rec else f' (rekomendasi: ⭐ {STRAT_LABEL[rec]})'}\n"
         f"Value deposited: {ch.fmt_amount(amount)} {esc(dep_sym)} ({ch.fmt_usd(usd)} · {esc(amount_desc)})\n"
@@ -1207,12 +1154,13 @@ def position_card(cid: int, p: dict) -> str:
     return "\n".join(L)
 
 
-def position_kb(tid: int) -> InlineKeyboardMarkup:
+def position_kb(cid: int, p: dict) -> InlineKeyboardMarkup:
+    tid = p["token_id"]
+    meme_ca = p["token0"] if p["quote_is_token1"] else p["token1"]
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📈 Chart", callback_data=f"chart|{tid}"),
-         InlineKeyboardButton("➕ Add", callback_data=f"add|{tid}"),
-         InlineKeyboardButton("🔄", callback_data=f"pos|{tid}")],
-        [InlineKeyboardButton("➖ Reduce", callback_data=f"red|{tid}"),
+        chart_buttons(cid, p["pool"], meme_ca) + [InlineKeyboardButton("🔄", callback_data=f"pos|{tid}")],
+        [InlineKeyboardButton("➕ Add", callback_data=f"add|{tid}"),
+         InlineKeyboardButton("➖ Reduce", callback_data=f"red|{tid}"),
          InlineKeyboardButton("💰 Fee", callback_data=f"fee|{tid}"),
          InlineKeyboardButton("🗑 Close", callback_data=f"close|{tid}")],
         [InlineKeyboardButton("⬅️ Posisi", callback_data="menu|list"),
@@ -1237,137 +1185,16 @@ async def show_position(update: Update, msg, token_id: int):
         await edit(msg, f"❌ Posisi #{token_id} tidak ditemukan (sudah ditutup?).",
                    InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Posisi", callback_data="menu|list")], BACK_ROW]))
         return
-    await edit(msg, position_card(cid, p), position_kb(token_id))
+    await edit(msg, position_card(cid, p), position_kb(cid, p))
 
 
-# ---------- Chart ----------
-CHART_TPL = """<!doctype html><html><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>__TITLE__</title>
-<style>body{margin:0;background:#131722;color:#d1d4dc;font:13px/1.4 -apple-system,Segoe UI,Roboto,sans-serif}
-#hdr{padding:10px 14px}#hdr b{color:#fff;font-size:15px}#hdr .in{color:#26a69a}#hdr .out{color:#ef5350}
-#hdr a{color:#5c9ded;text-decoration:none;margin-left:10px}
-#dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#26a69a;margin-right:4px;animation:b 2s infinite}
-@keyframes b{50%{opacity:.25}}
-canvas{display:block;width:100vw;height:calc(100vh - 60px)}</style></head><body>
-<div id="hdr"><span id="dot"></span><b>__TITLE__</b> · Range MC __RLO__–__RHI__ · now <span id="now">__RNOW__</span> ·
-<span id="st" class="__CLS__">__STATE__</span><a href="__DEX_URL__" target="_blank">dexscreener ↗</a></div>
-<canvas id="c"></canvas><script>
-const data=__DATA__, rlo=__VLO__, rhi=__VHI__, mintTs=__MINT_TS__;
-const K=__K__, SGN=__SGN__, LIVE="/live/__CID__/__POOL__";
-const cv=document.getElementById("c");
-function fmt(v){if(v>=1e9)return "$"+(v/1e9).toFixed(2)+"B";if(v>=1e6)return "$"+(v/1e6).toFixed(2)+"M";
-if(v>=1e3)return "$"+(v/1e3).toFixed(1)+"k";return "$"+v.toFixed(2)}
-function hm(t){const d=new Date(t*1000);return d.getHours().toString().padStart(2,"0")+":"+d.getMinutes().toString().padStart(2,"0")}
-function draw(){const dpr=devicePixelRatio||1;cv.width=cv.clientWidth*dpr;cv.height=cv.clientHeight*dpr;
-const g=cv.getContext("2d");g.scale(dpr,dpr);const W=cv.clientWidth,H=cv.clientHeight,L=10,R=78,T=14,B=26;
-const xs=data.map(d=>d[0]),ys=data.map(d=>d[1]);
-let lo=Math.min(...ys,rlo),hi=Math.max(...ys,rhi);const pad=(hi-lo)*0.08||1;lo-=pad;hi+=pad;
-const x0=xs[0],x1=xs[xs.length-1];
-const X=t=>L+(t-x0)/(x1-x0||1)*(W-L-R), Y=v=>T+(1-(v-lo)/(hi-lo))*(H-T-B);
-g.fillStyle="#131722";g.fillRect(0,0,W,H);
-g.strokeStyle="#1f2733";g.fillStyle="#6b7280";g.font="11px sans-serif";g.textAlign="left";
-const steps=6;for(let i=0;i<=steps;i++){const v=lo+(hi-lo)*i/steps,y=Y(v);
-g.beginPath();g.moveTo(L,y);g.lineTo(W-R,y);g.stroke();g.fillText(fmt(v),W-R+6,y+4)}
-g.textAlign="center";for(let i=0;i<=5;i++){const t=x0+(x1-x0)*i/5;g.fillText(hm(t),X(t),H-8)}
-// box range (ala dexscreener)
-g.fillStyle="rgba(233,30,140,0.13)";g.fillRect(L,Y(rhi),W-L-R,Y(rlo)-Y(rhi));
-g.strokeStyle="rgba(233,30,140,0.85)";g.lineWidth=1.2;
-g.beginPath();g.moveTo(L,Y(rhi));g.lineTo(W-R,Y(rhi));g.stroke();
-g.beginPath();g.moveTo(L,Y(rlo));g.lineTo(W-R,Y(rlo));g.stroke();
-// garis mint (kalau dalam window)
-if(mintTs>x0&&mintTs<x1){g.strokeStyle="rgba(255,193,7,0.7)";g.setLineDash([4,4]);
-g.beginPath();g.moveTo(X(mintTs),T);g.lineTo(X(mintTs),H-B);g.stroke();g.setLineDash([])}
-// garis harga
-g.strokeStyle="#e8eaed";g.lineWidth=1.6;g.beginPath();
-data.forEach((d,i)=>{const x=X(d[0]),y=Y(d[1]);i?g.lineTo(x,y):g.moveTo(x,y)});g.stroke();
-// titik terakhir + label
-const lx=X(x1),ly=Y(ys[ys.length-1]);
-g.fillStyle="#26a69a";g.beginPath();g.arc(lx,ly,3.5,0,7);g.fill();
-g.fillStyle="#26a69a";g.fillRect(W-R+2,ly-9,R-6,18);g.fillStyle="#fff";g.textAlign="left";
-g.fillText(fmt(ys[ys.length-1]),W-R+6,ly+4);}
-draw();addEventListener("resize",draw);
-async function poll(){try{
-const r=await fetch(LIVE,{cache:"no-store"});if(!r.ok)return;
-const j=await r.json();const mc=K*Math.pow(1.0001,SGN*j.tick);
-if(!data.length||j.ts>data[data.length-1][0]){
-data.push([j.ts,mc]);if(data.length>800)data.shift();draw();
-document.getElementById("now").textContent=fmt(mc);
-const st=document.getElementById("st"),inr=mc>=rlo&&mc<=rhi;
-st.textContent=inr?"IN RANGE":"OUT OF RANGE";st.className=inr?"in":"out";}
-}catch(e){}}
-setInterval(poll,3000);
-</script></body></html>"""
-
-
-def build_chart_html(cid: int, pos: dict, hist_mc: list, mint_ts: int | None, mc_k: float) -> str:
-    meme_sym = pos["sym0"] if pos["quote_is_token1"] else pos["sym1"]
-    state = "IN RANGE" if pos["in_range"] else "OUT OF RANGE"
-    dex_url = f"https://dexscreener.com/{ch.CHAINS[cid]['dexscreener']}/{pos['pool']}"
-    return (CHART_TPL
-            .replace("__TITLE__", f"{esc(meme_sym)} #{pos['token_id']} — MC")
-            .replace("__RLO__", ch.fmt_usd(pos["mc_lower"]))
-            .replace("__RHI__", ch.fmt_usd(pos["mc_upper"]))
-            .replace("__RNOW__", ch.fmt_usd(pos["mc_now"]))
-            .replace("__CLS__", "in" if pos["in_range"] else "out")
-            .replace("__STATE__", state)
-            .replace("__DEX_URL__", dex_url)
-            .replace("__DATA__", json.dumps([[t, round(v, 2)] for t, v in hist_mc]))
-            .replace("__VLO__", str(round(pos["mc_lower"], 2)))
-            .replace("__VHI__", str(round(pos["mc_upper"], 2)))
-            .replace("__MINT_TS__", str(mint_ts or 0))
-            .replace("__K__", repr(mc_k))
-            .replace("__SGN__", "1" if pos["quote_is_token1"] else "-1")
-            .replace("__CID__", str(cid))
-            .replace("__POOL__", pos["pool"]))
-
-
-async def do_chart(update: Update, token_id: int):
-    s = store.load_settings()
-    cid = s["chain"]
-    status = await reply(update, f"⏳ Membuat chart #{token_id}...")
-
-    def work():
-        pos = next((p for p in ch.list_positions(cid, pk()) if p["token_id"] == token_id), None)
-        if not pos or not pos.get("mc_now"):
-            raise RuntimeError(f"Posisi #{token_id} tidak ditemukan / MC tidak tersedia.")
-        w3 = ch.get_w3(cid)
-        q_is_t1 = pos["quote_is_token1"]
-        mdec = pos["dec0"] if q_is_t1 else pos["dec1"]
-        qdec = pos["dec1"] if q_is_t1 else pos["dec0"]
-        meme_addr = pos["token0"] if q_is_t1 else pos["token1"]
-        supply = ch.token_supply(w3, meme_addr)
-        qusd = ch.quote_usd_price(w3, cid, pos["quote_sym"])
-
-        mts = store.mint_ts(cid, token_id)
-        span = min(max(int(time.time()) - mts, 1800) if mts else 6 * 3600, 24 * 3600)
-        hist = ch.price_history(cid, pos["pool"], span_secs=span)
-
-        # MC = K × 1.0001^(±tick); K juga dipakai JS untuk konversi live
-        mc_k = 10 ** (mdec - qdec) * qusd * supply
-
-        def mc_at(tick):
-            return mc_k * (ch.tick_to_price(tick) if q_is_t1 else 1 / ch.tick_to_price(tick))
-        hist_mc = [(t, mc_at(tick)) for t, tick in hist]
-
-        fname = f"chart_{cid}_{token_id}.html"
-        (CHARTS_DIR / fname).write_text(build_chart_html(cid, pos, hist_mc, mts, mc_k))
-        return fname, pos
-
-    try:
-        fname, pos = await asyncio.to_thread(work)
-    except Exception as e:
-        await edit(status, f"❌ Chart gagal: {esc(e)}")
-        return
-    meme_sym = pos["sym0"] if pos["quote_is_token1"] else pos["sym1"]
-    state = "🟢 IN" if pos["in_range"] else "🔴 OUT"
-    dex_url = f"https://dexscreener.com/{ch.CHAINS[cid]['dexscreener']}/{pos['pool']}"
-    await edit(status, (
-        f"📈 <b>{esc(meme_sym)} #{token_id}</b> · {state}\n"
-        f"Range MC {ch.fmt_usd(pos['mc_lower'])}–{ch.fmt_usd(pos['mc_upper'])} (now {ch.fmt_usd(pos['mc_now'])})\n"
-        f"http://127.0.0.1:{CHART_PORT}/{fname} (live, box range)\n"
-        f"{dex_url} (dexscreener)\n"
-        f"<i>link pertama = server lokal bot, buka di browser PC ini</i>"))
+# ---------- Chart (link eksternal) ----------
+def chart_buttons(cid: int, pool: str, meme_ca: str) -> list[InlineKeyboardButton]:
+    cfg = ch.CHAINS[cid]
+    return [
+        InlineKeyboardButton("📈 GMGN", url=f"https://gmgn.ai/{cfg['gmgn']}/token/{meme_ca}"),
+        InlineKeyboardButton("📊 DexScreener", url=f"https://dexscreener.com/{cfg['dexscreener']}/{pool}"),
+    ]
 
 
 # ---------- Add / Reduce flow ----------
@@ -1691,7 +1518,8 @@ async def on_callback(update: Update, _):
         await do_mint(update, ctx)
         return
     if data.startswith("chart|"):
-        await do_chart(update, int(data.split("|", 1)[1]))
+        # tombol lama (pra-link eksternal) — arahkan ke kartu detail
+        await show_position(update, q.message, int(data.split("|", 1)[1]))
         return
     if data.startswith("add|"):
         await ask_add(update, int(data.split("|", 1)[1]))
@@ -1756,11 +1584,12 @@ async def monitor_loop(app):
                 body = (f"{head}\n"
                         f"Val {ch.fmt_usd(p['value_usd'])} · Unclaimed {ch.fmt_usd(p['unclaimed_usd'])}\n"
                         f"Range: {esc(range_str(p))}")
-                kb = InlineKeyboardMarkup([[
-                    InlineKeyboardButton("📋 Detail", callback_data=f"pos|{p['token_id']}"),
-                    InlineKeyboardButton("📈 Chart", callback_data=f"chart|{p['token_id']}"),
-                    InlineKeyboardButton("🗑 Close", callback_data=f"close|{p['token_id']}"),
-                ]])
+                meme_ca = p["token0"] if p["quote_is_token1"] else p["token1"]
+                kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📋 Detail", callback_data=f"pos|{p['token_id']}"),
+                     InlineKeyboardButton("🗑 Close", callback_data=f"close|{p['token_id']}")],
+                    chart_buttons(cid, p["pool"], meme_ca),
+                ])
                 for chat_id in allowed_chat_ids():
                     try:
                         await app.bot.send_message(chat_id, body, parse_mode=ParseMode.HTML,
@@ -1823,7 +1652,6 @@ def main():
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_address))
     app.add_error_handler(on_error)
-    start_chart_server()
     log.info("LP bot jalan. Wallet: %s",
              ", ".join(f"W{i + 1} {_addr_of(k)}" for i, k in enumerate(all_pks())))
     app.run_polling(allowed_updates=Update.ALL_TYPES)

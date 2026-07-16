@@ -26,6 +26,7 @@ CHAINS = {
         "name": "Robinhood",
         "slug": "robinhood",  # slug URL app.uniswap.org
         "dexscreener": "robinhood",
+        "gmgn": "robinhood",
         "v2_factory": "0x8bceaa40b9acdfaedf85adf4ff01f5ad6517937f",
         # rpc.mainnet.chain.robinhood.com sering diblokir DNS ISP Indonesia
         # (redirect ke internetpositif.id) → fallback Blockscout eth-rpc
@@ -53,6 +54,7 @@ CHAINS = {
         "name": "BSC",
         "slug": "bnb",
         "dexscreener": "bsc",
+        "gmgn": "bsc",
         "v2_factory": "0x8909Dc15e40173Ff4699343b6eB8132c65e18eC6",  # Uniswap V2 BSC
         "rpcs": [
             "https://1rpc.io/bnb",
