@@ -1098,18 +1098,19 @@ def _pos_metrics(cid: int, p: dict) -> dict:
     tid = p["token_id"]
     dep = store.mint_usd(cid, tid)
     claimed = store.fees_claimed_usd(cid, tid)
+    withdrawn = store.withdrawn_usd(cid, tid)  # hasil reduce yang sudah masuk wallet
     cur_total = p["value_usd"] + p["unclaimed_usd"]
     mts = store.mint_ts(cid, tid)
     pnl = pnl_pct = apr = None
     if dep:
-        pnl = cur_total + claimed - dep
+        pnl = cur_total + claimed + withdrawn - dep
         pnl_pct = pnl / dep * 100
         if mts:
             age_days = max((int(time.time()) - mts) / 86400, 0.01)
             apr = (p["unclaimed_usd"] + claimed) / dep / age_days * 365 * 100
     return {
         "meme_sym": p["sym0"] if p["quote_is_token1"] else p["sym1"],
-        "dep": dep, "claimed": claimed, "cur_total": cur_total,
+        "dep": dep, "claimed": claimed, "withdrawn": withdrawn, "cur_total": cur_total,
         "pnl": pnl, "pnl_pct": pnl_pct, "apr": apr,
         "age": store.fmt_age(mts),
     }
@@ -1144,6 +1145,8 @@ def position_card(cid: int, p: dict) -> str:
     stat = []
     if m["dep"]:
         stat.append(f"Deposit {ch.fmt_usd(m['dep'])}")
+    if m["withdrawn"]:
+        stat.append(f"Ditarik {ch.fmt_usd(m['withdrawn'])}")
     if m["claimed"]:
         stat.append(f"Fee terklaim {ch.fmt_usd(m['claimed'])}")
     if m["apr"] is not None:

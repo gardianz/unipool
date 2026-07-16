@@ -96,6 +96,12 @@ def fees_claimed_usd(chain_id: int, token_id: int) -> float:
                if e["kind"] == "fees" and e["token_id"] == token_id)
 
 
+def withdrawn_usd(chain_id: int, token_id: int) -> float:
+    """Total dana yang sudah ditarik dari posisi (reduce/close)."""
+    return sum(e["usd"] for e in _hist()["events"].get(str(chain_id), [])
+               if e["kind"] == "close" and e["token_id"] == token_id)
+
+
 def portfolio_summary(chain_id: int, wallet: str = "") -> dict:
     """PnL per wallet — event lama tanpa field wallet tidak ikut dihitung."""
     ev = [e for e in _hist()["events"].get(str(chain_id), [])
