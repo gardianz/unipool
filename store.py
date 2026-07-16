@@ -19,6 +19,7 @@ DEFAULT_SETTINGS = {
     "autoswap": True,       # swap hasil close → wrapped native
     "gap": 1,               # jarak pengaman range single-sided dari harga (satuan tick-spacing; 0 = nempel)
     "alert_secs": 60,       # interval cek alert in/out range (detik; 0 = off)
+    "wallet_idx": 0,        # wallet aktif (index di daftar PRIVATE_KEY, PRIVATE_KEY_2, ...)
 }
 
 

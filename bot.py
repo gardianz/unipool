@@ -113,16 +113,47 @@ def esc(s) -> str:
     return html.escape(str(s))
 
 
+@functools.lru_cache(maxsize=1)
+def all_pks() -> tuple[str, ...]:
+    """Semua private key dari .env: PRIVATE_KEY (W1), PRIVATE_KEY_2 (W2), dst."""
+    keys = []
+    raw = os.environ.get("PRIVATE_KEY", "").strip()
+    if raw:
+        keys.append(raw)
+    i = 2
+    while True:
+        raw = os.environ.get(f"PRIVATE_KEY_{i}", "").strip()
+        if not raw:
+            break
+        keys.append(raw)
+        i += 1
+    return tuple(k if k.startswith("0x") else "0x" + k for k in keys)
+
+
+def active_wallet_idx() -> int:
+    n = max(1, len(all_pks()))
+    try:
+        return min(max(0, int(store.load_settings().get("wallet_idx", 0))), n - 1)
+    except (TypeError, ValueError):
+        return 0
+
+
 def pk() -> str:
-    p = os.environ.get("PRIVATE_KEY", "").strip()
-    if not p.startswith("0x"):
-        p = "0x" + p
-    return p
+    return all_pks()[active_wallet_idx()]
+
+
+def wallet_label(idx: int | None = None) -> str:
+    return f"W{(active_wallet_idx() if idx is None else idx) + 1}"
+
+
+@functools.lru_cache(maxsize=16)
+def _addr_of(key: str) -> str:
+    from web3 import Web3
+    return Web3().eth.account.from_key(key).address
 
 
 def wallet_address() -> str:
-    from web3 import Web3
-    return Web3().eth.account.from_key(pk()).address
+    return _addr_of(pk())
 
 
 async def reply(update: Update, text: str, kb: InlineKeyboardMarkup | None = None):
@@ -177,14 +208,25 @@ HELP = (
     "<code>a 30%</code> / <code>a 0.005</code> — amount"
 )
 
-MENU_KB = InlineKeyboardMarkup([
-    [InlineKeyboardButton("📊 Posisi LP", callback_data="menu|list"),
-     InlineKeyboardButton("👛 Dompet", callback_data="menu|wallet")],
-    [InlineKeyboardButton("⚙️ Pengaturan", callback_data="menu|settings"),
-     InlineKeyboardButton("⛓ Chain", callback_data="menu|chain")],
-    [InlineKeyboardButton("❓ Bantuan", callback_data="menu|help"),
-     InlineKeyboardButton("🔄 Segarkan", callback_data="menu|main")],
-])
+def menu_kb() -> InlineKeyboardMarkup:
+    rows = []
+    n = len(all_pks())
+    if n > 1:
+        cur = active_wallet_idx()
+        rows.append([InlineKeyboardButton(("✓ " if i == cur else "") + f"W{i + 1}",
+                                          callback_data=f"wsel|{i}")
+                     for i in range(min(n, 8))])
+    rows += [
+        [InlineKeyboardButton("📊 Posisi LP", callback_data="menu|list"),
+         InlineKeyboardButton("👛 Dompet", callback_data="menu|wallet")],
+        [InlineKeyboardButton("⚙️ Pengaturan", callback_data="menu|settings"),
+         InlineKeyboardButton("⛓ Chain", callback_data="menu|chain")],
+        [InlineKeyboardButton("❓ Bantuan", callback_data="menu|help"),
+         InlineKeyboardButton("🔄 Segarkan", callback_data="menu|main")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+
 BACK_ROW = [InlineKeyboardButton("⬅️ Menu", callback_data="menu|main")]
 NAV_KB = InlineKeyboardMarkup([
     [InlineKeyboardButton("📊 Posisi", callback_data="go|list"),
@@ -211,10 +253,21 @@ def build_main_menu() -> str:
         bal_lines.append(f"· {esc(sym)}: {ch.fmt_amount(bal)} ({ch.fmt_usd(usd)})")
     amount = f"{s['amount_fixed']:g} fix" if s["amount_fixed"] else f"{s['amount_pct']:g}%"
     alert = f"{int(s.get('alert_secs', 60))}s" if s.get("alert_secs") else "off"
+    pks = all_pks()
+    wallets_line = ""
+    if len(pks) > 1:
+        cur = active_wallet_idx()
+        parts = []
+        for i, k in enumerate(pks):
+            bal = w3.eth.get_balance(_addr_of(k)) / 1e18
+            mark = "▸" if i == cur else ""
+            parts.append(f"{mark}W{i + 1} {ch.fmt_amount(bal)}")
+        wallets_line = f"👛 {' · '.join(parts)} {esc(cfg['native_symbol'])}\n"
     return (
         f"🦄 <b>unipool</b> — LP Uniswap V3\n"
         f"⛓ {esc(cfg['name'])} (chain {cid})\n"
-        f"EVM: <code>{esc(addr)}</code>\n\n"
+        f"{wallets_line}"
+        f"{esc(wallet_label())}: <code>{esc(addr)}</code>\n\n"
         f"💰 <b>Saldo:</b>\n" + "\n".join(bal_lines) + "\n"
         f"<b>Total: {ch.fmt_usd(total)}</b> · 1 {esc(cfg['wrapped_symbol'])} = ${eth_usd:,.0f}\n\n"
         f"⚙️ amount {esc(amount)} · slippage {s['slippage_pct']:g}% · gap {s.get('gap', 1)} · "
@@ -233,7 +286,7 @@ async def show_main_menu(update: Update, msg=None):
     except Exception as e:
         text = (f"🦄 <b>unipool</b>\n❌ Gagal baca saldo: {esc(e)}\n\n"
                 f"Paste alamat token (<code>0x...</code>) untuk mulai.")
-    await edit(msg, text, MENU_KB)
+    await edit(msg, text, menu_kb())
 
 
 # ---------- Settings via tombol ----------
@@ -382,15 +435,19 @@ async def cmd_chain(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await reply(update, "⛓ <b>Pilih chain aktif:</b>", chain_kb())
 
 
-def wallet_text() -> str:
-    """Saldo semua token + USD (dipanggil di thread)."""
+WAL_PAGE = 6  # token ERC20 per halaman
+
+
+def wallet_text(page: int = 0) -> tuple[str, int, int]:
+    """Saldo semua token + USD, token ERC20 dipaginasi.
+    Return (text, page, pages). Dipanggil di thread."""
     s = store.load_settings()
     cid = s["chain"]
     cfg = ch.CHAINS[cid]
     w3 = ch.get_w3(cid)
     addr = wallet_address()
     eth_usd = ch.quote_usd_price(w3, cid, cfg["wrapped_symbol"])
-    lines = [f"<b>Wallet</b> <code>{esc(addr)}</code> — {esc(cfg['name'])}"]
+    lines = [f"<b>Wallet {esc(wallet_label())}</b> <code>{esc(addr)}</code> — {esc(cfg['name'])}"]
     total = 0.0
     native = w3.eth.get_balance(addr) / 1e18
     total += native * eth_usd
@@ -401,8 +458,9 @@ def wallet_text() -> str:
         usd = bal * (1.0 if sym in cfg["stable_syms"] else eth_usd)
         total += usd
         lines.append(f"{esc(sym)}: {ch.fmt_amount(bal)} ({ch.fmt_usd(usd)})")
-    # token ERC20 lain (meme hasil close, dll) — via Alchemy
+    # token ERC20 lain (meme hasil close, dll) — via Alchemy, urut nilai USD
     quote_addrs = {a.lower() for a in cfg["quotes"].values()}
+    toks = []
     for t in ch.wallet_tokens(cid, addr):
         if t["address"].lower() in quote_addrs:
             continue
@@ -410,21 +468,36 @@ def wallet_text() -> str:
         price = ch.token_usd_price(w3, cid, t["address"])
         usd = bal * price
         total += usd
+        toks.append((usd, price, bal, t["symbol"], t["address"]))
+    toks.sort(key=lambda x: -x[0])
+    pages = max(1, -(-len(toks) // WAL_PAGE))
+    page = min(max(0, page), pages - 1)
+    if toks:
+        lines.append(f"\n🪙 <b>Token ({len(toks)})</b> — halaman {page + 1}/{pages}:")
+    for usd, price, bal, sym, address in toks[page * WAL_PAGE:(page + 1) * WAL_PAGE]:
         usd_txt = f" ({ch.fmt_usd(usd)})" if price else " (harga ?)"
-        lines.append(f"{esc(t['symbol'])}: {ch.fmt_amount(bal)}{usd_txt}")
-        lines.append(f"<code>{esc(t['address'])}</code>")
+        lines.append(f"{esc(sym)}: {ch.fmt_amount(bal)}{usd_txt}")
+        lines.append(f"<code>{esc(address)}</code>")
     lines.append(f"\n<b>Total: {ch.fmt_usd(total)}</b> · 1 {esc(cfg['wrapped_symbol'])} = ${eth_usd:,.0f}")
-    return "\n".join(lines)
+    return "\n".join(lines), page, pages
 
 
-def wallet_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 Segarkan", callback_data="menu|wallet")],
-        BACK_ROW,
-    ])
+def wallet_kb(page: int = 0, pages: int = 1) -> InlineKeyboardMarkup:
+    rows = []
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("⬅️", callback_data=f"wal|{page - 1}"))
+        nav.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="noop"))
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton("➡️", callback_data=f"wal|{page + 1}"))
+        rows.append(nav)
+    rows.append([InlineKeyboardButton("🔄 Segarkan", callback_data=f"wal|{page}")])
+    rows.append(BACK_ROW)
+    return InlineKeyboardMarkup(rows)
 
 
-async def cmd_wallet(update: Update, _, status_msg=None):
+async def cmd_wallet(update: Update, _, status_msg=None, page: int = 0):
     if not authorized(update):
         return
     if status_msg is None:
@@ -433,10 +506,10 @@ async def cmd_wallet(update: Update, _, status_msg=None):
         msg = status_msg
         await edit(msg, "⏳ Memuat wallet...")
     try:
-        text = await asyncio.to_thread(wallet_text)
+        text, page, pages = await asyncio.to_thread(wallet_text, page)
     except Exception as e:
-        text = f"❌ Gagal baca wallet: {esc(e)}"
-    await edit(msg, text, wallet_kb())
+        text, pages = f"❌ Gagal baca wallet: {esc(e)}", 1
+    await edit(msg, text, wallet_kb(page, pages))
 
 
 # ---------- Discovery: paste alamat ----------
@@ -1022,7 +1095,11 @@ async def cmd_list(update: Update, _, status_msg=None):
     pnl = summary["withdrawals"] + summary["fees_claimed"] + open_value + unclaimed - deposits
     pnl_pct = (pnl / deposits * 100) if deposits else 0.0
 
-    lines = [
+    lines = []
+    if len(all_pks()) > 1:
+        waddr = wallet_address()
+        lines.append(f"👛 {esc(wallet_label())} <code>{esc(waddr[:6])}…{esc(waddr[-4:])}</code>")
+    lines += [
         f"<b>Portfolio PnL {ch.fmt_usd(pnl)} ({pnl_pct:+.2f}%)</b>",
         (f"deposits {ch.fmt_usd(deposits)} | withdrawals {ch.fmt_usd(summary['withdrawals'])} | "
          f"fees claimed {ch.fmt_usd(summary['fees_claimed'])}"),
@@ -1392,9 +1469,20 @@ async def on_callback(update: Update, _):
     if data == "refresh":
         await cmd_list(update, None, status_msg=q.message)
         return
+    if data == "noop":
+        return
     # --- navigasi menu (edit in-place) ---
     if data == "menu|main":
         await show_main_menu(update, msg=q.message)
+        return
+    if data.startswith("wsel|"):
+        s = store.load_settings()
+        s["wallet_idx"] = int(data.split("|")[1])
+        store.save_settings(s)
+        await show_main_menu(update, msg=q.message)
+        return
+    if data.startswith("wal|"):
+        await cmd_wallet(update, None, status_msg=q.message, page=int(data.split("|")[1]))
         return
     if data == "menu|list":
         await cmd_list(update, None, status_msg=q.message)
@@ -1518,7 +1606,9 @@ async def monitor_loop(app):
             continue
         cid = s["chain"]
         try:
-            positions = await asyncio.to_thread(ch.list_positions, cid, pk())
+            positions = []
+            for key in all_pks():
+                positions += await asyncio.to_thread(ch.list_positions, cid, key)
             for p in positions:
                 key = (cid, p["token_id"])
                 now_in = p["in_range"]
@@ -1605,7 +1695,8 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_address))
     app.add_error_handler(on_error)
     start_chart_server()
-    log.info("LP bot jalan. Wallet: %s", wallet_address())
+    log.info("LP bot jalan. Wallet: %s",
+             ", ".join(f"W{i + 1} {_addr_of(k)}" for i, k in enumerate(all_pks())))
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
