@@ -21,7 +21,8 @@ import uuid
 from pathlib import Path
 
 from dotenv import load_dotenv
-from telegram import ForceReply, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (BotCommand, ForceReply, InlineKeyboardButton,
+                      InlineKeyboardMarkup, Update)
 from telegram.constants import ParseMode
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
                           ContextTypes, MessageHandler, filters)
@@ -159,60 +160,92 @@ def range_str(p: dict) -> str:
     return f"{ch.fmt_price(lo)}–{ch.fmt_price(hi)} (now {ch.fmt_price(now)})"
 
 
-# ---------- Commands ----------
+# ---------- Commands & menu utama ----------
 HELP = (
-    "<b>LP Bot — Uniswap V3 (Robinhood + BSC)</b>\n\n"
-    "Paste alamat token (0x...) → bot cari pool → pilih → mint LP single-sided quote.\n\n"
+    "<b>unipool — LP Uniswap V3 (Robinhood + BSC)</b>\n\n"
+    "Paste alamat token (0x...) → bot cari pool → pilih → atur strategi → mint.\n"
+    "/start membuka menu utama (dashboard saldo + tombol navigasi).\n\n"
     "<b>Perintah:</b>\n"
-    "/list — posisi + PnL + tombol close\n"
-    "/wallet — saldo wallet\n"
-    "/settings — lihat setting\n"
-    "/set <code>key value</code> — ubah setting (width, amount, amount_pct, slippage, gap, autoswap)\n"
-    "/chain <code>4663|56</code> — ganti chain aktif\n\n"
-    "<b>Contoh:</b>\n"
-    "<code>/set width 30</code> — range 30%\n"
-    "<code>/set amount 0.05</code> — deposit fix 0.05 quote\n"
-    "<code>/set amount_pct 50</code> — deposit 50% saldo quote\n"
-    "<code>/set gap 0</code> — range nempel harga (token stabil; default 1)\n"
-    "<code>/set alert 60</code> — cek posisi tiap 60 detik, alert keluar/masuk range (off = mati)\n"
-    "<code>/set autoswap off</code>"
+    "/start — menu utama\n"
+    "/list — posisi + PnL + chart/add/reduce/close\n"
+    "/wallet — saldo semua token + nilai USD\n"
+    "/settings — pengaturan via tombol\n"
+    "/set <code>key value</code> — set manual (width, amount, amount_pct, slippage, gap, alert, autoswap)\n"
+    "/chain — ganti chain aktif\n\n"
+    "<b>Custom saat kartu konfirmasi aktif:</b>\n"
+    "<code>r 40 120</code> — range −40%/+120%\n"
+    "<code>a 30%</code> / <code>a 0.005</code> — amount"
 )
 
+MENU_KB = InlineKeyboardMarkup([
+    [InlineKeyboardButton("📊 Posisi LP", callback_data="menu|list"),
+     InlineKeyboardButton("👛 Dompet", callback_data="menu|wallet")],
+    [InlineKeyboardButton("⚙️ Pengaturan", callback_data="menu|settings"),
+     InlineKeyboardButton("⛓ Chain", callback_data="menu|chain")],
+    [InlineKeyboardButton("❓ Bantuan", callback_data="menu|help"),
+     InlineKeyboardButton("🔄 Segarkan", callback_data="menu|main")],
+])
+BACK_ROW = [InlineKeyboardButton("⬅️ Menu", callback_data="menu|main")]
+NAV_KB = InlineKeyboardMarkup([
+    [InlineKeyboardButton("📊 Posisi", callback_data="go|list"),
+     InlineKeyboardButton("🏠 Menu", callback_data="go|main")],
+])
 
-async def cmd_start(update: Update, _):
-    if not authorized(update):
-        return
-    await reply(update, HELP)
 
-
-async def cmd_settings(update: Update, _):
-    if not authorized(update):
-        return
+def build_main_menu() -> str:
+    """Dashboard: saldo inti + ringkasan setting (dipanggil di thread)."""
     s = store.load_settings()
-    cfg = ch.CHAINS[s["chain"]]
-    amount = f"{s['amount_fixed']} quote (fix)" if s["amount_fixed"] else f"{s['amount_pct']}% saldo quote"
-    await reply(update, (
-        f"<b>Settings</b>\n"
-        f"chain: {s['chain']} ({esc(cfg['name'])})\n"
-        f"width: {s['width_pct']}%\n"
-        f"amount: {esc(amount)}\n"
-        f"slippage: {s['slippage_pct']}%\n"
-        f"gap: {s.get('gap', 1)} tick-spacing (0 = range nempel harga)\n"
-        f"alert in/out range: {('tiap ' + str(int(s.get('alert_secs', 60))) + 's') if s.get('alert_secs') else 'off'}\n"
-        f"autoswap after close: {'on' if s['autoswap'] else 'off'}\n"
-        f"wallet: <code>{esc(wallet_address())}</code>"
-    ))
+    cid = s["chain"]
+    cfg = ch.CHAINS[cid]
+    w3 = ch.get_w3(cid)
+    addr = wallet_address()
+    eth_usd = ch.quote_usd_price(w3, cid, cfg["wrapped_symbol"])
+    native = w3.eth.get_balance(addr) / 1e18
+    total = native * eth_usd
+    bal_lines = [f"· {esc(cfg['native_symbol'])}: {ch.fmt_amount(native)} ({ch.fmt_usd(native * eth_usd)})"]
+    for sym, a in cfg["quotes"].items():
+        c = ch.erc20(w3, a)
+        bal = c.functions.balanceOf(addr).call() / 10 ** c.functions.decimals().call()
+        usd = bal * (1.0 if sym in cfg["stable_syms"] else eth_usd)
+        total += usd
+        bal_lines.append(f"· {esc(sym)}: {ch.fmt_amount(bal)} ({ch.fmt_usd(usd)})")
+    amount = f"{s['amount_fixed']:g} fix" if s["amount_fixed"] else f"{s['amount_pct']:g}%"
+    alert = f"{int(s.get('alert_secs', 60))}s" if s.get("alert_secs") else "off"
+    return (
+        f"🦄 <b>unipool</b> — LP Uniswap V3\n"
+        f"⛓ {esc(cfg['name'])} (chain {cid})\n"
+        f"EVM: <code>{esc(addr)}</code>\n\n"
+        f"💰 <b>Saldo:</b>\n" + "\n".join(bal_lines) + "\n"
+        f"<b>Total: {ch.fmt_usd(total)}</b> · 1 {esc(cfg['wrapped_symbol'])} = ${eth_usd:,.0f}\n\n"
+        f"⚙️ amount {esc(amount)} · slippage {s['slippage_pct']:g}% · gap {s.get('gap', 1)} · "
+        f"alert {alert} · autoswap {'ON' if s['autoswap'] else 'OFF'}\n\n"
+        f"📥 Paste alamat token (<code>0x...</code>) untuk buka posisi baru."
+    )
 
 
-async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not authorized(update):
-        return
-    args = context.args or []
-    if len(args) != 2:
-        await reply(update, "Format: /set key value (width, amount, amount_pct, slippage, autoswap)")
-        return
-    key, val = args[0].lower(), args[1].lower()
-    s = store.load_settings()
+async def show_main_menu(update: Update, msg=None):
+    if msg is None:
+        msg = await reply(update, "⏳ Memuat menu...")
+    else:
+        await edit(msg, "⏳ Memuat menu...")
+    try:
+        text = await asyncio.to_thread(build_main_menu)
+    except Exception as e:
+        text = (f"🦄 <b>unipool</b>\n❌ Gagal baca saldo: {esc(e)}\n\n"
+                f"Paste alamat token (<code>0x...</code>) untuk mulai.")
+    await edit(msg, text, MENU_KB)
+
+
+# ---------- Settings via tombol ----------
+SET_KEYS = "width, amount, amount_pct, slippage, gap, alert, autoswap"
+SLIP_STEPS = [0.5, 1.0, 3.0, 5.0, 10.0]
+ALERT_STEPS = [0, 30, 60, 120, 300, 600]
+AMT_STEPS = [25.0, 50.0, 75.0, 100.0]
+WIDTH_STEPS = [10.0, 20.0, 30.0, 50.0, 100.0]
+
+
+def apply_setting(s: dict, key: str, val: str) -> str | None:
+    """Mutasi s; return pesan error atau None kalau sukses."""
     try:
         if key == "width":
             s["width_pct"] = max(0.1, float(val))
@@ -230,66 +263,180 @@ async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif key == "autoswap":
             s["autoswap"] = val in ("on", "true", "1", "yes")
         else:
-            await reply(update, f"Key tidak dikenal: {esc(key)}")
-            return
+            return f"Key tidak dikenal: {key}"
     except ValueError:
-        await reply(update, "Value tidak valid.")
+        return "Value tidak valid."
+    return None
+
+
+def _next_step(steps: list, cur):
+    try:
+        return steps[(steps.index(cur) + 1) % len(steps)]
+    except ValueError:
+        return steps[0]
+
+
+def cycle_setting(key: str):
+    s = store.load_settings()
+    if key == "slippage":
+        s["slippage_pct"] = _next_step(SLIP_STEPS, s["slippage_pct"])
+    elif key == "gap":
+        s["gap"] = (int(s.get("gap", 1)) + 1) % 6
+    elif key == "alert":
+        s["alert_secs"] = _next_step(ALERT_STEPS, int(s.get("alert_secs", 60) or 0))
+    elif key == "autoswap":
+        s["autoswap"] = not s["autoswap"]
+    elif key == "amount":
+        s["amount_pct"] = _next_step(AMT_STEPS, 0 if s["amount_fixed"] else s["amount_pct"])
+        s["amount_fixed"] = None
+    elif key == "width":
+        s["width_pct"] = _next_step(WIDTH_STEPS, s["width_pct"])
+    store.save_settings(s)
+
+
+def settings_text() -> str:
+    s = store.load_settings()
+    cfg = ch.CHAINS[s["chain"]]
+    return (
+        "⚙️ <b>Pengaturan</b>\n"
+        f"Chain aktif: {s['chain']} ({esc(cfg['name'])})\n\n"
+        "Klik tombol untuk ganti nilai (▸ = putar preset).\n"
+        "· <b>Slippage</b> — toleransi harga saat mint/swap\n"
+        "· <b>Gap</b> — jarak range single-sided dari harga (tick-spacing; 0 = nempel)\n"
+        "· <b>Alert</b> — interval cek posisi keluar/masuk range\n"
+        "· <b>Autoswap</b> — hasil close otomatis di-swap ke wrapped native\n"
+        "· <b>Amount</b> — default besaran deposit\n"
+        "· <b>Width</b> — default lebar range %"
+    )
+
+
+def settings_kb() -> InlineKeyboardMarkup:
+    s = store.load_settings()
+    alert = f"{int(s.get('alert_secs', 60))}s" if s.get("alert_secs") else "off"
+    amount = f"{s['amount_fixed']:g} fix" if s["amount_fixed"] else f"{s['amount_pct']:g}%"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"Slippage: {s['slippage_pct']:g}% ▸", callback_data="cyc|slippage"),
+         InlineKeyboardButton(f"Gap: {s.get('gap', 1)} ▸", callback_data="cyc|gap")],
+        [InlineKeyboardButton(f"Alert: {alert} ▸", callback_data="cyc|alert"),
+         InlineKeyboardButton(f"Autoswap: {'✅ ON' if s['autoswap'] else '🚫 OFF'}", callback_data="cyc|autoswap")],
+        [InlineKeyboardButton(f"Amount: {amount} ▸", callback_data="cyc|amount"),
+         InlineKeyboardButton(f"Width: {s['width_pct']:g}% ▸", callback_data="cyc|width")],
+        [InlineKeyboardButton("✏️ Set nilai manual…", callback_data="askset")],
+        BACK_ROW,
+    ])
+
+
+def chain_kb() -> InlineKeyboardMarkup:
+    cur = store.load_settings()["chain"]
+    rows = [[InlineKeyboardButton(("✓ " if cid == cur else "") + f"{cfg['name']} ({cid})",
+                                  callback_data=f"chsel|{cid}")]
+            for cid, cfg in ch.CHAINS.items()]
+    rows.append(BACK_ROW)
+    return InlineKeyboardMarkup(rows)
+
+
+async def cmd_start(update: Update, _):
+    if not authorized(update):
+        return
+    await show_main_menu(update)
+
+
+async def cmd_help(update: Update, _):
+    if not authorized(update):
+        return
+    await reply(update, HELP, InlineKeyboardMarkup([BACK_ROW]))
+
+
+async def cmd_settings(update: Update, _):
+    if not authorized(update):
+        return
+    await reply(update, settings_text(), settings_kb())
+
+
+async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not authorized(update):
+        return
+    args = context.args or []
+    if len(args) != 2:
+        await reply(update, f"Format: /set key value ({SET_KEYS})")
+        return
+    s = store.load_settings()
+    err = apply_setting(s, args[0].lower(), args[1].lower())
+    if err:
+        await reply(update, f"❌ {esc(err)}")
         return
     store.save_settings(s)
-    await cmd_settings(update, context)
+    await reply(update, settings_text(), settings_kb())
 
 
 async def cmd_chain(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorized(update):
         return
     args = context.args or []
-    if not args or int(args[0]) not in ch.CHAINS:
-        await reply(update, "Format: /chain 4663 (Robinhood) atau /chain 56 (BSC)")
+    if args and args[0].isdigit() and int(args[0]) in ch.CHAINS:
+        s = store.load_settings()
+        s["chain"] = int(args[0])
+        store.save_settings(s)
+        await reply(update, f"✅ Chain aktif: {s['chain']} ({esc(ch.CHAINS[s['chain']]['name'])})")
         return
-    s = store.load_settings()
-    s["chain"] = int(args[0])
-    store.save_settings(s)
-    await reply(update, f"Chain aktif: {s['chain']} ({esc(ch.CHAINS[s['chain']]['name'])})")
+    await reply(update, "⛓ <b>Pilih chain aktif:</b>", chain_kb())
 
 
-async def cmd_wallet(update: Update, _):
-    if not authorized(update):
-        return
+def wallet_text() -> str:
+    """Saldo semua token + USD (dipanggil di thread)."""
     s = store.load_settings()
     cid = s["chain"]
     cfg = ch.CHAINS[cid]
+    w3 = ch.get_w3(cid)
+    addr = wallet_address()
+    eth_usd = ch.quote_usd_price(w3, cid, cfg["wrapped_symbol"])
+    lines = [f"<b>Wallet</b> <code>{esc(addr)}</code> — {esc(cfg['name'])}"]
+    total = 0.0
+    native = w3.eth.get_balance(addr) / 1e18
+    total += native * eth_usd
+    lines.append(f"{esc(cfg['native_symbol'])}: {ch.fmt_amount(native)} ({ch.fmt_usd(native * eth_usd)})")
+    for sym, a in cfg["quotes"].items():
+        c = ch.erc20(w3, a)
+        bal = c.functions.balanceOf(addr).call() / 10 ** c.functions.decimals().call()
+        usd = bal * (1.0 if sym in cfg["stable_syms"] else eth_usd)
+        total += usd
+        lines.append(f"{esc(sym)}: {ch.fmt_amount(bal)} ({ch.fmt_usd(usd)})")
+    # token ERC20 lain (meme hasil close, dll) — via Alchemy
+    quote_addrs = {a.lower() for a in cfg["quotes"].values()}
+    for t in ch.wallet_tokens(cid, addr):
+        if t["address"].lower() in quote_addrs:
+            continue
+        bal = t["raw"] / 10 ** t["decimals"]
+        price = ch.token_usd_price(w3, cid, t["address"])
+        usd = bal * price
+        total += usd
+        usd_txt = f" ({ch.fmt_usd(usd)})" if price else " (harga ?)"
+        lines.append(f"{esc(t['symbol'])}: {ch.fmt_amount(bal)}{usd_txt}")
+        lines.append(f"<code>{esc(t['address'])}</code>")
+    lines.append(f"\n<b>Total: {ch.fmt_usd(total)}</b> · 1 {esc(cfg['wrapped_symbol'])} = ${eth_usd:,.0f}")
+    return "\n".join(lines)
 
-    def work():
-        w3 = ch.get_w3(cid)
-        addr = wallet_address()
-        eth_usd = ch.quote_usd_price(w3, cid, cfg["wrapped_symbol"])
-        lines = [f"<b>Wallet</b> <code>{esc(addr)}</code> — {esc(cfg['name'])}"]
-        total = 0.0
-        native = w3.eth.get_balance(addr) / 1e18
-        total += native * eth_usd
-        lines.append(f"{esc(cfg['native_symbol'])}: {ch.fmt_amount(native)} ({ch.fmt_usd(native * eth_usd)})")
-        for sym, a in cfg["quotes"].items():
-            c = ch.erc20(w3, a)
-            bal = c.functions.balanceOf(addr).call() / 10 ** c.functions.decimals().call()
-            usd = bal * (1.0 if sym in cfg["stable_syms"] else eth_usd)
-            total += usd
-            lines.append(f"{esc(sym)}: {ch.fmt_amount(bal)} ({ch.fmt_usd(usd)})")
-        # token ERC20 lain (meme hasil close, dll) — via Alchemy
-        quote_addrs = {a.lower() for a in cfg["quotes"].values()}
-        for t in ch.wallet_tokens(cid, addr):
-            if t["address"].lower() in quote_addrs:
-                continue
-            bal = t["raw"] / 10 ** t["decimals"]
-            price = ch.token_usd_price(w3, cid, t["address"])
-            usd = bal * price
-            total += usd
-            usd_txt = f" ({ch.fmt_usd(usd)})" if price else " (harga ?)"
-            lines.append(f"{esc(t['symbol'])}: {ch.fmt_amount(bal)}{usd_txt}")
-            lines.append(f"<code>{esc(t['address'])}</code>")
-        lines.append(f"\n<b>Total: {ch.fmt_usd(total)}</b> · 1 {esc(cfg['wrapped_symbol'])} = ${eth_usd:,.0f}")
-        return "\n".join(lines)
 
-    await reply(update, await asyncio.to_thread(work))
+def wallet_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Segarkan", callback_data="menu|wallet")],
+        BACK_ROW,
+    ])
+
+
+async def cmd_wallet(update: Update, _, status_msg=None):
+    if not authorized(update):
+        return
+    if status_msg is None:
+        msg = await reply(update, "⏳ Memuat wallet...")
+    else:
+        msg = status_msg
+        await edit(msg, "⏳ Memuat wallet...")
+    try:
+        text = await asyncio.to_thread(wallet_text)
+    except Exception as e:
+        text = f"❌ Gagal baca wallet: {esc(e)}"
+    await edit(msg, text, wallet_kb())
 
 
 # ---------- Discovery: paste alamat ----------
@@ -685,6 +832,20 @@ async def handle_awaiting(update: Update) -> bool:
     st = AWAITING.get(chat_id)
     if not st:
         return False
+    if st["kind"] == "setval":
+        parts = (update.message.text or "").strip().lower().split()
+        if len(parts) != 2:
+            await reply(update, f"❌ Format: <code>key value</code>\nkey: {SET_KEYS}")
+            return True
+        s = store.load_settings()
+        err = apply_setting(s, parts[0], parts[1])
+        if err:
+            await reply(update, f"❌ {esc(err)}")
+            return True
+        store.save_settings(s)
+        AWAITING.pop(chat_id, None)
+        await reply(update, settings_text(), settings_kb())
+        return True
     if st["kind"] == "addamt":
         text = (update.message.text or "").strip()
         try:
@@ -831,7 +992,7 @@ async def do_mint(update: Update, ctx_data: dict):
                      f"({ch.fmt_usd(r['deposited_usd'])})"))
     if r["token_id"]:
         lines.append(ch.pos_link(cid, r["token_id"]))
-    await edit(status, "\n".join(lines))
+    await edit(status, "\n".join(lines), NAV_KB)
 
 
 # ---------- /list ----------
@@ -914,6 +1075,7 @@ async def cmd_list(update: Update, _, status_msg=None):
             InlineKeyboardButton(f"🗑 Close {meme_sym} #{p['token_id']}", callback_data=f"close|{p['token_id']}"),
         ])
     buttons.insert(0, [InlineKeyboardButton("🔄 Refresh", callback_data="refresh")])
+    buttons.append(BACK_ROW)
     await edit(status, "\n".join(lines), InlineKeyboardMarkup(buttons))
 
 
@@ -1094,7 +1256,7 @@ async def do_add_exec(update: Update, token_id: int, val: float, is_pct: bool):
     for label, h in r["steps"]:
         lines.append(f"{label}: {ch.tx_link(cid, h)}")
     lines.append(ch.pos_link(cid, token_id))
-    await edit(status, "\n".join(lines))
+    await edit(status, "\n".join(lines), NAV_KB)
 
 
 async def ask_reduce(update: Update, token_id: int):
@@ -1136,7 +1298,7 @@ async def do_reduce_exec(update: Update, token_id: int, pct: int):
     for label, h in r["steps"]:
         lines.append(f"{label}: {ch.tx_link(cid, h)}")
     lines.append(ch.pos_link(cid, token_id))
-    await edit(status, "\n".join(lines))
+    await edit(status, "\n".join(lines), NAV_KB)
 
 
 # ---------- Close flow ----------
@@ -1203,7 +1365,7 @@ async def do_close(update: Update, token_id: int, autoswap: bool):
     lines.append(f"Withdrawal value ~{ch.fmt_usd(usd)}")
     for label, h in r["steps"]:
         lines.append(f"{label}: {ch.tx_link(cid, h)}")
-    await edit(status, "\n".join(lines))
+    await edit(status, "\n".join(lines), NAV_KB)
 
     if r["swaps"]:
         lines = ["🔄 Auto-swap hasil close:"]
@@ -1229,6 +1391,51 @@ async def on_callback(update: Update, _):
         return
     if data == "refresh":
         await cmd_list(update, None, status_msg=q.message)
+        return
+    # --- navigasi menu (edit in-place) ---
+    if data == "menu|main":
+        await show_main_menu(update, msg=q.message)
+        return
+    if data == "menu|list":
+        await cmd_list(update, None, status_msg=q.message)
+        return
+    if data == "menu|wallet":
+        await cmd_wallet(update, None, status_msg=q.message)
+        return
+    if data == "menu|settings":
+        await edit(q.message, settings_text(), settings_kb())
+        return
+    if data == "menu|chain":
+        await edit(q.message, "⛓ <b>Pilih chain aktif:</b>", chain_kb())
+        return
+    if data == "menu|help":
+        await edit(q.message, HELP, InlineKeyboardMarkup([BACK_ROW]))
+        return
+    # --- navigasi pesan baru (dipakai dari receipt tx, biar receipt tetap ada) ---
+    if data == "go|main":
+        await show_main_menu(update)
+        return
+    if data == "go|list":
+        await cmd_list(update, None)
+        return
+    if data.startswith("chsel|"):
+        s = store.load_settings()
+        s["chain"] = int(data.split("|")[1])
+        store.save_settings(s)
+        await show_main_menu(update, msg=q.message)
+        return
+    if data.startswith("cyc|"):
+        cycle_setting(data.split("|")[1])
+        await edit(q.message, settings_text(), settings_kb())
+        return
+    if data == "askset":
+        await update.effective_chat.send_message(
+            ("✏️ <b>Balas pesan ini</b> dengan <code>key value</code>\n"
+             f"key: {SET_KEYS}\n"
+             "contoh: <code>slippage 3</code> · <code>amount 0.05</code> · <code>alert off</code>"),
+            parse_mode=ParseMode.HTML,
+            reply_markup=ForceReply(selective=True, input_field_placeholder="slippage 3"))
+        AWAITING[update.effective_chat.id] = {"kind": "setval", "key": ""}
         return
     if data.startswith("pool|"):
         # pilih pool → kartu konfirmasi (belum mint)
@@ -1351,6 +1558,18 @@ async def monitor_loop(app):
 
 
 async def post_init(app):
+    # daftar command → muncul di menu Telegram saat user ketik "/"
+    try:
+        await app.bot.set_my_commands([
+            BotCommand("start", "Menu utama (dashboard saldo)"),
+            BotCommand("list", "Posisi LP + PnL + chart/close"),
+            BotCommand("wallet", "Saldo semua token + nilai USD"),
+            BotCommand("settings", "Pengaturan via tombol"),
+            BotCommand("chain", "Ganti chain aktif"),
+            BotCommand("help", "Bantuan & daftar perintah"),
+        ])
+    except Exception as e:
+        log.warning("set_my_commands gagal: %s", e)
     app.create_task(monitor_loop(app))
 
 
@@ -1375,7 +1594,8 @@ def main():
         sys.exit("❌ PRIVATE_KEY belum diset (.env).")
 
     app = Application.builder().token(token).post_init(post_init).build()
-    app.add_handler(CommandHandler(["start", "help"], cmd_start))
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("settings", cmd_settings))
     app.add_handler(CommandHandler("set", cmd_set))
     app.add_handler(CommandHandler("chain", cmd_chain))

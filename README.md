@@ -13,6 +13,7 @@ Paste alamat token → bot cari pool → pilih strategi → mint posisi LP. Pant
 - 📊 **/list** — nilai posisi, fee unclaimed, PnL per posisi & portfolio, status IN/OUT range
 - 📈 **Chart live** — grafik market cap + kotak range posisi, refresh 3 detik, link dexscreener
 - 🔔 **Alert** otomatis saat posisi keluar/masuk range
+- 🧭 **Menu navigasi** — `/start` membuka dashboard (saldo + tombol Posisi/Dompet/Pengaturan/Chain); semua setting bisa diubah lewat tombol tanpa hafal perintah
 - 🛡️ **Failover RPC** multi-endpoint + bypass blokir DNS ISP Indonesia (DoH + koneksi IP langsung, sertifikat tetap diverifikasi)
 - 💰 Harga token berlapis: pool v3 → pair v2 → API dexscreener
 
@@ -87,6 +88,7 @@ Log `LP bot jalan. Wallet: 0x...` = siap. Buka chat bot kamu di Telegram, kirim 
 
 | Perintah | Fungsi |
 |---|---|
+| `/start` | menu utama: dashboard saldo + tombol navigasi |
 | paste `0x...` | cari pool token di chain aktif |
 | `/list` | posisi + PnL + tombol chart/close |
 | `/wallet` | saldo semua token + nilai USD + CA |
