@@ -1171,7 +1171,8 @@ async def cmd_list(update: Update, _, status_msg=None):
         ])
         buttons.append([
             InlineKeyboardButton(f"➖ Reduce #{p['token_id']}", callback_data=f"red|{p['token_id']}"),
-            InlineKeyboardButton(f"🗑 Close {meme_sym} #{p['token_id']}", callback_data=f"close|{p['token_id']}"),
+            InlineKeyboardButton(f"💰 Fee #{p['token_id']}", callback_data=f"fee|{p['token_id']}"),
+            InlineKeyboardButton(f"🗑 Close #{p['token_id']}", callback_data=f"close|{p['token_id']}"),
         ])
     buttons.insert(0, [InlineKeyboardButton("🔄 Refresh", callback_data="refresh")])
     buttons.append(BACK_ROW)
@@ -1409,6 +1410,35 @@ async def do_reduce_exec(update: Update, token_id: int, pct: int):
     await edit(status, "\n".join(lines), NAV_KB)
 
 
+# ---------- Collect fee ----------
+async def do_collect(update: Update, token_id: int):
+    s = store.load_settings()
+    cid = s["chain"]
+
+    def find_pos():
+        return next((p for p in ch.list_positions(cid, pk()) if p["token_id"] == token_id), None)
+
+    pos = await asyncio.to_thread(find_pos)
+    status = await reply(update, f"⏳ Collect fee #{token_id}...")
+    async with TX_LOCK:
+        try:
+            r = await asyncio.to_thread(ch.collect_fees, cid, pk(), token_id)
+        except Exception as e:
+            await edit(status, f"❌ Collect gagal: {esc(e)}")
+            return
+    usd_txt = ""
+    if pos and pos["unclaimed_usd"] > 0:
+        store.record_event(cid, "fees", token_id, pos["unclaimed_usd"], wallet=wallet_address())
+        usd_txt = f" (~{ch.fmt_usd(pos['unclaimed_usd'])})"
+    lines = [f"✅ <b>Fee terklaim #{token_id}</b>{usd_txt}",
+             f"Received {ch.fmt_amount(r['got0'])} {esc(r['sym0'])} + "
+             f"{ch.fmt_amount(r['got1'])} {esc(r['sym1'])}",
+             "<i>Posisi tetap jalan — liquidity tidak berubah.</i>"]
+    for label, h in r["steps"]:
+        lines.append(f"{label}: {ch.tx_link(cid, h)}")
+    await edit(status, "\n".join(lines), NAV_KB)
+
+
 # ---------- Close flow ----------
 async def ask_close(update: Update, token_id: int):
     s = store.load_settings()
@@ -1606,6 +1636,9 @@ async def on_callback(update: Update, _):
         _, tid, val, kind = data.split("|")
         await q.edit_message_reply_markup(None)
         await do_add_exec(update, int(tid), float(val), kind == "p")
+        return
+    if data.startswith("fee|"):
+        await do_collect(update, int(data.split("|", 1)[1]))
         return
     if data.startswith("red|"):
         await ask_reduce(update, int(data.split("|", 1)[1]))

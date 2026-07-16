@@ -81,7 +81,7 @@ Log `LP bot jalan. Wallet: 0x...` = siap. Buka chat bot kamu di Telegram, kirim 
 2. Pilih pool → muncul **kartu konfirmasi**: strategi, range (dalam market cap), komposisi deposit, rencana wrap/swap
 3. Atur pakai tombol (strategi / preset range / amount) atau **✏️ Custom** — balas dengan `40 120` (persen) atau `mc 300k 800k`
 4. **✅ Confirm mint** → bot eksekusi wrap → approve → mint, kirim semua link transaksi
-5. `/list` → pantau; tombol **📈 Chart** (grafik live + box range) dan **🗑 Close**
+5. `/list` → pantau; tombol **📈 Chart** (grafik live + box range), **➕ Add**, **➖ Reduce**, **💰 Fee** (collect fee tanpa close), **🗑 Close**
 6. Close → pilih **swap semua → WETH** atau **tahan token**
 
 ## Perintah

@@ -1232,6 +1232,30 @@ def decrease_position(chain_id: int, pk: str, token_id: int, pct: int) -> dict:
             "sym0": i0["symbol"], "sym1": i1["symbol"]}
 
 
+def collect_fees(chain_id: int, pk: str, token_id: int) -> dict:
+    """Klaim fee unclaimed saja — liquidity posisi tidak berubah.
+    (NPM.collect nge-poke pool dulu kalau liquidity > 0, jadi fee ter-update.)"""
+    w3 = get_w3(chain_id)
+    cfg = CHAINS[chain_id]
+    account = w3.eth.account.from_key(pk)
+    npm = w3.eth.contract(address=Web3.to_checksum_address(cfg["npm"]), abi=NPM_ABI)
+
+    (_, _, t0, t1, *_rest) = npm.functions.positions(token_id).call()
+    i0, i1 = token_info(w3, t0), token_info(w3, t1)
+
+    got0, got1 = npm.functions.collect((token_id, account.address, MAX_UINT128, MAX_UINT128)).call(
+        {"from": account.address})
+    if got0 == 0 and got1 == 0:
+        raise RuntimeError("Tidak ada fee untuk diklaim.")
+    h = send_tx(w3, pk, {"to": cfg["npm"],
+                         "data": calldata(npm.functions.collect((token_id, account.address, MAX_UINT128, MAX_UINT128)))})
+    wait_ok(w3, h, "collect")
+
+    return {"steps": [("collect", h)],
+            "got0": got0 / 10 ** i0["decimals"], "got1": got1 / 10 ** i1["decimals"],
+            "sym0": i0["symbol"], "sym1": i1["symbol"]}
+
+
 # ---------- Close + auto-swap ----------
 def verify_router(w3: Web3, chain_id: int, _cache={}) -> bool:
     """Cek router.factory() == factory chain sebelum swap pertama."""
