@@ -31,6 +31,9 @@ import store
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("lp-bot")
+# long-polling getUpdates tiap ~10 detik itu normal — jangan banjiri log
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
 
 ADDR_RE = re.compile(r"\b(0x[0-9a-fA-F]{40})\b")
 CUSTOM_RANGE_RE = re.compile(r"^r(?:ange)?\s+(\d+(?:\.\d+)?)(?:\s+(\d+(?:\.\d+)?))?$", re.I)
