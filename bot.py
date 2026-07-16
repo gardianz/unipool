@@ -1131,52 +1131,113 @@ async def cmd_list(update: Update, _, status_msg=None):
     buttons = []
     if not positions:
         lines.append("Tidak ada posisi aktif.")
+    else:
+        lines.append("Klik posisi untuk detail + aksi:")
     for p in positions:
-        meme_sym = p["sym0"] if p["quote_is_token1"] else p["sym1"]
-        age = store.fmt_age(store.mint_ts(cid, p["token_id"]))
-        in_out = "🟢 IN" if p["in_range"] else "🔴 OUT"
-        dep = store.mint_usd(cid, p["token_id"])
-        claimed = store.fees_claimed_usd(cid, p["token_id"])
-        cur_total = p["value_usd"] + p["unclaimed_usd"]
-        if dep:
-            d = cur_total + claimed - dep
-            pos_pnl = f"PnL: {'+' if d >= 0 else '−'}${abs(d):.2f} ({d / dep * 100:+.1f}%)"
-        else:
-            pos_pnl = "PnL: ? (mint di luar bot)"
-        # APR riil posisi: fee (unclaimed + terklaim) vs modal vs umur
-        apr_txt = ""
-        mts = store.mint_ts(cid, p["token_id"])
-        if dep and mts:
-            age_days = max((int(time.time()) - mts) / 86400, 0.01)
-            apr = (p["unclaimed_usd"] + claimed) / dep / age_days * 365 * 100
-            apr_txt = f" | APR ~{apr:,.0f}%"
-        pct0 = p["usd0"] / p["value_usd"] * 100 if p["value_usd"] else 0
-        lines.append(
-            f"<b>{esc(meme_sym)}</b> #{p['token_id']} | Age: {age} | {in_out} | "
-            f"Range: {esc(range_str(p))}")
-        lines.append(
-            f"💼 Val {ch.fmt_usd(p['value_usd'])}: "
-            f"{ch.fmt_amount(p['amount0'])} {esc(p['sym0'])} ({ch.fmt_usd(p['usd0'])} · {pct0:.0f}%) + "
-            f"{ch.fmt_amount(p['amount1'])} {esc(p['sym1'])} ({ch.fmt_usd(p['usd1'])} · {100 - pct0:.0f}%)")
-        lines.append(
-            f"💰 Fee {ch.fmt_usd(p['unclaimed_usd'])}: "
-            f"{ch.fmt_amount(p['fees0'])} {esc(p['sym0'])} ({ch.fmt_usd(p['fees_usd0'])}) + "
-            f"{ch.fmt_amount(p['fees1'])} {esc(p['sym1'])} ({ch.fmt_usd(p['fees_usd1'])})")
-        lines.append(f"{pos_pnl}{apr_txt.replace(' | ', ' · ') if apr_txt else ''}")
-        lines.append(ch.pos_link(cid, p["token_id"]))
-        lines.append("")
-        buttons.append([
-            InlineKeyboardButton(f"📈 Chart #{p['token_id']}", callback_data=f"chart|{p['token_id']}"),
-            InlineKeyboardButton(f"➕ Add #{p['token_id']}", callback_data=f"add|{p['token_id']}"),
-        ])
-        buttons.append([
-            InlineKeyboardButton(f"➖ Reduce #{p['token_id']}", callback_data=f"red|{p['token_id']}"),
-            InlineKeyboardButton(f"💰 Fee #{p['token_id']}", callback_data=f"fee|{p['token_id']}"),
-            InlineKeyboardButton(f"🗑 Close #{p['token_id']}", callback_data=f"close|{p['token_id']}"),
-        ])
+        m = _pos_metrics(cid, p)
+        mark = "🟢" if p["in_range"] else "🔴"
+        label = f"{mark} {m['meme_sym']} #{p['token_id']} · {ch.fmt_usd(m['cur_total'])}"
+        if m["pnl_pct"] is not None:
+            label += f" · {m['pnl_pct']:+.0f}%"
+        label += f" · {m['age']}"
+        buttons.append([InlineKeyboardButton(label, callback_data=f"pos|{p['token_id']}")])
     buttons.insert(0, [InlineKeyboardButton("🔄 Refresh", callback_data="refresh")])
     buttons.append(BACK_ROW)
     await edit(status, "\n".join(lines), InlineKeyboardMarkup(buttons))
+
+
+def _pos_metrics(cid: int, p: dict) -> dict:
+    """Angka turunan posisi untuk label ringkasan + kartu detail."""
+    tid = p["token_id"]
+    dep = store.mint_usd(cid, tid)
+    claimed = store.fees_claimed_usd(cid, tid)
+    cur_total = p["value_usd"] + p["unclaimed_usd"]
+    mts = store.mint_ts(cid, tid)
+    pnl = pnl_pct = apr = None
+    if dep:
+        pnl = cur_total + claimed - dep
+        pnl_pct = pnl / dep * 100
+        if mts:
+            age_days = max((int(time.time()) - mts) / 86400, 0.01)
+            apr = (p["unclaimed_usd"] + claimed) / dep / age_days * 365 * 100
+    return {
+        "meme_sym": p["sym0"] if p["quote_is_token1"] else p["sym1"],
+        "dep": dep, "claimed": claimed, "cur_total": cur_total,
+        "pnl": pnl, "pnl_pct": pnl_pct, "apr": apr,
+        "age": store.fmt_age(mts),
+    }
+
+
+def position_card(cid: int, p: dict) -> str:
+    """Kartu detail satu posisi (ala BasedBot)."""
+    m = _pos_metrics(cid, p)
+    tid = p["token_id"]
+    in_out = "🟢 IN range" if p["in_range"] else "🔴 OUT of range"
+    meme_ca = p["token0"] if p["quote_is_token1"] else p["token1"]
+    pct0 = p["usd0"] / p["value_usd"] * 100 if p["value_usd"] else 0
+    if m["pnl"] is not None:
+        pnl_line = (f"{'🟩 Untung' if m['pnl'] >= 0 else '🟥 Rugi'}: "
+                    f"{'+' if m['pnl'] >= 0 else '−'}${abs(m['pnl']):.2f} ({m['pnl_pct']:+.1f}%)")
+    else:
+        pnl_line = "PnL: ? (mint di luar bot)"
+    L = [
+        f"<b>{esc(m['meme_sym'])} #{tid}</b> [v3] · {in_out} · Age {m['age']}",
+        f"CA: <code>{esc(meme_ca)}</code>",
+        "",
+        f"📊 Range: {esc(range_str(p))}",
+        f"💼 <b>Nilai {ch.fmt_usd(p['value_usd'])}</b>",
+        f"· {ch.fmt_amount(p['amount0'])} {esc(p['sym0'])} ({ch.fmt_usd(p['usd0'])} · {pct0:.0f}%)",
+        f"· {ch.fmt_amount(p['amount1'])} {esc(p['sym1'])} ({ch.fmt_usd(p['usd1'])} · {100 - pct0:.0f}%)",
+        f"💰 <b>Fee unclaimed {ch.fmt_usd(p['unclaimed_usd'])}</b>",
+        f"· {ch.fmt_amount(p['fees0'])} {esc(p['sym0'])} ({ch.fmt_usd(p['fees_usd0'])}) + "
+        f"{ch.fmt_amount(p['fees1'])} {esc(p['sym1'])} ({ch.fmt_usd(p['fees_usd1'])})",
+        "",
+        pnl_line,
+    ]
+    stat = []
+    if m["dep"]:
+        stat.append(f"Deposit {ch.fmt_usd(m['dep'])}")
+    if m["claimed"]:
+        stat.append(f"Fee terklaim {ch.fmt_usd(m['claimed'])}")
+    if m["apr"] is not None:
+        stat.append(f"APR ~{m['apr']:,.0f}%")
+    if stat:
+        L.append(" · ".join(stat))
+    L.append(ch.pos_link(cid, tid))
+    return "\n".join(L)
+
+
+def position_kb(tid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📈 Chart", callback_data=f"chart|{tid}"),
+         InlineKeyboardButton("➕ Add", callback_data=f"add|{tid}"),
+         InlineKeyboardButton("🔄", callback_data=f"pos|{tid}")],
+        [InlineKeyboardButton("➖ Reduce", callback_data=f"red|{tid}"),
+         InlineKeyboardButton("💰 Fee", callback_data=f"fee|{tid}"),
+         InlineKeyboardButton("🗑 Close", callback_data=f"close|{tid}")],
+        [InlineKeyboardButton("⬅️ Posisi", callback_data="menu|list"),
+         InlineKeyboardButton("🏠 Menu", callback_data="menu|main")],
+    ])
+
+
+async def show_position(update: Update, msg, token_id: int):
+    s = store.load_settings()
+    cid = s["chain"]
+    await edit(msg, f"⏳ Memuat posisi #{token_id}...")
+
+    def work():
+        return next((p for p in ch.list_positions(cid, pk()) if p["token_id"] == token_id), None)
+
+    try:
+        p = await asyncio.to_thread(work)
+    except Exception as e:
+        await edit(msg, f"❌ Gagal load posisi: {esc(e)}", InlineKeyboardMarkup([BACK_ROW]))
+        return
+    if not p:
+        await edit(msg, f"❌ Posisi #{token_id} tidak ditemukan (sudah ditutup?).",
+                   InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Posisi", callback_data="menu|list")], BACK_ROW]))
+        return
+    await edit(msg, position_card(cid, p), position_kb(token_id))
 
 
 # ---------- Chart ----------
@@ -1586,6 +1647,9 @@ async def on_callback(update: Update, _):
             reply_markup=ForceReply(selective=True, input_field_placeholder="slippage 3"))
         AWAITING[update.effective_chat.id] = {"kind": "setval", "key": ""}
         return
+    if data.startswith("pos|"):
+        await show_position(update, q.message, int(data.split("|", 1)[1]))
+        return
     if data.startswith("pool|"):
         # pilih pool → kartu konfirmasi (belum mint)
         await show_confirm(q.message, data.split("|", 1)[1])
@@ -1693,6 +1757,7 @@ async def monitor_loop(app):
                         f"Val {ch.fmt_usd(p['value_usd'])} · Unclaimed {ch.fmt_usd(p['unclaimed_usd'])}\n"
                         f"Range: {esc(range_str(p))}")
                 kb = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("📋 Detail", callback_data=f"pos|{p['token_id']}"),
                     InlineKeyboardButton("📈 Chart", callback_data=f"chart|{p['token_id']}"),
                     InlineKeyboardButton("🗑 Close", callback_data=f"close|{p['token_id']}"),
                 ]])
