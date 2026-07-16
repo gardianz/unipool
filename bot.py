@@ -603,9 +603,21 @@ def compute_amount(ctx_data: dict) -> float:
         return (bal * ctx_data["amount_pct"] / 100) / 10 ** mdec
     q = ch.erc20(w3, p["quote_addr"])
     bal = q.functions.balanceOf(addr).call()
+    gas_reserve = int(0.0005 * 1e18)
     if p["quote_addr"].lower() == cfg["wrapped"].lower():
-        gas_reserve = int(0.0005 * 1e18)
         bal += max(0, w3.eth.get_balance(addr) - gas_reserve)
+    else:
+        # quote bukan wrapped (mis. USDG): saldo WETH+native ikut jadi modal,
+        # nanti di-swap otomatis ke quote saat mint
+        try:
+            wbal = ch.erc20(w3, cfg["wrapped"]).functions.balanceOf(addr).call()
+            wtotal = wbal + max(0, w3.eth.get_balance(addr) - gas_reserve)
+            if wtotal > 0:
+                rate = ch.wrapped_per_quote_wei(w3, cid, p["quote_addr"])  # wei wrapped per wei quote
+                if rate > 0:
+                    bal += int(wtotal / rate * 0.98)  # margin biaya swap
+        except Exception:
+            pass  # tidak ada pool wrapped/quote — pakai saldo quote apa adanya
     return (bal * ctx_data["amount_pct"] / 100) / 10 ** p["quote_decimals"]
 
 
@@ -714,12 +726,22 @@ def build_preview(ctx_data: dict) -> str:
             L.append(f"· Sisa ~{ch.fmt_amount(in_meme(excess_q))} {esc(tsym)} "
                      f"tidak terpakai, tetap di wallet")
         extra = "\n".join(L)
-    if mode != "upper" and p["quote_addr"].lower() == cfg["wrapped"].lower():
+    if mode != "upper":
         bal = ch.erc20(w3, p["quote_addr"]).functions.balanceOf(wallet_address()).call()
         deficit = max(0, int(amount * 10 ** p["quote_decimals"]) - bal)
-        if deficit:
+        if deficit and p["quote_addr"].lower() == cfg["wrapped"].lower():
             extra += (f"\nAuto-wrap: {ch.fmt_amount(deficit / 10 ** p['quote_decimals'])} "
                       f"native → {esc(p['quote_sym'])}")
+        elif deficit:
+            try:
+                rate = ch.wrapped_per_quote_wei(w3, cid, p["quote_addr"])
+                weth_in = deficit * rate / 1e18
+                extra += (f"\nAuto-swap: ~{ch.fmt_amount(weth_in)} {esc(cfg['wrapped_symbol'])} → "
+                          f"{ch.fmt_amount(deficit / 10 ** p['quote_decimals'])} {esc(p['quote_sym'])} "
+                          f"(wrap otomatis kalau perlu)")
+            except Exception:
+                extra += (f"\n⚠️ Saldo {esc(p['quote_sym'])} kurang dan pool "
+                          f"{esc(cfg['wrapped_symbol'])}/{esc(p['quote_sym'])} tidak ditemukan — mint bakal gagal.")
 
     usd = amount * (ch._meme_usd(w3, cid, p) if mode == "upper" else p["quote_usd"])
     amount_desc = "fix" if ctx_data["amount_fixed"] else f"{ctx_data['amount_pct']:g}%"
@@ -1319,6 +1341,15 @@ async def do_add_exec(update: Update, token_id: int, val: float, is_pct: bool):
             bal = qc.functions.balanceOf(wallet_address()).call()
             if quote.lower() == cfg["wrapped"].lower():
                 bal += max(0, w3.eth.get_balance(wallet_address()) - int(0.0005e18))
+            else:
+                try:
+                    wbal = ch.erc20(w3, cfg["wrapped"]).functions.balanceOf(wallet_address()).call()
+                    wtotal = wbal + max(0, w3.eth.get_balance(wallet_address()) - int(0.0005e18))
+                    rate = ch.wrapped_per_quote_wei(w3, cid, quote)
+                    if wtotal > 0 and rate > 0:
+                        bal += int(wtotal / rate * 0.98)
+                except Exception:
+                    pass
             budget = (bal * val / 100) / 10 ** qc.functions.decimals().call()
         return ch.increase_position(cid, pk(), token_id, budget, s["slippage_pct"])
 

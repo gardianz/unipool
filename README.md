@@ -9,7 +9,7 @@ Paste alamat token → bot cari pool → pilih strategi → mint posisi LP. Pant
 - 🔍 **Auto pool discovery** — scan semua fee tier (0.01%–1%) × semua quote (WETH/USDG di Robinhood, WBNB/USDT/USDC di BSC), urut TVL
 - 🎯 **4 strategi range**: Stable (±6%), Wide (dua sisi), Lower (setor quote saja, nampung kalau harga turun), Upper (setor token saja, jual bertahap kalau naik) + rekomendasi otomatis
 - ✏️ **Custom range** via persen atau **market cap** (`mc 300k 800k`), custom amount (persen saldo / nilai pasti)
-- 🔁 **Auto-wrap** ETH→WETH, **auto-swap** komposisi dua sisi (token existing di wallet dipakai duluan)
+- 🔁 **Auto-wrap** ETH→WETH, **auto-swap** komposisi dua sisi (token existing di wallet dipakai duluan); pair non-WETH (mis. USDG) otomatis dibeli dari saldo WETH/ETH saat mint
 - 📊 **/list** — nilai posisi, fee unclaimed, PnL per posisi & portfolio, status IN/OUT range
 - 📈 **Chart live** — grafik market cap + kotak range posisi, refresh 3 detik, link dexscreener
 - 🔔 **Alert** otomatis saat posisi keluar/masuk range

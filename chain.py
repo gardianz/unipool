@@ -606,28 +606,86 @@ def pool_volatility_daily(w3: Web3, pool_addr: str) -> float | None:
 
 
 # ---------- Aksi: wrap, approve, mint ----------
-def ensure_quote_balance(w3: Web3, chain_id: int, pk: str, quote_addr: str, need_wei: int) -> list[tuple[str, str]]:
-    """Auto-wrap native → wrapped kalau quote = wrapped dan saldo ERC20 kurang.
+def find_pool(w3: Web3, chain_id: int, a: str, b: str) -> tuple[str | None, int]:
+    """Cari pool v3 pasangan (a, b) di semua fee tier. Return (pool_addr, fee)."""
+    cfg = CHAINS[chain_id]
+    factory = w3.eth.contract(address=Web3.to_checksum_address(cfg["factory"]), abi=FACTORY_ABI)
+    t0, t1 = sorted([Web3.to_checksum_address(a), Web3.to_checksum_address(b)])
+    for f in (500, 3000, 100, 10000):
+        addr = factory.functions.getPool(t0, t1, f).call()
+        if int(addr, 16) != 0:
+            return addr, f
+    return None, 0
+
+
+def wrapped_per_quote_wei(w3: Web3, chain_id: int, quote_addr: str) -> float:
+    """Kurs wei wrapped per wei quote via pool wrapped/quote v3."""
+    cfg = CHAINS[chain_id]
+    wrapped = Web3.to_checksum_address(cfg["wrapped"])
+    quote = Web3.to_checksum_address(quote_addr)
+    pool_addr, _ = find_pool(w3, chain_id, wrapped, quote)
+    if not pool_addr:
+        raise RuntimeError(f"Tidak ada pool {cfg['wrapped_symbol']}/quote untuk konversi.")
+    raw = _pool_price_t1_per_t0(w3, pool_addr)  # t1-wei per t0-wei
+    t0, _ = sorted([wrapped, quote])
+    return (1 / raw if raw else 0) if wrapped == t0 else raw
+
+
+def ensure_quote_balance(w3: Web3, chain_id: int, pk: str, quote_addr: str, need_wei: int,
+                         slippage_pct: float = 5.0) -> list[tuple[str, str]]:
+    """Pastikan saldo quote cukup. Quote = wrapped → auto-wrap native.
+    Quote lain (mis. USDG) → wrap native seperlunya lalu swap wrapped → quote.
     Return list (label, txhash)."""
     cfg = CHAINS[chain_id]
     account = w3.eth.account.from_key(pk)
     txs = []
     quote = Web3.to_checksum_address(quote_addr)
+    wrapped = Web3.to_checksum_address(cfg["wrapped"])
     bal = erc20(w3, quote).functions.balanceOf(account.address).call()
     if bal >= need_wei:
         return txs
-    if quote != Web3.to_checksum_address(cfg["wrapped"]):
-        raise RuntimeError(
-            f"Saldo quote kurang: punya {bal}, butuh {need_wei} (auto-wrap cuma untuk {cfg['wrapped_symbol']})")
     deficit = need_wei - bal
-    native = w3.eth.get_balance(account.address)
     gas_reserve = w3.to_wei("0.0005", "ether")
-    if native < deficit + gas_reserve:
-        raise RuntimeError(f"Saldo native kurang untuk wrap: punya {native / 1e18:.6f}, butuh {deficit / 1e18:.6f} + gas")
-    weth = w3.eth.contract(address=quote, abi=WETH_ABI)
-    h = send_tx(w3, pk, {"to": quote, "value": deficit, "data": calldata(weth.functions.deposit())})
-    wait_ok(w3, h, "wrap")
-    txs.append(("wrap", h))
+
+    if quote == wrapped:
+        native = w3.eth.get_balance(account.address)
+        if native < deficit + gas_reserve:
+            raise RuntimeError(
+                f"Saldo native kurang untuk wrap: punya {native / 1e18:.6f}, butuh {deficit / 1e18:.6f} + gas")
+        weth = w3.eth.contract(address=quote, abi=WETH_ABI)
+        h = send_tx(w3, pk, {"to": quote, "value": deficit, "data": calldata(weth.functions.deposit())})
+        wait_ok(w3, h, "wrap")
+        txs.append(("wrap", h))
+        return txs
+
+    # quote bukan wrapped: tutup kekurangan dengan swap wrapped → quote
+    pool_addr, fee = find_pool(w3, chain_id, wrapped, quote)
+    if not pool_addr:
+        raise RuntimeError(
+            f"Saldo quote kurang dan tidak ada pool {cfg['wrapped_symbol']}/quote untuk auto-swap.")
+    rate = wrapped_per_quote_wei(w3, chain_id, quote)
+    need_in = int(deficit * rate * 1.02)  # +2% margin biar hasil swap ≥ deficit
+    if need_in <= 0:
+        raise RuntimeError("Konversi kurs wrapped/quote gagal (rate 0).")
+    wbal = erc20(w3, wrapped).functions.balanceOf(account.address).call()
+    if wbal < need_in:
+        wrap_amt = need_in - wbal
+        native = w3.eth.get_balance(account.address)
+        if native < wrap_amt + gas_reserve:
+            raise RuntimeError(
+                f"Saldo {cfg['wrapped_symbol']}+native kurang untuk beli quote: "
+                f"butuh ~{need_in / 1e18:.6f} {cfg['wrapped_symbol']}, "
+                f"punya {(wbal + native) / 1e18:.6f}")
+        weth = w3.eth.contract(address=wrapped, abi=WETH_ABI)
+        h = send_tx(w3, pk, {"to": wrapped, "value": wrap_amt, "data": calldata(weth.functions.deposit())})
+        wait_ok(w3, h, "wrap")
+        txs.append(("wrap", h))
+    h = swap_to_token(chain_id, pk, wrapped, quote, fee, need_in, slippage_pct)
+    if h:
+        txs.append(("swap→quote", h))
+    got = poll_balance(w3, quote, account.address, need_wei)
+    if got < int(need_wei * 0.97):
+        raise RuntimeError(f"Hasil swap ke quote kurang: {got} < {need_wei} (slippage terlalu besar?)")
     return txs
 
 
@@ -698,7 +756,8 @@ def mint_position(chain_id: int, pk: str, pool_info: dict, budget: float,
         budget_wei = int(Decimal(str(budget)) * Decimal(10) ** qdec)
         if budget_wei <= 0:
             raise RuntimeError("Amount 0.")
-        steps += ensure_quote_balance(w3, chain_id, pk, quote, budget_wei)
+        steps += ensure_quote_balance(w3, chain_id, pk, quote, budget_wei, slippage_pct)
+        budget_wei = min(budget_wei, erc20(w3, quote).functions.balanceOf(account.address).call())
         slot0 = pool.functions.slot0().call()
         t_lo, t_hi = calc_strategy_range(slot0[1], pool_info["fee"], q_is_t1, mode,
                                          strategy["low_pct"], strategy["up_pct"],
@@ -733,9 +792,10 @@ def mint_position(chain_id: int, pk: str, pool_info: dict, budget: float,
         dep_wei = int(Decimal(str(budget)) * Decimal(10) ** qdec)
         if dep_wei <= 0:
             raise RuntimeError("Amount 0.")
-        steps += ensure_quote_balance(w3, chain_id, pk, quote, dep_wei)
+        steps += ensure_quote_balance(w3, chain_id, pk, quote, dep_wei, slippage_pct)
+        dep_wei = min(dep_wei, erc20(w3, quote).functions.balanceOf(account.address).call())
         steps += ensure_approval(w3, pk, quote, npm_addr, dep_wei)
-        deposited_usd = budget * pool_info["quote_usd"]
+        deposited_usd = dep_wei / 10 ** qdec * pool_info["quote_usd"]
 
     # ---- Fase 2: baca harga TERAKHIR baru mint; retry kalau harga nyebrang range ----
     npm = w3.eth.contract(address=npm_addr, abi=NPM_ABI)
@@ -1081,7 +1141,8 @@ def increase_position(chain_id: int, pk: str, token_id: int, budget_quote: float
 
     steps = []
     slip = (100 - slippage_pct) / 100
-    steps += ensure_quote_balance(w3, chain_id, pk, quote, budget_wei)
+    steps += ensure_quote_balance(w3, chain_id, pk, quote, budget_wei, slippage_pct)
+    budget_wei = min(budget_wei, erc20(w3, quote).functions.balanceOf(account.address).call())
 
     slot0 = pool.functions.slot0().call()
     # rasio quote:meme mengikuti posisi range vs harga (plan_two_sided nge-clamp
