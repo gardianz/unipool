@@ -887,10 +887,19 @@ async def cmd_list(update: Update, _, status_msg=None):
             age_days = max((int(time.time()) - mts) / 86400, 0.01)
             apr = (p["unclaimed_usd"] + claimed) / dep / age_days * 365 * 100
             apr_txt = f" | APR ~{apr:,.0f}%"
+        pct0 = p["usd0"] / p["value_usd"] * 100 if p["value_usd"] else 0
         lines.append(
-            f"<b>{esc(meme_sym)}</b> #{p['token_id']} | Age: {age} | Val: {ch.fmt_usd(p['value_usd'])} | "
-            f"Unclaimed: {ch.fmt_usd(p['unclaimed_usd'])} | {pos_pnl}{apr_txt} | {in_out} | "
+            f"<b>{esc(meme_sym)}</b> #{p['token_id']} | Age: {age} | {in_out} | "
             f"Range: {esc(range_str(p))}")
+        lines.append(
+            f"💼 Val {ch.fmt_usd(p['value_usd'])}: "
+            f"{ch.fmt_amount(p['amount0'])} {esc(p['sym0'])} ({ch.fmt_usd(p['usd0'])} · {pct0:.0f}%) + "
+            f"{ch.fmt_amount(p['amount1'])} {esc(p['sym1'])} ({ch.fmt_usd(p['usd1'])} · {100 - pct0:.0f}%)")
+        lines.append(
+            f"💰 Fee {ch.fmt_usd(p['unclaimed_usd'])}: "
+            f"{ch.fmt_amount(p['fees0'])} {esc(p['sym0'])} ({ch.fmt_usd(p['fees_usd0'])}) + "
+            f"{ch.fmt_amount(p['fees1'])} {esc(p['sym1'])} ({ch.fmt_usd(p['fees_usd1'])})")
+        lines.append(f"{pos_pnl}{apr_txt.replace(' | ', ' · ') if apr_txt else ''}")
         lines.append(ch.pos_link(cid, p["token_id"]))
         lines.append("")
         buttons.append([

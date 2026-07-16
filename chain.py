@@ -872,6 +872,7 @@ def _position_detail(w3: Web3, chain_id: int, npm, factory, account, tid: int, p
 
         raw_price = (sqrtp / Q96) ** 2  # token1 per token0, raw
         usd = unclaimed_usd = 0.0
+        usd0 = usd1 = fees_usd0 = fees_usd1 = 0.0
         mc_lower = mc_upper = mc_now = None
         if qsym:
             qusd = quote_usd_price(w3, chain_id, qsym)
@@ -879,14 +880,20 @@ def _position_detail(w3: Web3, chain_id: int, npm, factory, account, tid: int, p
                 qdec, mdec = i1["decimals"], i0["decimals"]
                 meme_addr = t0
                 meme_in_q = raw_price * 10 ** (mdec - qdec)  # quote per 1 meme
-                usd = (a1_raw / 10 ** qdec + (a0_raw / 10 ** mdec) * meme_in_q) * qusd
-                unclaimed_usd = (f1 / 10 ** qdec + (f0 / 10 ** mdec) * meme_in_q) * qusd
+                usd0 = (a0_raw / 10 ** mdec) * meme_in_q * qusd
+                usd1 = a1_raw / 10 ** qdec * qusd
+                fees_usd0 = (f0 / 10 ** mdec) * meme_in_q * qusd
+                fees_usd1 = f1 / 10 ** qdec * qusd
             else:
                 qdec, mdec = i0["decimals"], i1["decimals"]
                 meme_addr = t1
                 meme_in_q = (1 / raw_price) * 10 ** (mdec - qdec) if raw_price else 0
-                usd = (a0_raw / 10 ** qdec + (a1_raw / 10 ** mdec) * meme_in_q) * qusd
-                unclaimed_usd = (f0 / 10 ** qdec + (f1 / 10 ** mdec) * meme_in_q) * qusd
+                usd0 = a0_raw / 10 ** qdec * qusd
+                usd1 = (a1_raw / 10 ** mdec) * meme_in_q * qusd
+                fees_usd0 = f0 / 10 ** qdec * qusd
+                fees_usd1 = (f1 / 10 ** mdec) * meme_in_q * qusd
+            usd = usd0 + usd1
+            unclaimed_usd = fees_usd0 + fees_usd1
 
             # market cap (FDV) di batas range + sekarang — display gaya GMGN
             def meme_q_at(t):
@@ -908,6 +915,7 @@ def _position_detail(w3: Web3, chain_id: int, npm, factory, account, tid: int, p
             "fees0": f0 / 10 ** i0["decimals"], "fees1": f1 / 10 ** i1["decimals"],
             "in_range": tick_lo <= cur_tick < tick_hi,
             "value_usd": usd, "unclaimed_usd": unclaimed_usd,
+            "usd0": usd0, "usd1": usd1, "fees_usd0": fees_usd0, "fees_usd1": fees_usd1,
             "quote_sym": qsym, "quote_is_token1": q_is_t1,
             "mc_lower": mc_lower, "mc_upper": mc_upper, "mc_now": mc_now,
         }
