@@ -102,6 +102,32 @@ Log `LP bot jalan. Wallet: 0x...` = siap. Buka chat bot kamu di Telegram, kirim 
 | `/set autoswap off` | matikan auto-swap |
 | `/chain 56` | ganti chain (4663 Robinhood / 56 BSC) |
 
+## Jalankan 24/7 di VPS (systemd)
+
+Supaya bot hidup terus dan auto-restart kalau crash/VPS reboot:
+
+```bash
+sudo tee /etc/systemd/system/unipool.service > /dev/null <<'UNIT'
+[Unit]
+Description=unipool LP bot
+After=network-online.target
+
+[Service]
+User=ubuntu
+WorkingDirectory=/home/ubuntu/unipool
+ExecStart=/home/ubuntu/unipool/.venv/bin/python3 bot.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+sudo systemctl daemon-reload
+sudo systemctl enable --now unipool
+```
+
+Cek log: `journalctl -u unipool -f` · restart: `sudo systemctl restart unipool` (perlu setiap `git pull`).
+
 ## Troubleshooting
 
 **SSL "Hostname mismatch" ke `rpc.mainnet.chain.robinhood.com`** — DNS ISP Indonesia memblokir domain robinhood.com (redirect internetpositif.id). Bot otomatis bypass: resolve IP asli via DNS-over-HTTPS lalu konek langsung (sertifikat tetap diverifikasi). Alternatif permanen: ganti DNS Windows/router ke `1.1.1.1`.
@@ -109,6 +135,8 @@ Log `LP bot jalan. Wallet: 0x...` = siap. Buka chat bot kamu di Telegram, kirim 
 **Mint revert saat token lagi ramai** — harga bergerak melewati range saat transaksi disiapkan. Bot sudah retry 3× otomatis; kalau tetap gagal, perlebar range atau naikkan `/set gap`.
 
 **Token di /wallet "harga ?"** — token belum punya pool v3/v2 dan tidak terindeks dexscreener.
+
+**`telegram.error.NetworkError: Bad Gateway` di log** — server Telegram lagi gangguan sesaat (HTTP 502). Bot retry otomatis, tidak perlu diapa-apakan.
 
 ## Catatan risiko
 

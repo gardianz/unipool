@@ -1625,6 +1625,11 @@ async def post_init(app):
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    from telegram.error import NetworkError
+    if isinstance(context.error, NetworkError):
+        # 502/timeout dari server Telegram — PTB retry sendiri, cukup 1 baris warning
+        log.warning("Jaringan Telegram: %s (retry otomatis)", context.error)
+        return
     log.error("Handler error", exc_info=context.error)
     if isinstance(update, Update) and update.effective_chat:
         msg = str(context.error)[:500]
