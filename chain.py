@@ -609,15 +609,24 @@ def pool_volatility_daily(w3: Web3, pool_addr: str) -> float | None:
 
 # ---------- Aksi: wrap, approve, mint ----------
 def find_pool(w3: Web3, chain_id: int, a: str, b: str) -> tuple[str | None, int]:
-    """Cari pool v3 pasangan (a, b) di semua fee tier. Return (pool_addr, fee)."""
+    """Cari pool v3 pasangan (a, b) — pilih yang saldo sisi-a terbesar
+    (pool dust bisa nyimpan harga ngaco). Return (pool_addr, fee)."""
     cfg = CHAINS[chain_id]
     factory = w3.eth.contract(address=Web3.to_checksum_address(cfg["factory"]), abi=FACTORY_ABI)
-    t0, t1 = sorted([Web3.to_checksum_address(a), Web3.to_checksum_address(b)])
-    for f in (500, 3000, 100, 10000):
+    a = Web3.to_checksum_address(a)
+    t0, t1 = sorted([a, Web3.to_checksum_address(b)])
+    best, best_fee, best_bal = None, 0, -1
+    for f in (100, 500, 3000, 10000):
         addr = factory.functions.getPool(t0, t1, f).call()
-        if int(addr, 16) != 0:
-            return addr, f
-    return None, 0
+        if int(addr, 16) == 0:
+            continue
+        try:
+            bal = erc20(w3, a).functions.balanceOf(addr).call()
+        except Exception:
+            continue
+        if bal > best_bal:
+            best, best_fee, best_bal = addr, f, bal
+    return best, best_fee
 
 
 def wrapped_per_quote_wei(w3: Web3, chain_id: int, quote_addr: str) -> float:
@@ -1022,26 +1031,32 @@ def token_usd_price(w3: Web3, chain_id: int, token_addr: str, _cache={}) -> floa
     factory = w3.eth.contract(address=Web3.to_checksum_address(cfg["factory"]), abi=FACTORY_ABI)
     mdec = token_info(w3, token)["decimals"]
     price = 0.0
+    # pilih pool dengan likuiditas sisi-quote terbesar — pool dust bisa nyimpan
+    # harga ngaco ratusan kali lipat (mis. pool kosong fee 0.3%)
+    best_liq_usd = 0.0
     for qsym, qaddr in cfg["quotes"].items():
         q = Web3.to_checksum_address(qaddr)
         if q == token:
             price = quote_usd_price(w3, chain_id, qsym)
+            best_liq_usd = float("inf")
             break
         qd = token_info(w3, q)["decimals"]
+        qusd = quote_usd_price(w3, chain_id, qsym)
         t0, t1 = sorted([token, q])
-        for fee in (3000, 10000, 500, 100):
+        for fee in (100, 500, 3000, 10000):
             pool = factory.functions.getPool(t0, t1, fee).call()
             if int(pool, 16) == 0:
                 continue
             try:
+                liq_usd = erc20(w3, q).functions.balanceOf(pool).call() / 10 ** qd * qusd
+                if liq_usd < 10 or liq_usd <= best_liq_usd:
+                    continue  # dust / kalah likuid dari kandidat sebelumnya
                 raw = _pool_price_t1_per_t0(w3, pool)
             except Exception:
                 continue
             in_q = raw * 10 ** (mdec - qd) if token == t0 else ((1 / raw) * 10 ** (mdec - qd) if raw else 0)
-            price = in_q * quote_usd_price(w3, chain_id, qsym)
-            break
-        if price:
-            break
+            price = in_q * qusd
+            best_liq_usd = liq_usd
     # fallback 1: pair Uniswap V2
     if not price and cfg.get("v2_factory"):
         v2f = w3.eth.contract(address=Web3.to_checksum_address(cfg["v2_factory"]), abi=V2_FACTORY_ABI)
