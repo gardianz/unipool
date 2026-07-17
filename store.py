@@ -53,7 +53,7 @@ def _hist() -> dict:
     return _read(HISTORY_FILE, {"events": {}})
 
 
-def record_event(chain_id: int, kind: str, token_id: int | None, usd: float,
+def record_event(chain_id: int, kind: str, token_id, usd: float,
                  detail: str = "", wallet: str = ""):
     """kind: mint | close | fees"""
     h = _hist()
@@ -77,26 +77,54 @@ def adopt_orphans(chain_id: int, wallet: str, token_ids: list[int]):
         _write(HISTORY_FILE, h)
 
 
-def mint_ts(chain_id: int, token_id: int) -> int | None:
+# ---------- Registry posisi V2/V4 ----------
+# NPM v3 bisa di-enumerate on-chain (ERC721Enumerable), tapi PositionManager v4
+# tidak, dan posisi v2 cuma saldo LP token — keduanya dicatat di sini saat mint.
+def add_ref(chain_id: int, wallet: str, kind: str, ref: str):
+    """kind: 'v2' (ref = alamat pair) | 'v4' (ref = tokenId str)."""
+    h = _hist()
+    lst = (h.setdefault("refs", {}).setdefault(str(chain_id), {})
+            .setdefault(wallet.lower(), {}).setdefault(kind, []))
+    ref = str(ref).lower()
+    if ref not in lst:
+        lst.append(ref)
+        _write(HISTORY_FILE, h)
+
+
+def refs(chain_id: int, wallet: str, kind: str) -> list[str]:
+    return list(_hist().get("refs", {}).get(str(chain_id), {})
+                .get(wallet.lower(), {}).get(kind, []))
+
+
+def drop_ref(chain_id: int, wallet: str, kind: str, ref: str):
+    h = _hist()
+    lst = h.get("refs", {}).get(str(chain_id), {}).get(wallet.lower(), {}).get(kind, [])
+    ref = str(ref).lower()
+    if ref in lst:
+        lst.remove(ref)
+        _write(HISTORY_FILE, h)
+
+
+def mint_ts(chain_id: int, token_id) -> int | None:
     for e in _hist()["events"].get(str(chain_id), []):
         if e["kind"] == "mint" and e["token_id"] == token_id:
             return e["ts"]
     return None
 
 
-def mint_usd(chain_id: int, token_id: int) -> float | None:
+def mint_usd(chain_id: int, token_id) -> float | None:
     """Total deposit posisi (mint awal + semua add)."""
     total = sum(e["usd"] for e in _hist()["events"].get(str(chain_id), [])
                 if e["kind"] == "mint" and e["token_id"] == token_id)
     return total or None
 
 
-def fees_claimed_usd(chain_id: int, token_id: int) -> float:
+def fees_claimed_usd(chain_id: int, token_id) -> float:
     return sum(e["usd"] for e in _hist()["events"].get(str(chain_id), [])
                if e["kind"] == "fees" and e["token_id"] == token_id)
 
 
-def withdrawn_usd(chain_id: int, token_id: int) -> float:
+def withdrawn_usd(chain_id: int, token_id) -> float:
     """Total dana yang sudah ditarik dari posisi (reduce/close)."""
     return sum(e["usd"] for e in _hist()["events"].get(str(chain_id), [])
                if e["kind"] == "close" and e["token_id"] == token_id)

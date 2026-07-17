@@ -97,6 +97,14 @@ def _addr_of(key: str) -> str:
     return Web3().eth.account.from_key(key).address
 
 
+def list_positions_all(cid: int, key: str | None = None) -> list[dict]:
+    """Posisi v3 + v4 + v2 wallet (v4/v2 dari registry yang dicatat saat mint)."""
+    key = key or pk()
+    w = _addr_of(key)
+    return ch.list_all_positions(cid, key,
+                                 store.refs(cid, w, "v2"), store.refs(cid, w, "v4"))
+
+
 def wallet_address() -> str:
     return _addr_of(pk())
 
@@ -485,7 +493,7 @@ async def on_address(update: Update, _):
     cfg = ch.CHAINS[cid]
     amount_desc = f"amount {s['amount_fixed']} fix" if s["amount_fixed"] else f"amount {s['amount_pct']}%"
     status = await reply(update, (
-        f"⏳ Fetching Uniswap v3 pools on {esc(cfg['name'])}...\n"
+        f"⏳ Fetching Uniswap v2/v3/v4 pools on {esc(cfg['name'])}...\n"
         f"(width {s['width_pct']:g}% · {esc(amount_desc)} · deposit auto)"))
 
     import time as _t
@@ -498,17 +506,19 @@ async def on_address(update: Update, _):
 
     pools = res["pools"]
     if not pools:
-        await edit(status, f"❌ Tidak ada pool v3 untuk {esc(res['token']['symbol'])} di {esc(cfg['name'])}.")
+        await edit(status, f"❌ Tidak ada pool v2/v3/v4 untuk {esc(res['token']['symbol'])} di {esc(cfg['name'])}.")
         return
 
     buttons = []
     for i, p in enumerate(pools[:8], 1):
         key = uuid.uuid4().hex[:10]
         PENDING[key] = {"chain": cid, "token": res["token"], "pool_info": p,
-                        "mode": "lower", "low_pct": s["width_pct"], "up_pct": 100.0,
+                        "mode": "v2" if p.get("ver") == 2 else "lower",
+                        "low_pct": s["width_pct"], "up_pct": 100.0,
                         "amount_pct": s["amount_pct"], "amount_fixed": s["amount_fixed"],
                         "gap": int(s.get("gap", 1)), "vol": None, "rec": None}
-        label = f"{i}. [v3] {p['quote_sym']} {p['fee'] / 10000:.2f}% · {ch.fmt_usd(p['tvl_usd'])}"
+        label = (f"{i}. [v{p.get('ver', 3)}] {p['quote_sym']} {p['fee'] / 10000:.2f}% · "
+                 f"{ch.fmt_usd(p['tvl_usd'])}")
         if p.get("apr_pct"):
             label += f" · APR {p['apr_pct']:,.0f}%"
         buttons.append([InlineKeyboardButton(label, callback_data=f"pool|{key}")])
@@ -546,9 +556,14 @@ def compute_amount(ctx_data: dict) -> float:
         mdec = ch.token_info(w3, meme)["decimals"]
         bal = ch.erc20(w3, meme).functions.balanceOf(addr).call()
         return (bal * ctx_data["amount_pct"] / 100) / 10 ** mdec
+    gas_reserve = int(0.0005 * 1e18)
+    if p["quote_addr"].lower() == ch.V4_NATIVE:
+        # pool v4 ber-quote ETH native: modal = saldo native + WETH (bisa di-unwrap? tidak —
+        # cukup native; WETH tidak dihitung biar tidak overcommit)
+        bal = max(0, w3.eth.get_balance(addr) - gas_reserve)
+        return (bal * ctx_data["amount_pct"] / 100) / 10 ** p["quote_decimals"]
     q = ch.erc20(w3, p["quote_addr"])
     bal = q.functions.balanceOf(addr).call()
-    gas_reserve = int(0.0005 * 1e18)
     if p["quote_addr"].lower() == cfg["wrapped"].lower():
         bal += max(0, w3.eth.get_balance(addr) - gas_reserve)
     else:
@@ -576,6 +591,8 @@ def recommend_strategy(ctx_data: dict) -> tuple[str, float | None]:
     w3 = ch.get_w3(cid)
     if tsym.upper() in cfg["stable_syms"] and p["quote_sym"] in cfg["stable_syms"]:
         return "stable", None
+    if p.get("ver", 3) != 3:
+        return "lower", None  # oracle TWAP cuma ada di pool v3
     vol = ch.pool_volatility_daily(w3, p["pool"])
     if vol is None:
         return "lower", None
@@ -594,11 +611,61 @@ def _meme_price(p: dict, tdec: int, tick: int) -> float:
     return (1 / raw if raw else 0) * 10 ** (tdec - p["quote_decimals"])
 
 
+def build_preview_v2(ctx_data: dict) -> str:
+    """Kartu konfirmasi add liquidity V2 (full-range 50/50, tanpa strategi range)."""
+    cid = ctx_data["chain"]
+    cfg = ch.CHAINS[cid]
+    p = ctx_data["pool_info"]
+    tsym = ctx_data["token"]["symbol"]
+    tdec = ctx_data["token"]["decimals"]
+    w3 = ch.get_w3(cid)
+
+    amount = compute_amount(ctx_data)
+    if amount <= 0:
+        raise RuntimeError(f"Saldo {p['quote_sym']} kosong.")
+    rq, rm = ch._v2_pair_reserves(w3, p["pool"], p["quote_addr"])
+    price_q = (rq / rm) * 10 ** (tdec - p["quote_decimals"]) if rm else 0
+    usd = amount * p["quote_usd"]
+    try:
+        supply = ch.token_supply(w3, _meme_addr(p))
+    except Exception:
+        supply = 0
+    meme_bal = ch.erc20(w3, _meme_addr(p)).functions.balanceOf(wallet_address()).call()
+    meme_val_q = meme_bal * rq // rm if rm else 0
+    qwei = int(amount * 10 ** p["quote_decimals"])
+    quote_keep = min((qwei + meme_val_q) // 2, qwei)
+    swap_in = qwei - quote_keep
+    amount_desc = "fix" if ctx_data["amount_fixed"] else f"{ctx_data['amount_pct']:g}%"
+    vol_txt = f"vol 24j {ch.fmt_usd(p['vol24_usd'])}" if p.get("vol24_usd") is not None else "vol 24j: ?"
+    if p.get("apr_pct"):
+        vol_txt += f" · APR pool ~{p['apr_pct']:,.0f}%"
+    return (
+        f"<b>Confirm add liquidity · {esc(cfg['name'])} · v2</b>\n"
+        f"CA: <code>{esc(ctx_data['token']['address'])}</code>\n"
+        f"{esc(tsym)}/{esc(p['quote_sym'])} 0.30% · TVL {ch.fmt_usd(p['tvl_usd'])} · {vol_txt}\n"
+        f"📈 <a href=\"https://gmgn.ai/{cfg['gmgn']}/token/{ctx_data['token']['address']}\">GMGN</a> · "
+        f"<a href=\"https://dexscreener.com/{cfg['dexscreener']}/{p['pool']}\">DexScreener</a>\n\n"
+        f"Value deposited: {ch.fmt_amount(amount)} {esc(p['quote_sym'])} ({ch.fmt_usd(usd)} · {esc(amount_desc)})\n"
+        f"Current price: {ch.fmt_price(price_q)} {esc(p['quote_sym'])}/{esc(tsym)}"
+        + (f" · MC {ch.fmt_usd(price_q * p['quote_usd'] * supply)}" if supply else "") + "\n\n"
+        f"📦 <b>Komposisi 50/50 (full range):</b>\n"
+        f"· {ch.fmt_amount(quote_keep / 10 ** p['quote_decimals'])} {esc(p['quote_sym'])} masuk pair\n"
+        + (f"· swap {ch.fmt_amount(swap_in / 10 ** p['quote_decimals'])} {esc(p['quote_sym'])} → {esc(tsym)}\n"
+           if swap_in > qwei // 500 else f"· tanpa swap — {esc(tsym)} existing dipakai\n")
+        + f"\n<i>LP v2 = full range, selalu aktif. Fee 0.3% auto-compound ke posisi "
+        f"(tidak ada klaim fee terpisah). Token fee-on-transfer tidak didukung.</i>\n\n"
+        f"Custom: <code>a 0.005</code> / <code>a 30%</code> (amount)\n"
+        f"Slippage {store.load_settings()['slippage_pct']:g}% · deadline 20 menit"
+    )
+
+
 def build_preview(ctx_data: dict) -> str:
     """Kartu konfirmasi mint (dipanggil di thread)."""
     cid = ctx_data["chain"]
     cfg = ch.CHAINS[cid]
     p = ctx_data["pool_info"]
+    if p.get("ver") == 2:
+        return build_preview_v2(ctx_data)
     tsym = ctx_data["token"]["symbol"]
     tdec = ctx_data["token"]["decimals"]
     mode = ctx_data["mode"]
@@ -613,12 +680,15 @@ def build_preview(ctx_data: dict) -> str:
         raise RuntimeError(f"Saldo {dep_sym} kosong."
                            + (" Upper butuh pegang token meme." if mode == "upper" else ""))
 
-    pool = w3.eth.contract(address=ch.Web3.to_checksum_address(p["pool"]), abi=ch.POOL_ABI)
-    slot0 = pool.functions.slot0().call()
-    sqrtp, cur_tick = slot0[0], slot0[1]
+    if p.get("ver") == 4:
+        sqrtp, cur_tick = ch.v4_slot0(w3, cid, p["pool_id"])
+    else:
+        pool = w3.eth.contract(address=ch.Web3.to_checksum_address(p["pool"]), abi=ch.POOL_ABI)
+        slot0 = pool.functions.slot0().call()
+        sqrtp, cur_tick = slot0[0], slot0[1]
     lo_t, hi_t = ch.calc_strategy_range(cur_tick, p["fee"], p["quote_is_token1"],
                                         mode, ctx_data["low_pct"], ctx_data["up_pct"],
-                                        ctx_data.get("gap", 1))
+                                        ctx_data.get("gap", 1), spacing=p.get("tick_spacing"))
     lo, hi = sorted([_meme_price(p, tdec, lo_t), _meme_price(p, tdec, hi_t)])
     now = _meme_price(p, tdec, cur_tick)
     try:
@@ -671,7 +741,9 @@ def build_preview(ctx_data: dict) -> str:
             L.append(f"· Sisa ~{ch.fmt_amount(in_meme(excess_q))} {esc(tsym)} "
                      f"tidak terpakai, tetap di wallet")
         extra = "\n".join(L)
-    if mode != "upper":
+    if mode != "upper" and p["quote_addr"].lower() == ch.V4_NATIVE:
+        extra += "\nDeposit pakai ETH native langsung (tanpa wrap)."
+    elif mode != "upper":
         bal = ch.erc20(w3, p["quote_addr"]).functions.balanceOf(wallet_address()).call()
         deficit = max(0, int(amount * 10 ** p["quote_decimals"]) - bal)
         if deficit and p["quote_addr"].lower() == cfg["wrapped"].lower():
@@ -709,7 +781,7 @@ def build_preview(ctx_data: dict) -> str:
     rec = ctx_data["rec"]
 
     return (
-        f"<b>Confirm mint · {esc(cfg['name'])} · v3</b>\n"
+        f"<b>Confirm mint · {esc(cfg['name'])} · v{p.get('ver', 3)}</b>\n"
         f"CA: <code>{esc(ctx_data['token']['address'])}</code>\n"
         f"{esc(tsym)}/{esc(p['quote_sym'])} {p['fee'] / 10000:.2f}% · TVL {ch.fmt_usd(p['tvl_usd'])} · {vol_txt}\n"
         f"📈 <a href=\"https://gmgn.ai/{cfg['gmgn']}/token/{ctx_data['token']['address']}\">GMGN</a> · "
@@ -736,6 +808,16 @@ def build_preview(ctx_data: dict) -> str:
 def confirm_kb(key: str, ctx_data: dict) -> InlineKeyboardMarkup:
     mode = ctx_data["mode"]
     rec = ctx_data["rec"]
+    if ctx_data["pool_info"].get("ver") == 2:
+        def abtn2(a):
+            mark = "✓ " if (not ctx_data["amount_fixed"] and ctx_data["amount_pct"] == a) else ""
+            return InlineKeyboardButton(f"{mark}A {a:g}%", callback_data=f"amt|{key}|{a}")
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Confirm add", callback_data=f"mint|{key}"),
+             InlineKeyboardButton("❌ Cancel", callback_data=f"cancelp|{key}")],
+            [abtn2(a) for a in (25, 50, 75, 100)],
+            [InlineKeyboardButton("✏️ Custom Amount…", callback_data=f"askamt|{key}")],
+        ])
 
     def sbtn(m):
         mark = "✓ " if m == mode else ("⭐ " if m == rec else "")
@@ -836,8 +918,13 @@ def current_mc(ctx_data: dict) -> float:
     """MC token sekarang (untuk prompt & konversi input MC)."""
     p = ctx_data["pool_info"]
     w3 = ch.get_w3(ctx_data["chain"])
-    pool = w3.eth.contract(address=ch.Web3.to_checksum_address(p["pool"]), abi=ch.POOL_ABI)
-    tick = pool.functions.slot0().call()[1]
+    if p.get("ver") == 4:
+        _, tick = ch.v4_slot0(w3, ctx_data["chain"], p["pool_id"])
+    elif p.get("ver") == 2:
+        raise RuntimeError("Range tidak berlaku untuk pool v2.")
+    else:
+        pool = w3.eth.contract(address=ch.Web3.to_checksum_address(p["pool"]), abi=ch.POOL_ABI)
+        tick = pool.functions.slot0().call()[1]
     supply = ch.token_supply(w3, _meme_addr(p))
     return _meme_price(p, ctx_data["token"]["decimals"], tick) * p["quote_usd"] * supply
 
@@ -898,14 +985,14 @@ async def handle_awaiting(update: Update) -> bool:
             await reply(update, "❌ Format tidak valid. Contoh: <code>0.005</code> atau <code>30%</code>")
             return True
         AWAITING.pop(chat_id, None)
-        tid = int(st["key"])
+        tid = st["key"]
         desc = f"{val:g}% saldo" if is_pct else f"{val:g} quote"
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"✅ Tambah {desc} ke #{tid}",
-                                  callback_data=f"addok|{tid}|{val}|{'p' if is_pct else 'f'}")],
+            [InlineKeyboardButton(f"✅ Tambah {desc} ke {tid}",
+                                  callback_data=f"addok|{tid}|{val:g}|{'p' if is_pct else 'f'}")],
             [InlineKeyboardButton("❌ Cancel", callback_data="cancel")],
         ])
-        await reply(update, f"Konfirmasi tambah dana ke posisi #{tid}:", kb)
+        await reply(update, f"Konfirmasi tambah dana ke posisi {tid}:", kb)
         return True
     key = st["key"]
     ctx = PENDING.get(key)
@@ -982,6 +1069,7 @@ async def do_mint(update: Update, ctx_data: dict):
     s = store.load_settings()
     cid = ctx_data["chain"]
     p = ctx_data["pool_info"]
+    ver = p.get("ver", 3)
     tsym = ctx_data["token"]["symbol"]
     mode = ctx_data["mode"]
     strategy = {"mode": mode, "low_pct": ctx_data["low_pct"], "up_pct": ctx_data["up_pct"],
@@ -993,21 +1081,46 @@ async def do_mint(update: Update, ctx_data: dict):
         await reply(update, f"❌ Saldo {esc(dep_sym)} kosong.")
         return
 
+    mode_label = "V2 50/50" if ver == 2 else STRAT_LABEL[mode]
     status = await reply(update, (
-        f"⏳ Minting position ({STRAT_LABEL[mode]})...\n"
+        f"⏳ Minting position ({mode_label}) [v{ver}]...\n"
         f"<i>{esc(tsym)}/{esc(p['quote_sym'])} fee {p['fee'] / 10000:.2f}% · "
         f"deposit {ch.fmt_amount(amount)} {esc(dep_sym)} "
         f"(wrap/swap otomatis kalau perlu)</i>"))
 
     async with TX_LOCK:
         try:
-            r = await asyncio.to_thread(
-                ch.mint_position, cid, pk(), p, amount, strategy, s["slippage_pct"])
+            if ver == 2:
+                r = await asyncio.to_thread(
+                    ch.mint_v2, cid, pk(), p, amount, s["slippage_pct"])
+            elif ver == 4:
+                r = await asyncio.to_thread(
+                    ch.mint_v4, cid, pk(), p, amount, strategy, s["slippage_pct"])
+            else:
+                r = await asyncio.to_thread(
+                    ch.mint_position, cid, pk(), p, amount, strategy, s["slippage_pct"])
         except Exception as e:
             await edit(status, f"❌ Mint gagal: {esc(e)}")
             return
 
-    store.record_event(cid, "mint", r["token_id"], r["deposited_usd"],
+    if ver == 2:
+        pid = f"v2:{r['pair'].lower()}"
+        store.add_ref(cid, wallet_address(), "v2", r["pair"])
+        store.record_event(cid, "mint", pid, r["deposited_usd"],
+                           f"{tsym}/{p['quote_sym']} v2", wallet=wallet_address())
+        lines = [f"✅ <b>{esc(tsym)} LP</b> [v2] · full range ({ch.fmt_usd(r['deposited_usd'])})",
+                 f"Masuk: {ch.fmt_amount(r['quote_in'])} {esc(r['quote_sym'])} + "
+                 f"{ch.fmt_amount(r['meme_in'])} {esc(r['meme_sym'])}"]
+        for label, h in r["steps"]:
+            lines.append(f"{label}: {ch.tx_link(cid, h)}")
+        lines.append(ch.pos_link_any(cid, pid))
+        await edit(status, "\n".join(lines), NAV_KB)
+        return
+
+    pid = f"v4:{r['token_id']}" if ver == 4 else r["token_id"]
+    if ver == 4 and r["token_id"]:
+        store.add_ref(cid, wallet_address(), "v4", str(r["token_id"]))
+    store.record_event(cid, "mint", pid, r["deposited_usd"],
                        f"{tsym}/{p['quote_sym']} {mode}", wallet=wallet_address())
 
     tdec = ctx_data["token"]["decimals"]
@@ -1021,7 +1134,7 @@ async def do_mint(update: Update, ctx_data: dict):
             return 0
     supply = await asyncio.to_thread(mc_supply)
 
-    lines = [f"✅ <b>{esc(tsym)} #{r['token_id']}</b> [v3] · {STRAT_LABEL[mode]}"]
+    lines = [f"✅ <b>{esc(tsym)} #{r['token_id']}</b> [v{ver}] · {STRAT_LABEL[mode]}"]
     for label, h in r["steps"]:
         lines.append(f"{label}: {ch.tx_link(cid, h)}")
     if supply:
@@ -1033,7 +1146,7 @@ async def do_mint(update: Update, ctx_data: dict):
     lines.insert(2, (f"Deposited ~{ch.fmt_amount(r['deposited'])} {esc(r['deposit_sym'])} "
                      f"({ch.fmt_usd(r['deposited_usd'])})"))
     if r["token_id"]:
-        lines.append(ch.pos_link(cid, r["token_id"]))
+        lines.append(ch.pos_link_any(cid, pid))
     await edit(status, "\n".join(lines), NAV_KB)
 
 
@@ -1050,7 +1163,7 @@ async def cmd_list(update: Update, _, status_msg=None):
         status = status_msg
         await edit(status, f"⏳ Refreshing positions on {esc(ch.CHAINS[cid]['name'])}...")
     try:
-        positions = await asyncio.to_thread(ch.list_positions, cid, pk())
+        positions = await asyncio.to_thread(list_positions_all, cid)
     except Exception as e:
         await edit(status, f"❌ Gagal load posisi: {esc(e)}")
         return
@@ -1083,14 +1196,24 @@ async def cmd_list(update: Update, _, status_msg=None):
     for p in positions:
         m = _pos_metrics(cid, p)
         mark = "🟢" if p["in_range"] else "🔴"
-        label = f"{mark} {m['meme_sym']} #{p['token_id']} · {ch.fmt_usd(m['cur_total'])}"
+        label = f"{mark} {m['meme_sym']} {_pos_disp(p)} · {ch.fmt_usd(m['cur_total'])}"
         if m["pnl_pct"] is not None:
             label += f" · {m['pnl_pct']:+.0f}%"
         label += f" · {m['age']}"
-        buttons.append([InlineKeyboardButton(label, callback_data=f"pos|{p['token_id']}")])
+        buttons.append([InlineKeyboardButton(label, callback_data=f"pos|{p['pid']}")])
     buttons.insert(0, [InlineKeyboardButton("🔄 Refresh", callback_data="refresh")])
     buttons.append(BACK_ROW)
     await edit(status, "\n".join(lines), InlineKeyboardMarkup(buttons))
+
+
+def _pos_disp(p: dict) -> str:
+    """Label pendek posisi: '#183469' (v3) · '#12 [v4]' · '[v2]'."""
+    ver = p.get("ver", 3)
+    if ver == 2:
+        return "[v2]"
+    if ver == 4:
+        return f"#{p['v4_tid']} [v4]"
+    return f"#{p['token_id']}"
 
 
 def _pos_metrics(cid: int, p: dict) -> dict:
@@ -1119,7 +1242,7 @@ def _pos_metrics(cid: int, p: dict) -> dict:
 def position_card(cid: int, p: dict) -> str:
     """Kartu detail satu posisi (ala BasedBot)."""
     m = _pos_metrics(cid, p)
-    tid = p["token_id"]
+    ver = p.get("ver", 3)
     in_out = "🟢 IN range" if p["in_range"] else "🔴 OUT of range"
     meme_ca = p["token0"] if p["quote_is_token1"] else p["token1"]
     pct0 = p["usd0"] / p["value_usd"] * 100 if p["value_usd"] else 0
@@ -1128,17 +1251,21 @@ def position_card(cid: int, p: dict) -> str:
                     f"{'+' if m['pnl'] >= 0 else '−'}${abs(m['pnl']):.2f} ({m['pnl_pct']:+.1f}%)")
     else:
         pnl_line = "PnL: ? (mint di luar bot)"
+    range_line = ("📊 Full range (v2, selalu aktif)" if ver == 2
+                  else f"📊 Range: {esc(range_str(p))}")
+    fee_line = ("💰 Fee 0.3% auto-compound ke posisi (v2)" if ver == 2 else
+                f"💰 <b>Fee unclaimed {ch.fmt_usd(p['unclaimed_usd'])}</b>\n"
+                f"· {ch.fmt_amount(p['fees0'])} {esc(p['sym0'])} ({ch.fmt_usd(p['fees_usd0'])}) + "
+                f"{ch.fmt_amount(p['fees1'])} {esc(p['sym1'])} ({ch.fmt_usd(p['fees_usd1'])})")
     L = [
-        f"<b>{esc(m['meme_sym'])} #{tid}</b> [v3] · {in_out} · Age {m['age']}",
+        f"<b>{esc(m['meme_sym'])} {_pos_disp(p)}</b> · {in_out} · Age {m['age']}",
         f"CA: <code>{esc(meme_ca)}</code>",
         "",
-        f"📊 Range: {esc(range_str(p))}",
+        range_line,
         f"💼 <b>Nilai {ch.fmt_usd(p['value_usd'])}</b>",
         f"· {ch.fmt_amount(p['amount0'])} {esc(p['sym0'])} ({ch.fmt_usd(p['usd0'])} · {pct0:.0f}%)",
         f"· {ch.fmt_amount(p['amount1'])} {esc(p['sym1'])} ({ch.fmt_usd(p['usd1'])} · {100 - pct0:.0f}%)",
-        f"💰 <b>Fee unclaimed {ch.fmt_usd(p['unclaimed_usd'])}</b>",
-        f"· {ch.fmt_amount(p['fees0'])} {esc(p['sym0'])} ({ch.fmt_usd(p['fees_usd0'])}) + "
-        f"{ch.fmt_amount(p['fees1'])} {esc(p['sym1'])} ({ch.fmt_usd(p['fees_usd1'])})",
+        fee_line,
         "",
         pnl_line,
     ]
@@ -1153,31 +1280,34 @@ def position_card(cid: int, p: dict) -> str:
         stat.append(f"APR ~{m['apr']:,.0f}%")
     if stat:
         L.append(" · ".join(stat))
-    L.append(ch.pos_link(cid, tid))
+    L.append(ch.pos_link_any(cid, p["pid"]))
     return "\n".join(L)
 
 
 def position_kb(cid: int, p: dict) -> InlineKeyboardMarkup:
-    tid = p["token_id"]
+    pid = p["pid"]
+    ver = p.get("ver", 3)
     meme_ca = p["token0"] if p["quote_is_token1"] else p["token1"]
+    actions = [InlineKeyboardButton("➕ Add", callback_data=f"add|{pid}"),
+               InlineKeyboardButton("➖ Reduce", callback_data=f"red|{pid}")]
+    if ver != 2:  # fee v2 auto-compound — tidak ada klaim terpisah
+        actions.append(InlineKeyboardButton("💰 Fee", callback_data=f"fee|{pid}"))
+    actions.append(InlineKeyboardButton("🗑 Close", callback_data=f"close|{pid}"))
     return InlineKeyboardMarkup([
-        chart_buttons(cid, p["pool"], meme_ca) + [InlineKeyboardButton("🔄", callback_data=f"pos|{tid}")],
-        [InlineKeyboardButton("➕ Add", callback_data=f"add|{tid}"),
-         InlineKeyboardButton("➖ Reduce", callback_data=f"red|{tid}"),
-         InlineKeyboardButton("💰 Fee", callback_data=f"fee|{tid}"),
-         InlineKeyboardButton("🗑 Close", callback_data=f"close|{tid}")],
+        chart_buttons(cid, p["pool"], meme_ca) + [InlineKeyboardButton("🔄", callback_data=f"pos|{pid}")],
+        actions,
         [InlineKeyboardButton("⬅️ Posisi", callback_data="menu|list"),
          InlineKeyboardButton("🏠 Menu", callback_data="menu|main")],
     ])
 
 
-async def show_position(update: Update, msg, token_id: int):
+async def show_position(update: Update, msg, pid: str):
     s = store.load_settings()
     cid = s["chain"]
-    await edit(msg, f"⏳ Memuat posisi #{token_id}...")
+    await edit(msg, f"⏳ Memuat posisi {pid}...")
 
     def work():
-        return next((p for p in ch.list_positions(cid, pk()) if p["token_id"] == token_id), None)
+        return next((p for p in list_positions_all(cid) if p["pid"] == str(pid)), None)
 
     try:
         p = await asyncio.to_thread(work)
@@ -1185,7 +1315,7 @@ async def show_position(update: Update, msg, token_id: int):
         await edit(msg, f"❌ Gagal load posisi: {esc(e)}", InlineKeyboardMarkup([BACK_ROW]))
         return
     if not p:
-        await edit(msg, f"❌ Posisi #{token_id} tidak ditemukan (sudah ditutup?).",
+        await edit(msg, f"❌ Posisi {pid} tidak ditemukan (sudah ditutup?).",
                    InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Posisi", callback_data="menu|list")], BACK_ROW]))
         return
     await edit(msg, position_card(cid, p), position_kb(cid, p))
@@ -1201,49 +1331,59 @@ def chart_buttons(cid: int, pool: str, meme_ca: str) -> list[InlineKeyboardButto
 
 
 # ---------- Add / Reduce flow ----------
-async def ask_add(update: Update, token_id: int):
+async def ask_add(update: Update, pid: str):
+    if str(pid).startswith("v2:"):
+        await reply(update, ("➕ Add posisi v2: paste alamat token lagi lalu pilih pool "
+                             "<b>[v2]</b> yang sama — deposit baru otomatis menambah LP existing."))
+        return
     s = store.load_settings()
     qsym = ch.CHAINS[s["chain"]]["wrapped_symbol"]
     await update.effective_chat.send_message(
-        (f"➕ <b>Balas pesan ini</b> dengan jumlah dana untuk ditambah ke #{token_id}:\n"
+        (f"➕ <b>Balas pesan ini</b> dengan jumlah dana untuk ditambah ke {pid}:\n"
          f"· nilai pasti: <code>0.005</code> (satuan quote posisi, umumnya {esc(qsym)})\n"
          f"· persen saldo: <code>30%</code>\n\n"
          f"<i>Komposisi quote/meme dihitung otomatis mengikuti range posisi; "
          f"meme existing di wallet dipakai duluan.</i>"),
         parse_mode=ParseMode.HTML,
         reply_markup=ForceReply(selective=True, input_field_placeholder="contoh: 0.005 atau 30%"))
-    AWAITING[update.effective_chat.id] = {"kind": "addamt", "key": str(token_id)}
+    AWAITING[update.effective_chat.id] = {"kind": "addamt", "key": str(pid)}
 
 
-async def do_add_exec(update: Update, token_id: int, val: float, is_pct: bool):
+async def do_add_exec(update: Update, pid: str, val: float, is_pct: bool):
     s = store.load_settings()
     cid = s["chain"]
-    status = await reply(update, f"⏳ Menambah dana ke #{token_id}...")
+    status = await reply(update, f"⏳ Menambah dana ke {pid}...")
 
     def work():
         budget = val
         if is_pct:
             w3 = ch.get_w3(cid)
             cfg = ch.CHAINS[cid]
-            npm = w3.eth.contract(address=ch.Web3.to_checksum_address(cfg["npm"]), abi=ch.NPM_ABI)
-            pos = npm.functions.positions(token_id).call()
-            quotes_lc = {a.lower() for a in cfg["quotes"].values()}
-            quote = pos[3] if pos[3].lower() in quotes_lc else pos[2]
-            qc = ch.erc20(w3, quote)
-            bal = qc.functions.balanceOf(wallet_address()).call()
-            if quote.lower() == cfg["wrapped"].lower():
-                bal += max(0, w3.eth.get_balance(wallet_address()) - int(0.0005e18))
+            pos = next((x for x in list_positions_all(cid) if x["pid"] == str(pid)), None)
+            if not pos:
+                raise RuntimeError("Posisi tidak ditemukan.")
+            quote = pos["token1"] if pos["quote_is_token1"] else pos["token0"]
+            gas_reserve = int(0.0005e18)
+            if quote.lower() == ch.V4_NATIVE:
+                bal = max(0, w3.eth.get_balance(wallet_address()) - gas_reserve)
+                qdec = 18
             else:
-                try:
-                    wbal = ch.erc20(w3, cfg["wrapped"]).functions.balanceOf(wallet_address()).call()
-                    wtotal = wbal + max(0, w3.eth.get_balance(wallet_address()) - int(0.0005e18))
-                    rate = ch.wrapped_per_quote_wei(w3, cid, quote)
-                    if wtotal > 0 and rate > 0:
-                        bal += int(wtotal / rate * 0.98)
-                except Exception:
-                    pass
-            budget = (bal * val / 100) / 10 ** qc.functions.decimals().call()
-        return ch.increase_position(cid, pk(), token_id, budget, s["slippage_pct"])
+                qc = ch.erc20(w3, quote)
+                bal = qc.functions.balanceOf(wallet_address()).call()
+                qdec = qc.functions.decimals().call()
+                if quote.lower() == cfg["wrapped"].lower():
+                    bal += max(0, w3.eth.get_balance(wallet_address()) - gas_reserve)
+                else:
+                    try:
+                        wbal = ch.erc20(w3, cfg["wrapped"]).functions.balanceOf(wallet_address()).call()
+                        wtotal = wbal + max(0, w3.eth.get_balance(wallet_address()) - gas_reserve)
+                        rate = ch.wrapped_per_quote_wei(w3, cid, quote)
+                        if wtotal > 0 and rate > 0:
+                            bal += int(wtotal / rate * 0.98)
+                    except Exception:
+                        pass
+            budget = (bal * val / 100) / 10 ** qdec
+        return ch.add_any(cid, pk(), pid, budget, s["slippage_pct"])
 
     async with TX_LOCK:
         try:
@@ -1251,81 +1391,86 @@ async def do_add_exec(update: Update, token_id: int, val: float, is_pct: bool):
         except Exception as e:
             await edit(status, f"❌ Add gagal: {esc(e)}")
             return
-    store.record_event(cid, "mint", token_id, r["added_usd"], "add", wallet=wallet_address())
-    lines = [f"✅ <b>Added #{token_id}</b> (~{ch.fmt_usd(r['added_usd'])})"]
+    ev_tid = ch.parse_pid(pid)[1] if str(pid).isdigit() else str(pid)
+    store.record_event(cid, "mint", ev_tid, r["added_usd"], "add", wallet=wallet_address())
+    lines = [f"✅ <b>Added {pid}</b> (~{ch.fmt_usd(r['added_usd'])})"]
     if r.get("quote_in") is not None:
         lines.append(f"Masuk: {ch.fmt_amount(r['quote_in'])} {r['quote_sym']}"
                      f" + {ch.fmt_amount(r['meme_in'])} {r['meme_sym']}"
                      f" <i>(meme dari wallet dipakai duluan)</i>")
     for label, h in r["steps"]:
         lines.append(f"{label}: {ch.tx_link(cid, h)}")
-    lines.append(ch.pos_link(cid, token_id))
+    lines.append(ch.pos_link_any(cid, pid))
     await edit(status, "\n".join(lines), NAV_KB)
 
 
-async def ask_reduce(update: Update, token_id: int):
+async def ask_reduce(update: Update, pid: str):
+    note = ("<i>Token hasil penarikan tetap di wallet (tanpa auto-swap). "
+            "Untuk 100% pakai tombol Close.</i>")
+    if str(pid).startswith("v2:"):
+        note = "<i>Fee v2 sudah auto-compound di dalam nilai LP. Untuk 100% pakai Close.</i>"
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"➖ {pct}%", callback_data=f"redok|{token_id}|{pct}")
+        [InlineKeyboardButton(f"➖ {pct}%", callback_data=f"redok|{pid}|{pct}")
          for pct in (25, 50, 75)],
         [InlineKeyboardButton("❌ Cancel", callback_data="cancel")],
     ])
     await reply(update, (
-        f"➖ <b>Kurangi posisi #{token_id}?</b>\n"
-        f"Pilih persentase yang ditarik. Fee unclaimed ikut terambil.\n"
-        f"<i>Token hasil penarikan tetap di wallet (tanpa auto-swap). "
-        f"Untuk 100% pakai tombol Close.</i>"), kb)
+        f"➖ <b>Kurangi posisi {pid}?</b>\n"
+        f"Pilih persentase yang ditarik. Fee unclaimed ikut terambil.\n{note}"), kb)
 
 
-async def do_reduce_exec(update: Update, token_id: int, pct: int):
+async def do_reduce_exec(update: Update, pid: str, pct: int):
     s = store.load_settings()
     cid = s["chain"]
 
     def snapshot():
-        return next((p for p in ch.list_positions(cid, pk()) if p["token_id"] == token_id), None)
+        return next((p for p in list_positions_all(cid) if p["pid"] == str(pid)), None)
 
     pos = await asyncio.to_thread(snapshot)
-    status = await reply(update, f"⏳ Menarik {pct}% dari #{token_id}...")
+    status = await reply(update, f"⏳ Menarik {pct}% dari {pid}...")
     async with TX_LOCK:
         try:
-            r = await asyncio.to_thread(ch.decrease_position, cid, pk(), token_id, pct)
+            r = await asyncio.to_thread(ch.reduce_any, cid, pk(), pid, pct, s["slippage_pct"])
         except Exception as e:
             await edit(status, f"❌ Reduce gagal: {esc(e)}")
             return
+    ev_tid = ch.parse_pid(pid)[1] if str(pid).isdigit() else str(pid)
     if pos:
-        store.record_event(cid, "close", token_id, pos["value_usd"] * pct / 100,
+        store.record_event(cid, "close", ev_tid, pos["value_usd"] * pct / 100,
                            f"reduce {pct}%", wallet=wallet_address())
         if pos["unclaimed_usd"] > 0:
-            store.record_event(cid, "fees", token_id, pos["unclaimed_usd"], wallet=wallet_address())
-    lines = [f"✅ <b>Reduced #{token_id} −{pct}%</b>",
+            store.record_event(cid, "fees", ev_tid, pos["unclaimed_usd"], wallet=wallet_address())
+    lines = [f"✅ <b>Reduced {pid} −{pct}%</b>",
              f"Received ~{ch.fmt_amount(r['got0'])} {esc(r['sym0'])} + "
              f"{ch.fmt_amount(r['got1'])} {esc(r['sym1'])} (termasuk fee)"]
     for label, h in r["steps"]:
         lines.append(f"{label}: {ch.tx_link(cid, h)}")
-    lines.append(ch.pos_link(cid, token_id))
+    lines.append(ch.pos_link_any(cid, pid))
     await edit(status, "\n".join(lines), NAV_KB)
 
 
 # ---------- Collect fee ----------
-async def do_collect(update: Update, token_id: int):
+async def do_collect(update: Update, pid: str):
     s = store.load_settings()
     cid = s["chain"]
 
     def find_pos():
-        return next((p for p in ch.list_positions(cid, pk()) if p["token_id"] == token_id), None)
+        return next((p for p in list_positions_all(cid) if p["pid"] == str(pid)), None)
 
     pos = await asyncio.to_thread(find_pos)
-    status = await reply(update, f"⏳ Collect fee #{token_id}...")
+    status = await reply(update, f"⏳ Collect fee {pid}...")
     async with TX_LOCK:
         try:
-            r = await asyncio.to_thread(ch.collect_fees, cid, pk(), token_id)
+            r = await asyncio.to_thread(ch.collect_any, cid, pk(), pid)
         except Exception as e:
             await edit(status, f"❌ Collect gagal: {esc(e)}")
             return
+    ev_tid = ch.parse_pid(pid)[1] if str(pid).isdigit() else str(pid)
     usd_txt = ""
     if pos and pos["unclaimed_usd"] > 0:
-        store.record_event(cid, "fees", token_id, pos["unclaimed_usd"], wallet=wallet_address())
+        store.record_event(cid, "fees", ev_tid, pos["unclaimed_usd"], wallet=wallet_address())
         usd_txt = f" (~{ch.fmt_usd(pos['unclaimed_usd'])})"
-    lines = [f"✅ <b>Fee terklaim #{token_id}</b>{usd_txt}",
+    lines = [f"✅ <b>Fee terklaim {pid}</b>{usd_txt}",
              f"Received {ch.fmt_amount(r['got0'])} {esc(r['sym0'])} + "
              f"{ch.fmt_amount(r['got1'])} {esc(r['sym1'])}",
              "<i>Posisi tetap jalan — liquidity tidak berubah.</i>"]
@@ -1335,62 +1480,70 @@ async def do_collect(update: Update, token_id: int):
 
 
 # ---------- Close flow ----------
-async def ask_close(update: Update, token_id: int):
+async def ask_close(update: Update, pid: str):
     s = store.load_settings()
     cid = s["chain"]
 
     def work():
-        for p in ch.list_positions(cid, pk()):
-            if p["token_id"] == token_id:
-                return p
-        return None
+        return next((p for p in list_positions_all(cid) if p["pid"] == str(pid)), None)
 
     p = await asyncio.to_thread(work)
     if not p:
-        await reply(update, f"❌ Posisi #{token_id} tidak ditemukan.")
+        await reply(update, f"❌ Posisi {pid} tidak ditemukan.")
         return
+    ver = p.get("ver", 3)
     status = "🟢 IN" if p["in_range"] else "🔴 OUT"
     wsym = ch.CHAINS[cid]["wrapped_symbol"]
     meme_sym = p["sym0"] if p["quote_is_token1"] else p["sym1"]
+    if ver == 4:
+        swap_note = (f"<i>Opsi swap menjual hasil {esc(meme_sym)} → quote pool via "
+                     f"UniversalRouter v4.</i>")
+        detail = "Full exit LP (burn posisi, principal + fee sekaligus)."
+    elif ver == 2:
+        swap_note = f"<i>Opsi swap menjual {esc(meme_sym)} hasil penarikan via router v2.</i>"
+        detail = "Full exit LP (removeLiquidity 100%, fee sudah auto-compound)."
+    else:
+        swap_note = (f"<i>Opsi swap menjual SELURUH saldo {esc(meme_sym)} di wallet "
+                     f"(termasuk sisa dari close/mint sebelumnya), bukan cuma hasil posisi ini.</i>")
+        detail = "Full exit LP (decrease + collect)."
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"✅ Close + swap semua {meme_sym} → {wsym}",
-                              callback_data=f"closeok|{token_id}|1")],
-        [InlineKeyboardButton(f"✅ Close, tahan {meme_sym}", callback_data=f"closeok|{token_id}|0")],
+        [InlineKeyboardButton(f"✅ Close + swap {meme_sym} → {wsym if ver != 4 else 'quote'}",
+                              callback_data=f"closeok|{pid}|1")],
+        [InlineKeyboardButton(f"✅ Close, tahan {meme_sym}", callback_data=f"closeok|{pid}|0")],
         [InlineKeyboardButton("❌ Cancel", callback_data="cancel")],
     ])
     await reply(update, (
         f"⚠️ <b>Close position?</b>\n\n"
-        f"#{token_id} [v3] {esc(p['sym1'])}/{esc(p['sym0'])}\n"
+        f"{_pos_disp(p)} {esc(p['sym1'])}/{esc(p['sym0'])}\n"
         f"Val ~{ch.fmt_usd(p['value_usd'])} · {status}\n\n"
-        f"Full exit LP (decrease + collect).\n"
-        f"<i>Opsi swap menjual SELURUH saldo {esc(meme_sym)} di wallet "
-        f"(termasuk sisa dari close/mint sebelumnya), bukan cuma hasil posisi ini.</i>"), kb)
+        f"{detail}\n{swap_note}"), kb)
 
 
-async def do_close(update: Update, token_id: int, autoswap: bool):
+async def do_close(update: Update, pid: str, autoswap: bool):
     s = store.load_settings()
     cid = s["chain"]
 
     def find_pos():
-        for p in ch.list_positions(cid, pk()):
-            if p["token_id"] == token_id:
-                return p
-        return None
+        return next((p for p in list_positions_all(cid) if p["pid"] == str(pid)), None)
 
     pos = await asyncio.to_thread(find_pos)
     usd = (pos["value_usd"] + pos["unclaimed_usd"]) if pos else 0.0
-    status = await reply(update, f"⏳ Closing #{token_id} (v3)...")
+    ver, ref = ch.parse_pid(pid)
+    status = await reply(update, f"⏳ Closing {pid} (v{ver})...")
     async with TX_LOCK:
         try:
-            r = await asyncio.to_thread(ch.close_position, cid, pk(), token_id, s["slippage_pct"], autoswap)
+            r = await asyncio.to_thread(ch.close_any, cid, pk(), pid, s["slippage_pct"], autoswap)
         except Exception as e:
             await edit(status, f"❌ Close gagal: {esc(e)}")
             return
 
-    store.record_event(cid, "close", token_id, pos["value_usd"] if pos else usd, wallet=wallet_address())
+    ev_tid = ref if ver == 3 else str(pid)
+    if ver == 4:
+        store.drop_ref(cid, wallet_address(), "v4", str(ref))
+    store.record_event(cid, "close", ev_tid, pos["value_usd"] if pos else usd, wallet=wallet_address())
     if pos and pos["unclaimed_usd"] > 0:
-        store.record_event(cid, "fees", token_id, pos["unclaimed_usd"], wallet=wallet_address())
-    lines = [f"✅ <b>Closed #{token_id}</b>",
+        store.record_event(cid, "fees", ev_tid, pos["unclaimed_usd"], wallet=wallet_address())
+    lines = [f"✅ <b>Closed {pid}</b>",
              f"Received ~{ch.fmt_amount(r['got0'])} {esc(r['sym0'])} + {ch.fmt_amount(r['got1'])} {esc(r['sym1'])}"]
     if pos:
         lines.append(f"💰 Fee terklaim: {ch.fmt_amount(pos['fees0'])} {esc(pos['sym0'])} + "
@@ -1482,7 +1635,7 @@ async def on_callback(update: Update, _):
         AWAITING[update.effective_chat.id] = {"kind": "setval", "key": ""}
         return
     if data.startswith("pos|"):
-        await show_position(update, q.message, int(data.split("|", 1)[1]))
+        await show_position(update, q.message, data.split("|", 1)[1])
         return
     if data.startswith("pool|"):
         # pilih pool → kartu konfirmasi (belum mint)
@@ -1526,34 +1679,34 @@ async def on_callback(update: Update, _):
         return
     if data.startswith("chart|"):
         # tombol lama (pra-link eksternal) — arahkan ke kartu detail
-        await show_position(update, q.message, int(data.split("|", 1)[1]))
+        await show_position(update, q.message, data.split("|", 1)[1])
         return
     if data.startswith("add|"):
-        await ask_add(update, int(data.split("|", 1)[1]))
+        await ask_add(update, data.split("|", 1)[1])
         return
     if data.startswith("addok|"):
         _, tid, val, kind = data.split("|")
         await q.edit_message_reply_markup(None)
-        await do_add_exec(update, int(tid), float(val), kind == "p")
+        await do_add_exec(update, tid, float(val), kind == "p")
         return
     if data.startswith("fee|"):
-        await do_collect(update, int(data.split("|", 1)[1]))
+        await do_collect(update, data.split("|", 1)[1])
         return
     if data.startswith("red|"):
-        await ask_reduce(update, int(data.split("|", 1)[1]))
+        await ask_reduce(update, data.split("|", 1)[1])
         return
     if data.startswith("redok|"):
         _, tid, pct = data.split("|")
         await q.edit_message_reply_markup(None)
-        await do_reduce_exec(update, int(tid), int(pct))
+        await do_reduce_exec(update, tid, int(pct))
         return
     if data.startswith("close|"):
-        await ask_close(update, int(data.split("|", 1)[1]))
+        await ask_close(update, data.split("|", 1)[1])
         return
     if data.startswith("closeok|"):
         parts = data.split("|")
         await q.edit_message_reply_markup(None)
-        await do_close(update, int(parts[1]), autoswap=(len(parts) > 2 and parts[2] == "1"))
+        await do_close(update, parts[1], autoswap=(len(parts) > 2 and parts[2] == "1"))
         return
 
 
@@ -1571,9 +1724,11 @@ async def monitor_loop(app):
         try:
             positions = []
             for key in all_pks():
-                positions += await asyncio.to_thread(ch.list_positions, cid, key)
+                positions += await asyncio.to_thread(list_positions_all, cid, key)
             for p in positions:
-                key = (cid, p["token_id"])
+                if p.get("ver") == 2:
+                    continue  # v2 full-range, tidak pernah out of range
+                key = (cid, p["pid"])
                 now_in = p["in_range"]
                 prev = RANGE_STATE.get(key)
                 RANGE_STATE[key] = now_in
@@ -1581,20 +1736,20 @@ async def monitor_loop(app):
                     continue  # baseline pertama / tidak berubah
                 meme_sym = p["sym0"] if p["quote_is_token1"] else p["sym1"]
                 if now_in:
-                    head = f"🟢 <b>{esc(meme_sym)} #{p['token_id']} MASUK range</b> — fee mulai mengalir."
+                    head = f"🟢 <b>{esc(meme_sym)} {_pos_disp(p)} MASUK range</b> — fee mulai mengalir."
                 else:
                     if p.get("mc_now") and p.get("mc_lower") and p["mc_now"] < p["mc_lower"]:
                         arah = f"tembus ke BAWAH — posisi jadi penuh {esc(meme_sym)}"
                     else:
                         arah = f"keluar ke ATAS — posisi jadi penuh {esc(p['quote_sym'] or 'quote')}"
-                    head = f"🔴 <b>{esc(meme_sym)} #{p['token_id']} KELUAR range</b> — {arah}. Fee berhenti."
+                    head = f"🔴 <b>{esc(meme_sym)} {_pos_disp(p)} KELUAR range</b> — {arah}. Fee berhenti."
                 body = (f"{head}\n"
                         f"Val {ch.fmt_usd(p['value_usd'])} · Unclaimed {ch.fmt_usd(p['unclaimed_usd'])}\n"
                         f"Range: {esc(range_str(p))}")
                 meme_ca = p["token0"] if p["quote_is_token1"] else p["token1"]
                 kb = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📋 Detail", callback_data=f"pos|{p['token_id']}"),
-                     InlineKeyboardButton("🗑 Close", callback_data=f"close|{p['token_id']}")],
+                    [InlineKeyboardButton("📋 Detail", callback_data=f"pos|{p['pid']}"),
+                     InlineKeyboardButton("🗑 Close", callback_data=f"close|{p['pid']}")],
                     chart_buttons(cid, p["pool"], meme_ca),
                 ])
                 for chat_id in allowed_chat_ids():
@@ -1604,7 +1759,7 @@ async def monitor_loop(app):
                     except Exception:
                         pass
             # posisi yang sudah ditutup → buang dari state
-            live = {(cid, p["token_id"]) for p in positions}
+            live = {(cid, p["pid"]) for p in positions}
             for k in [k for k in RANGE_STATE if k[0] == cid and k not in live]:
                 RANGE_STATE.pop(k, None)
         except Exception as e:

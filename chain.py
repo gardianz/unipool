@@ -10,6 +10,7 @@ from decimal import Decimal
 from urllib.parse import urlparse
 
 import requests
+from eth_abi import encode as abi_encode
 from requests.adapters import HTTPAdapter
 from web3 import Web3
 from web3.exceptions import ContractLogicError
@@ -41,6 +42,16 @@ CHAINS = {
         "npm": "0x73991a25c818bf1f1128deaab1492d45638de0d3",
         # SwapRouter02 — diverifikasi on-chain: factory() == factory di atas
         "router": "0xCaf681a66D020601342297493863E78C959E5cb2",
+        # V2 router — diverifikasi on-chain: factory()==v2_factory, WETH()==wrapped
+        "v2_router": "0x89e5db8b5aa49aa85ac63f691524311aeb649eba",
+        # Uniswap V4 (developers.uniswap.org/contracts/v4/deployments; semua diverifikasi
+        # on-chain: posm/stateview/quoter/UR .poolManager() == v4_pm, posm.permit2() canonical)
+        "v4_pm": "0x8366a39cc670b4001a1121b8f6a443a643e40951",
+        "v4_posm": "0x58daec3116aae6d93017baaea7749052e8a04fa7",
+        "v4_stateview": "0xf3334192d15450cdd385c8b70e03f9a6bd9e673b",
+        "v4_quoter": "0x8dc178efb8111bb0973dd9d722ebeff267c98f94",
+        "v4_router": "0x8876789976decbfcbbbe364623c63652db8c0904",
+        "permit2": "0x000000000022D473030F116dDEE9F6B43aC78BA3",
         "wrapped": "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73",
         "wrapped_symbol": "WETH",
         "native_symbol": "ETH",
@@ -68,6 +79,15 @@ CHAINS = {
         "npm": "0x7b8A01B39D58278b5DE7e48c8449c9f4F5170613",
         # SwapRouter02 Uniswap di BSC (docs.uniswap.org deployments)
         "router": "0xB971eF87ede563556b2ED4b1C0b0019111Dd85d2",
+        # V2 router — diverifikasi on-chain: factory()==v2_factory, WETH()==wrapped
+        "v2_router": "0x4752ba5DBc23f44D87826276BF6Fd6b1C372aD24",
+        # Uniswap V4 (diverifikasi on-chain, sama seperti Robinhood)
+        "v4_pm": "0x28e2ea090877bf75740558f6bfb36a5ffee9e9df",
+        "v4_posm": "0x7a4a5c919ae2541aed11041a1aeee68f1287f95b",
+        "v4_stateview": "0xd13dd3d6e93f276fafc9db9e6bb47c1180aee0c4",
+        "v4_quoter": "0x9f75dd27d6664c475b90e105573e550ff69437b0",
+        "v4_router": "0x1906c1d672b88cd1b9ac7593301ca990f94eae07",
+        "permit2": "0x000000000022D473030F116dDEE9F6B43aC78BA3",
         "wrapped": "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c",
         "wrapped_symbol": "WBNB",
         "native_symbol": "BNB",
@@ -162,7 +182,113 @@ V2_FACTORY_ABI = [
 V2_PAIR_ABI = [
     {"constant": True, "inputs": [], "name": "getReserves", "outputs": [{"name": "r0", "type": "uint112"}, {"name": "r1", "type": "uint112"}, {"name": "ts", "type": "uint32"}], "type": "function", "stateMutability": "view"},
     {"constant": True, "inputs": [], "name": "token0", "outputs": [{"name": "", "type": "address"}], "type": "function", "stateMutability": "view"},
+    {"constant": True, "inputs": [], "name": "token1", "outputs": [{"name": "", "type": "address"}], "type": "function", "stateMutability": "view"},
 ]
+
+V2_ROUTER_ABI = [
+    {"inputs": [], "name": "factory", "outputs": [{"name": "", "type": "address"}], "type": "function", "stateMutability": "view"},
+    {"inputs": [], "name": "WETH", "outputs": [{"name": "", "type": "address"}], "type": "function", "stateMutability": "view"},
+    {"inputs": [{"name": "amountIn", "type": "uint256"}, {"name": "path", "type": "address[]"}],
+     "name": "getAmountsOut", "outputs": [{"name": "amounts", "type": "uint256[]"}],
+     "type": "function", "stateMutability": "view"},
+    {"inputs": [{"name": "amountIn", "type": "uint256"}, {"name": "amountOutMin", "type": "uint256"},
+                {"name": "path", "type": "address[]"}, {"name": "to", "type": "address"},
+                {"name": "deadline", "type": "uint256"}],
+     "name": "swapExactTokensForTokens", "outputs": [{"name": "amounts", "type": "uint256[]"}],
+     "type": "function", "stateMutability": "nonpayable"},
+    {"inputs": [{"name": "tokenA", "type": "address"}, {"name": "tokenB", "type": "address"},
+                {"name": "amountADesired", "type": "uint256"}, {"name": "amountBDesired", "type": "uint256"},
+                {"name": "amountAMin", "type": "uint256"}, {"name": "amountBMin", "type": "uint256"},
+                {"name": "to", "type": "address"}, {"name": "deadline", "type": "uint256"}],
+     "name": "addLiquidity", "outputs": [{"name": "amountA", "type": "uint256"},
+                                         {"name": "amountB", "type": "uint256"}, {"name": "liquidity", "type": "uint256"}],
+     "type": "function", "stateMutability": "nonpayable"},
+    {"inputs": [{"name": "tokenA", "type": "address"}, {"name": "tokenB", "type": "address"},
+                {"name": "liquidity", "type": "uint256"},
+                {"name": "amountAMin", "type": "uint256"}, {"name": "amountBMin", "type": "uint256"},
+                {"name": "to", "type": "address"}, {"name": "deadline", "type": "uint256"}],
+     "name": "removeLiquidity", "outputs": [{"name": "amountA", "type": "uint256"}, {"name": "amountB", "type": "uint256"}],
+     "type": "function", "stateMutability": "nonpayable"},
+]
+
+# ---------- Uniswap V4 ABIs ----------
+_POOLKEY_COMPONENTS = [
+    {"name": "currency0", "type": "address"}, {"name": "currency1", "type": "address"},
+    {"name": "fee", "type": "uint24"}, {"name": "tickSpacing", "type": "int24"},
+    {"name": "hooks", "type": "address"},
+]
+
+V4_POSM_ABI = [
+    {"inputs": [], "name": "poolManager", "outputs": [{"name": "", "type": "address"}], "type": "function", "stateMutability": "view"},
+    {"inputs": [], "name": "permit2", "outputs": [{"name": "", "type": "address"}], "type": "function", "stateMutability": "view"},
+    {"inputs": [], "name": "nextTokenId", "outputs": [{"name": "", "type": "uint256"}], "type": "function", "stateMutability": "view"},
+    {"inputs": [{"name": "tokenId", "type": "uint256"}], "name": "ownerOf", "outputs": [{"name": "", "type": "address"}], "type": "function", "stateMutability": "view"},
+    {"inputs": [{"name": "tokenId", "type": "uint256"}], "name": "getPositionLiquidity",
+     "outputs": [{"name": "liquidity", "type": "uint128"}], "type": "function", "stateMutability": "view"},
+    {"inputs": [{"name": "tokenId", "type": "uint256"}], "name": "getPoolAndPositionInfo",
+     "outputs": [{"components": _POOLKEY_COMPONENTS, "name": "poolKey", "type": "tuple"},
+                 {"name": "info", "type": "uint256"}], "type": "function", "stateMutability": "view"},
+    {"inputs": [{"name": "unlockData", "type": "bytes"}, {"name": "deadline", "type": "uint256"}],
+     "name": "modifyLiquidities", "outputs": [], "type": "function", "stateMutability": "payable"},
+]
+
+V4_STATEVIEW_ABI = [
+    {"inputs": [], "name": "poolManager", "outputs": [{"name": "", "type": "address"}], "type": "function", "stateMutability": "view"},
+    {"inputs": [{"name": "poolId", "type": "bytes32"}], "name": "getSlot0", "outputs": [
+        {"name": "sqrtPriceX96", "type": "uint160"}, {"name": "tick", "type": "int24"},
+        {"name": "protocolFee", "type": "uint24"}, {"name": "lpFee", "type": "uint24"}],
+     "type": "function", "stateMutability": "view"},
+    {"inputs": [{"name": "poolId", "type": "bytes32"}], "name": "getLiquidity",
+     "outputs": [{"name": "", "type": "uint128"}], "type": "function", "stateMutability": "view"},
+    {"inputs": [{"name": "poolId", "type": "bytes32"}, {"name": "tickLower", "type": "int24"},
+                {"name": "tickUpper", "type": "int24"}], "name": "getFeeGrowthInside",
+     "outputs": [{"name": "feeGrowthInside0X128", "type": "uint256"}, {"name": "feeGrowthInside1X128", "type": "uint256"}],
+     "type": "function", "stateMutability": "view"},
+    {"inputs": [{"name": "poolId", "type": "bytes32"}, {"name": "owner", "type": "address"},
+                {"name": "tickLower", "type": "int24"}, {"name": "tickUpper", "type": "int24"},
+                {"name": "salt", "type": "bytes32"}], "name": "getPositionInfo",
+     "outputs": [{"name": "liquidity", "type": "uint128"},
+                 {"name": "feeGrowthInside0LastX128", "type": "uint256"},
+                 {"name": "feeGrowthInside1LastX128", "type": "uint256"}],
+     "type": "function", "stateMutability": "view"},
+]
+
+PERMIT2_ABI = [
+    {"inputs": [{"name": "owner", "type": "address"}, {"name": "token", "type": "address"},
+                {"name": "spender", "type": "address"}], "name": "allowance",
+     "outputs": [{"name": "amount", "type": "uint160"}, {"name": "expiration", "type": "uint48"},
+                 {"name": "nonce", "type": "uint48"}], "type": "function", "stateMutability": "view"},
+    {"inputs": [{"name": "token", "type": "address"}, {"name": "spender", "type": "address"},
+                {"name": "amount", "type": "uint160"}, {"name": "expiration", "type": "uint48"}],
+     "name": "approve", "outputs": [], "type": "function", "stateMutability": "nonpayable"},
+]
+
+V4_QUOTER_ABI = [
+    {"inputs": [], "name": "poolManager", "outputs": [{"name": "", "type": "address"}], "type": "function", "stateMutability": "view"},
+    {"inputs": [{"components": [
+        {"components": _POOLKEY_COMPONENTS, "name": "poolKey", "type": "tuple"},
+        {"name": "zeroForOne", "type": "bool"},
+        {"name": "exactAmount", "type": "uint128"},
+        {"name": "hookData", "type": "bytes"}], "name": "params", "type": "tuple"}],
+     "name": "quoteExactInputSingle",
+     "outputs": [{"name": "amountOut", "type": "uint256"}, {"name": "gasEstimate", "type": "uint256"}],
+     "type": "function", "stateMutability": "nonpayable"},
+]
+
+V4_UR_ABI = [
+    {"inputs": [], "name": "poolManager", "outputs": [{"name": "", "type": "address"}], "type": "function", "stateMutability": "view"},
+    {"inputs": [{"name": "commands", "type": "bytes"}, {"name": "inputs", "type": "bytes[]"},
+                {"name": "deadline", "type": "uint256"}],
+     "name": "execute", "outputs": [], "type": "function", "stateMutability": "payable"},
+]
+
+# v4-periphery Actions (github.com/Uniswap/v4-periphery Actions.sol)
+V4_INCREASE, V4_DECREASE, V4_MINT, V4_BURN = 0x00, 0x01, 0x02, 0x03
+V4_SWAP_IN_SINGLE, V4_SETTLE_ALL, V4_SETTLE_PAIR = 0x06, 0x0C, 0x0D
+V4_TAKE_ALL, V4_TAKE_PAIR, V4_SWEEP = 0x0F, 0x11, 0x14
+UR_CMD_V4_SWAP = 0x10
+V4_NATIVE = "0x0000000000000000000000000000000000000000"
+V4_FEE_SPACINGS = ((100, 1), (500, 10), (3000, 60), (10000, 200))
 
 # SwapRouter02: exactInputSingle TANPA field deadline (beda dari SwapRouter v1)
 ROUTER_ABI = [
@@ -443,6 +569,17 @@ def pos_link(chain_id: int, token_id: int) -> str:
     return f"https://app.uniswap.org/positions/v3/{CHAINS[chain_id]['slug']}/{token_id}"
 
 
+def pos_link_any(chain_id: int, pid) -> str:
+    """Link posisi lintas versi. v2 tidak punya halaman posisi → link pair dexscreener."""
+    ver, ref = parse_pid(pid)
+    cfg = CHAINS[chain_id]
+    if ver == 4:
+        return f"https://app.uniswap.org/positions/v4/{cfg['slug']}/{ref}"
+    if ver == 2:
+        return f"https://dexscreener.com/{cfg['dexscreener']}/{ref}"
+    return pos_link(chain_id, ref)
+
+
 # ---------- Harga USD quote ----------
 def _pool_price_t1_per_t0(w3: Web3, pool_addr: str) -> float:
     pool = w3.eth.contract(address=Web3.to_checksum_address(pool_addr), abi=POOL_ABI)
@@ -534,7 +671,7 @@ def discover_pools(chain_id: int, token_addr: str) -> dict:
             q_bal = erc20(w3, q).functions.balanceOf(pool_addr).call() / 10 ** qdec
             t0, t1 = sorted([token, q])
             return {
-                "pool": pool_addr, "fee": fee, "quote_sym": qsym, "quote_addr": q,
+                "ver": 3, "pool": pool_addr, "fee": fee, "quote_sym": qsym, "quote_addr": q,
                 "quote_decimals": qdec, "quote_usd": qusd,
                 "tick": slot0[1], "sqrtp": slot0[0], "liquidity": liq,
                 "tvl_usd": q_bal * qusd * 2,  # estimasi: sisi quote × 2
@@ -542,10 +679,17 @@ def discover_pools(chain_id: int, token_addr: str) -> dict:
             }
 
         vols_f = ex.submit(dex_volumes, chain_id, token)
+        v2_f = ex.submit(discover_v2_pools, w3, chain_id, token)
+        v4_f = ex.submit(discover_v4_pools, w3, chain_id, token)
         pools = []
         for fut in [ex.submit(detail, it) for it in found]:
             try:
                 pools.append(fut.result())
+            except Exception:
+                continue
+        for fut in (v2_f, v4_f):
+            try:
+                pools += fut.result()
             except Exception:
                 continue
         tinfo = tinfo_f.result()
@@ -567,8 +711,9 @@ def discover_pools(chain_id: int, token_addr: str) -> dict:
 #   wide   = [P·(1−low%), P·(1+up%)]    → dua sisi (butuh quote + meme, auto-swap)
 #   stable = wide dengan lebar sempit (±low%/up% kecil)
 def calc_strategy_range(cur_tick: int, fee: int, quote_is_token1: bool, mode: str,
-                        low_pct: float, up_pct: float, gap: int = 1) -> tuple[int, int]:
-    sp = TICK_SPACING[fee]
+                        low_pct: float, up_pct: float, gap: int = 1,
+                        spacing: int | None = None) -> tuple[int, int]:
+    sp = spacing or TICK_SPACING[fee]
     ln = math.log(1.0001)
     dn_ticks = int(abs(math.log(max(1e-9, 1 - low_pct / 100)) / ln))  # jarak sisi harga-turun
     up_ticks = int(abs(math.log(1 + up_pct / 100) / ln))              # jarak sisi harga-naik
@@ -1421,3 +1566,1053 @@ def close_position(chain_id: int, pk: str, token_id: int, slippage_pct: float,
         "got0": got0 / 10 ** i0["decimals"], "got1": got1 / 10 ** i1["decimals"],
         "sym0": i0["symbol"], "sym1": i1["symbol"],
     }
+
+
+# ══════════════════════════ Uniswap V2 ══════════════════════════
+def verify_v2_router(w3: Web3, chain_id: int, _cache={}) -> bool:
+    """Fail-closed: router.factory()==v2_factory dan router.WETH()==wrapped."""
+    if chain_id in _cache:
+        return _cache[chain_id]
+    cfg = CHAINS[chain_id]
+    try:
+        r = w3.eth.contract(address=Web3.to_checksum_address(cfg["v2_router"]), abi=V2_ROUTER_ABI)
+        ok = (r.functions.factory().call().lower() == cfg["v2_factory"].lower()
+              and r.functions.WETH().call().lower() == cfg["wrapped"].lower())
+    except Exception:
+        ok = False
+    _cache[chain_id] = ok
+    return ok
+
+
+def _preflight(w3: Web3, account_addr: str, tx: dict):
+    """Simulasi eth_call sebelum kirim — send_tx fallback gas 500k bakal
+    broadcast buta kalau estimate gagal, jadi revert harus ketahuan di sini."""
+    try:
+        w3.eth.call({"from": account_addr, **tx})
+    except Exception as e:
+        raise RuntimeError(f"Simulasi tx gagal (tidak dikirim): {e}")
+
+
+def _v2_pair_reserves(w3: Web3, pair_addr: str, quote: str) -> tuple[int, int]:
+    """(reserve_quote, reserve_meme) wei."""
+    pc = w3.eth.contract(address=Web3.to_checksum_address(pair_addr), abi=V2_PAIR_ABI)
+    r0, r1, _ = pc.functions.getReserves().call()
+    t0 = pc.functions.token0().call()
+    return (r0, r1) if t0.lower() == quote.lower() else (r1, r0)
+
+
+V2_MINT_TOPIC = Web3.keccak(text="Mint(address,uint256,uint256)").hex()
+V2_BURN_TOPIC = Web3.keccak(text="Burn(address,uint256,uint256,address)").hex()
+
+
+def _v2_event_amounts(receipt, pair_addr: str, topic: str) -> tuple[int, int] | None:
+    for log in receipt.logs:
+        if (log.address.lower() == pair_addr.lower() and log.topics
+                and log.topics[0].hex().removeprefix("0x") == topic.removeprefix("0x")):
+            d = log.data.hex().removeprefix("0x")
+            if len(d) >= 128:
+                return int(d[0:64], 16), int(d[64:128], 16)
+    return None
+
+
+def discover_v2_pools(w3: Web3, chain_id: int, token: str) -> list[dict]:
+    """Pair v2 token × semua quote. Bentuk dict kompatibel pool_info v3 + ver=2."""
+    cfg = CHAINS[chain_id]
+    if not cfg.get("v2_factory"):
+        return []
+    token = Web3.to_checksum_address(token)
+    v2f = w3.eth.contract(address=Web3.to_checksum_address(cfg["v2_factory"]), abi=V2_FACTORY_ABI)
+    out = []
+    for qsym, qaddr in cfg["quotes"].items():
+        q = Web3.to_checksum_address(qaddr)
+        if q == token:
+            continue
+        try:
+            pair = v2f.functions.getPair(token, q).call()
+            if int(pair, 16) == 0:
+                continue
+            rq, rm = _v2_pair_reserves(w3, pair, q)
+            if rq == 0 or rm == 0:
+                continue
+            qdec = token_info(w3, q)["decimals"]
+            qusd = quote_usd_price(w3, chain_id, qsym)
+            tvl = rq / 10 ** qdec * qusd * 2
+            if tvl < 10:  # pair dust — harga tidak bisa dipercaya
+                continue
+            # round-trip lokal $100: pair yang tidak bisa serap swap kecil = dust/manipulasi
+            probe = int(min(100 / qusd if qusd else 0, rq / 10 ** qdec / 100 or 1) * 10 ** qdec) or 1
+            o1 = probe * 997 * rm // (rq * 1000 + probe * 997)
+            back = o1 * 997 * rq // (rm * 1000 + o1 * 997)
+            if back < probe * 70 // 100:
+                continue
+            t0, t1 = sorted([token, q])
+            out.append({
+                "ver": 2, "pool": pair, "fee": 3000, "quote_sym": qsym, "quote_addr": q,
+                "quote_decimals": qdec, "quote_usd": qusd,
+                "tick": None, "sqrtp": None, "liquidity": None,
+                "reserve_quote": rq, "reserve_meme": rm,
+                "tvl_usd": tvl, "token0": t0, "token1": t1, "quote_is_token1": q == t1,
+            })
+        except Exception:
+            continue
+    return out
+
+
+def mint_v2(chain_id: int, pk: str, pool_info: dict, budget: float, slippage_pct: float) -> dict:
+    """Add liquidity v2: swap ~50% quote → meme (meme existing dipakai duluan),
+    lalu router.addLiquidity dengan mins ber-slippage. Budget satuan quote."""
+    w3 = get_w3(chain_id)
+    cfg = CHAINS[chain_id]
+    if not verify_v2_router(w3, chain_id):
+        raise RuntimeError("V2 router gagal verifikasi on-chain (factory/WETH mismatch) — batal.")
+    account = w3.eth.account.from_key(pk)
+    router_addr = Web3.to_checksum_address(cfg["v2_router"])
+    router = w3.eth.contract(address=router_addr, abi=V2_ROUTER_ABI)
+    pair = Web3.to_checksum_address(pool_info["pool"])
+    quote = Web3.to_checksum_address(pool_info["quote_addr"])
+    meme = Web3.to_checksum_address(pool_info["token0"] if pool_info["quote_is_token1"] else pool_info["token1"])
+    qdec = pool_info["quote_decimals"]
+    minfo = token_info(w3, meme)
+    slip = (100 - slippage_pct) / 100
+    deadline = int(time.time()) + DEADLINE_SECS
+
+    budget_wei = int(Decimal(str(budget)) * Decimal(10) ** qdec)
+    if budget_wei <= 0:
+        raise RuntimeError("Amount 0.")
+    steps = ensure_quote_balance(w3, chain_id, pk, quote, budget_wei, slippage_pct)
+    budget_wei = min(budget_wei, erc20(w3, quote).functions.balanceOf(account.address).call())
+
+    rq, rm = _v2_pair_reserves(w3, pair, quote)
+    if rq == 0 or rm == 0:
+        raise RuntimeError("Reserves pair v2 kosong.")
+    meme_bal = erc20(w3, meme).functions.balanceOf(account.address).call()
+    meme_val_q = meme_bal * rq // rm
+    # target 50/50: quote yang ditahan = setengah total modal (quote + nilai meme existing)
+    quote_keep = min((budget_wei + meme_val_q) // 2, budget_wei)
+    swap_in = budget_wei - quote_keep
+    swapped = False
+    if swap_in > budget_wei // 500:
+        est_out = router.functions.getAmountsOut(swap_in, [quote, meme]).call()[-1]
+        min_out = int(est_out * slip)
+        if min_out <= 0:
+            raise RuntimeError("Estimasi hasil swap 0 — likuiditas pair terlalu tipis.")
+        steps += ensure_approval(w3, pk, quote, router_addr, swap_in)
+        data = calldata(router.functions.swapExactTokensForTokens(
+            swap_in, min_out, [quote, meme], account.address, deadline))
+        _preflight(w3, account.address, {"to": router_addr, "data": data})
+        h = send_tx(w3, pk, {"to": router_addr, "data": data})
+        wait_ok(w3, h, "swap v2")
+        steps.append(("swap", h))
+        swapped = True
+    meme_have = poll_balance(w3, meme, account.address, meme_bal + 1) if swapped \
+        else meme_bal
+    if quote_keep <= 0 or meme_have <= 0:
+        raise RuntimeError("Salah satu sisi 0 — v2 butuh dua sisi (quote + meme).")
+
+    rq, rm = _v2_pair_reserves(w3, pair, quote)  # fresh setelah swap
+    meme_need = quote_keep * rm // rq
+    meme_desired = min(meme_have, meme_need + meme_need // 100 + 1)
+    a_min = int(quote_keep * slip)
+    b_min = int(min(meme_need, meme_desired) * slip)
+    steps += ensure_approval(w3, pk, quote, router_addr, quote_keep)
+    steps += ensure_approval(w3, pk, meme, router_addr, meme_desired)
+    data = calldata(router.functions.addLiquidity(
+        quote, meme, quote_keep, meme_desired, a_min, b_min, account.address, deadline))
+    _preflight(w3, account.address, {"to": router_addr, "data": data})
+    h = send_tx(w3, pk, {"to": router_addr, "data": data})
+    receipt = wait_ok(w3, h, "addLiquidity v2")
+    steps.append(("addLiquidity", h))
+
+    qusd = pool_info["quote_usd"]
+    amts = _v2_event_amounts(receipt, pair, V2_MINT_TOPIC)
+    if amts:
+        a0, a1 = amts
+        q_amt, m_amt = (a1, a0) if pool_info["quote_is_token1"] else (a0, a1)
+    else:
+        q_amt, m_amt = quote_keep, meme_desired
+    m_in_q = m_amt * rq // rm if rm else 0
+    deposited_usd = (q_amt + m_in_q) / 10 ** qdec * qusd
+    return {"steps": steps, "pair": pair, "deposited_usd": deposited_usd,
+            "quote_in": q_amt / 10 ** qdec, "meme_in": m_amt / 10 ** minfo["decimals"],
+            "quote_sym": pool_info["quote_sym"], "meme_sym": minfo["symbol"]}
+
+
+def _v2_position_detail(w3: Web3, chain_id: int, pair_addr: str, account_addr: str) -> dict | None:
+    cfg = CHAINS[chain_id]
+    try:
+        pair = Web3.to_checksum_address(pair_addr)
+        pc = w3.eth.contract(address=pair, abi=V2_PAIR_ABI)
+        lp = erc20(w3, pair).functions.balanceOf(account_addr).call()
+        if lp == 0:
+            return None
+        total = erc20(w3, pair).functions.totalSupply().call()
+        r0, r1, _ = pc.functions.getReserves().call()
+        t0, t1 = pc.functions.token0().call(), pc.functions.token1().call()
+        i0, i1 = token_info(w3, t0), token_info(w3, t1)
+        a0, a1 = r0 * lp // total, r1 * lp // total
+
+        quotes_lc = {a.lower(): s for s, a in cfg["quotes"].items()}
+        if t1.lower() in quotes_lc:
+            qsym, q_is_t1 = quotes_lc[t1.lower()], True
+        elif t0.lower() in quotes_lc:
+            qsym, q_is_t1 = quotes_lc[t0.lower()], False
+        else:
+            return None
+        qusd = quote_usd_price(w3, chain_id, qsym)
+        rq, rm = (r1, r0) if q_is_t1 else (r0, r1)
+        aq, am = (a1, a0) if q_is_t1 else (a0, a1)
+        qdec = (i1 if q_is_t1 else i0)["decimals"]
+        usd_q = aq / 10 ** qdec * qusd
+        usd_m = (am * rq // rm) / 10 ** qdec * qusd if rm else 0
+        usd0, usd1 = (usd_m, usd_q) if q_is_t1 else (usd_q, usd_m)
+        return {
+            "ver": 2, "pid": f"v2:{pair.lower()}", "token_id": f"v2:{pair.lower()}",
+            "token0": t0, "token1": t1, "sym0": i0["symbol"], "sym1": i1["symbol"],
+            "dec0": i0["decimals"], "dec1": i1["decimals"], "fee": 3000, "pool": pair,
+            "tick_lower": None, "tick_upper": None, "cur_tick": None,
+            "liquidity": lp, "amount0": a0 / 10 ** i0["decimals"], "amount1": a1 / 10 ** i1["decimals"],
+            "fees0": 0.0, "fees1": 0.0, "in_range": True,
+            "value_usd": usd0 + usd1, "unclaimed_usd": 0.0,
+            "usd0": usd0, "usd1": usd1, "fees_usd0": 0.0, "fees_usd1": 0.0,
+            "quote_sym": qsym, "quote_is_token1": q_is_t1,
+            "mc_lower": None, "mc_upper": None, "mc_now": None,
+        }
+    except Exception:
+        return None
+
+
+def reduce_v2(chain_id: int, pk: str, pair_addr: str, pct: int, slippage_pct: float,
+              autoswap: bool = False) -> dict:
+    """removeLiquidity pct% (100 = close). Mins ber-slippage dari share reserves.
+    autoswap: jual meme hasil penarikan → wrapped via router v2."""
+    if not 1 <= pct <= 100:
+        raise RuntimeError("Persen 1–100.")
+    w3 = get_w3(chain_id)
+    cfg = CHAINS[chain_id]
+    if not verify_v2_router(w3, chain_id):
+        raise RuntimeError("V2 router gagal verifikasi on-chain — batal.")
+    account = w3.eth.account.from_key(pk)
+    router_addr = Web3.to_checksum_address(cfg["v2_router"])
+    router = w3.eth.contract(address=router_addr, abi=V2_ROUTER_ABI)
+    pair = Web3.to_checksum_address(pair_addr)
+    pc = w3.eth.contract(address=pair, abi=V2_PAIR_ABI)
+    slip = (100 - slippage_pct) / 100
+    deadline = int(time.time()) + DEADLINE_SECS
+
+    lp = erc20(w3, pair).functions.balanceOf(account.address).call()
+    if lp == 0:
+        raise RuntimeError("Saldo LP 0.")
+    part = lp if pct == 100 else lp * pct // 100
+    total = erc20(w3, pair).functions.totalSupply().call()
+    r0, r1, _ = pc.functions.getReserves().call()
+    t0, t1 = pc.functions.token0().call(), pc.functions.token1().call()
+    i0, i1 = token_info(w3, t0), token_info(w3, t1)
+    exp0, exp1 = r0 * part // total, r1 * part // total
+
+    steps = ensure_approval(w3, pk, pair, router_addr, part)
+    data = calldata(router.functions.removeLiquidity(
+        t0, t1, part, int(exp0 * slip), int(exp1 * slip), account.address, deadline))
+    _preflight(w3, account.address, {"to": router_addr, "data": data})
+    h = send_tx(w3, pk, {"to": router_addr, "data": data})
+    receipt = wait_ok(w3, h, "removeLiquidity v2")
+    steps.append(("remove", h))
+    amts = _v2_event_amounts(receipt, pair, V2_BURN_TOPIC) or (exp0, exp1)
+
+    swaps = []
+    if autoswap:
+        wrapped = Web3.to_checksum_address(cfg["wrapped"])
+        quotes_lc = {a.lower() for a in cfg["quotes"].values()}
+        for taddr, info in ((t0, i0), (t1, i1)):
+            if taddr.lower() == wrapped.lower():
+                continue
+            bal = erc20(w3, taddr).functions.balanceOf(account.address).call()
+            if bal == 0:
+                continue
+            # path langsung ke wrapped, atau lewat quote pair-nya
+            other = t1 if taddr == t0 else t0
+            path = [Web3.to_checksum_address(taddr), wrapped]
+            if taddr.lower() not in quotes_lc and other.lower() != wrapped.lower():
+                path = [Web3.to_checksum_address(taddr), Web3.to_checksum_address(other), wrapped]
+            try:
+                est = router.functions.getAmountsOut(bal, path).call()[-1]
+                if est <= 0:
+                    continue
+                ensure_approval(w3, pk, taddr, router_addr, bal)
+                sdata = calldata(router.functions.swapExactTokensForTokens(
+                    bal, int(est * slip), path, account.address, int(time.time()) + DEADLINE_SECS))
+                _preflight(w3, account.address, {"to": router_addr, "data": sdata})
+                sh = send_tx(w3, pk, {"to": router_addr, "data": sdata})
+                wait_ok(w3, sh, "swap v2")
+                swaps.append((info["symbol"], sh))
+            except Exception as e:
+                swaps.append((info["symbol"], f"SWAP GAGAL: {e}"))
+
+    return {"steps": steps, "swaps": swaps,
+            "got0": amts[0] / 10 ** i0["decimals"], "got1": amts[1] / 10 ** i1["decimals"],
+            "sym0": i0["symbol"], "sym1": i1["symbol"], "closed": pct == 100}
+
+
+# ══════════════════════════ Uniswap V4 ══════════════════════════
+def _v4c(w3: Web3, chain_id: int, which: str, abi):
+    return w3.eth.contract(address=Web3.to_checksum_address(CHAINS[chain_id][which]), abi=abi)
+
+
+def verify_v4(w3: Web3, chain_id: int, _cache={}) -> bool:
+    """Fail-closed: posm/stateview/UR semua harus menunjuk PoolManager yang sama
+    dan posm.permit2() harus Permit2 canonical. Salah satu gagal = semua aksi v4 batal."""
+    if chain_id in _cache:
+        return _cache[chain_id]
+    cfg = CHAINS[chain_id]
+    try:
+        pm = cfg["v4_pm"].lower()
+        posm = _v4c(w3, chain_id, "v4_posm", V4_POSM_ABI)
+        sv = _v4c(w3, chain_id, "v4_stateview", V4_STATEVIEW_ABI)
+        ur = _v4c(w3, chain_id, "v4_router", V4_UR_ABI)
+        qt = _v4c(w3, chain_id, "v4_quoter", V4_QUOTER_ABI)
+        ok = (posm.functions.poolManager().call().lower() == pm
+              and posm.functions.permit2().call().lower() == cfg["permit2"].lower()
+              and sv.functions.poolManager().call().lower() == pm
+              and ur.functions.poolManager().call().lower() == pm
+              and qt.functions.poolManager().call().lower() == pm)
+    except Exception:
+        ok = False
+    _cache[chain_id] = ok
+    return ok
+
+
+def v4_pool_key(a: str, b: str, fee: int, spacing: int) -> tuple:
+    """(currency0, currency1, fee, tickSpacing, hooks) — currency sorted ascending,
+    native ETH = address(0) selalu currency0. Hooks selalu 0 (pool vanilla saja)."""
+    c0, c1 = sorted([a.lower(), b.lower()])
+    return (Web3.to_checksum_address(c0), Web3.to_checksum_address(c1), fee, spacing,
+            Web3.to_checksum_address(V4_NATIVE))
+
+
+def v4_pool_id(key: tuple) -> bytes:
+    return Web3.keccak(abi_encode(["address", "address", "uint24", "int24", "address"], list(key)))
+
+
+def v4_slot0(w3: Web3, chain_id: int, pool_id: bytes) -> tuple[int, int]:
+    sv = _v4c(w3, chain_id, "v4_stateview", V4_STATEVIEW_ABI)
+    s = sv.functions.getSlot0(pool_id).call()
+    return s[0], s[1]
+
+
+def _v4_currency_info(w3: Web3, chain_id: int, cur: str) -> dict:
+    if cur.lower() == V4_NATIVE:
+        cfg = CHAINS[chain_id]
+        return {"address": V4_NATIVE, "symbol": cfg["native_symbol"], "decimals": 18}
+    return token_info(w3, cur)
+
+
+def _v4_balance(w3: Web3, cur: str, addr: str) -> int:
+    if cur.lower() == V4_NATIVE:
+        return w3.eth.get_balance(addr)
+    return erc20(w3, cur).functions.balanceOf(addr).call()
+
+
+def _v4_quote_side(chain_id: int, c0: str, c1: str) -> tuple[str | None, bool]:
+    """(quote_sym, quote_is_c1). Native ETH dihitung quote (dihargai = wrapped)."""
+    cfg = CHAINS[chain_id]
+    quotes_lc = {a.lower(): s for s, a in cfg["quotes"].items()}
+    if c1.lower() in quotes_lc:
+        return quotes_lc[c1.lower()], True
+    if c0.lower() in quotes_lc:
+        return quotes_lc[c0.lower()], False
+    if c0.lower() == V4_NATIVE:
+        return cfg["wrapped_symbol"], False   # harga native = harga wrapped
+    return None, True
+
+
+def v4_roundtrip_ok(w3: Web3, chain_id: int, key: tuple, quote_is_c1: bool,
+                    probe_wei: int, max_loss_pct: float = 30.0) -> bool:
+    """Uji kesehatan pool: swap simulasi quote→meme→quote via Quoter.
+    Pool dust / harga dimanipulasi (tick ekstrem) bakal rugi besar atau revert.
+    Ini satu-satunya cara murah memfilter pool v4 beracun — TVL virtual bisa dipalsukan."""
+    if probe_wei <= 0:
+        return False
+    try:
+        qt = _v4c(w3, chain_id, "v4_quoter", V4_QUOTER_ABI)
+        z1 = not quote_is_c1  # quote→meme: zeroForOne kalau quote = currency0
+        out1, _ = qt.functions.quoteExactInputSingle(
+            (tuple(key), z1, min(probe_wei, MAX_UINT128), b"")).call()
+        if out1 <= 0:
+            return False
+        out2, _ = qt.functions.quoteExactInputSingle(
+            (tuple(key), not z1, min(out1, MAX_UINT128), b"")).call()
+        return out2 >= probe_wei * (100 - max_loss_pct) / 100
+    except Exception:
+        return False
+
+
+def discover_v4_pools(w3: Web3, chain_id: int, token: str) -> list[dict]:
+    """Scan pool v4 vanilla (hooks=0) token × (native, semua quote) × fee standar.
+    TVL proxy dari liquidity aktif; pool dust (< $10) dibuang."""
+    cfg = CHAINS[chain_id]
+    if not cfg.get("v4_stateview") or not verify_v4(w3, chain_id):
+        return []
+    token = Web3.to_checksum_address(token)
+    sv = _v4c(w3, chain_id, "v4_stateview", V4_STATEVIEW_ABI)
+    cands = [(cfg["native_symbol"], V4_NATIVE)] + list(cfg["quotes"].items())
+    out = []
+    for qsym, qaddr in cands:
+        if qaddr.lower() == token.lower():
+            continue
+        for fee, spacing in V4_FEE_SPACINGS:
+            try:
+                key = v4_pool_key(token, qaddr, fee, spacing)
+                pid = v4_pool_id(key)
+                sqrtp, tick, _, _ = sv.functions.getSlot0(pid).call()
+                if sqrtp == 0:
+                    continue
+                liq = sv.functions.getLiquidity(pid).call()
+                if liq == 0:
+                    continue
+                q_is_c1 = key[1].lower() == qaddr.lower()
+                qinfo = _v4_currency_info(w3, chain_id, qaddr)
+                price_sym = qsym if qaddr.lower() != V4_NATIVE else cfg["wrapped_symbol"]
+                qusd = quote_usd_price(w3, chain_id, price_sym)
+                # reserve virtual sisi quote di harga sekarang (proxy TVL, bukan angka pasti)
+                if q_is_c1:
+                    q_virt = liq * sqrtp // Q96
+                else:
+                    q_virt = liq * Q96 // sqrtp if sqrtp else 0
+                tvl = q_virt / 10 ** qinfo["decimals"] * qusd * 2
+                if tvl < 10:
+                    continue
+                # probe $100 (atau 1% reserve virtual) round-trip — buang pool beracun
+                probe = int(min(100 / qusd if qusd else 0, q_virt / 10 ** qinfo["decimals"] / 100 or 1)
+                            * 10 ** qinfo["decimals"]) or 1
+                if not v4_roundtrip_ok(w3, chain_id, key, q_is_c1, probe):
+                    continue
+                out.append({
+                    "ver": 4, "pool": "0x" + pid.hex().removeprefix("0x"), "pool_id": pid,
+                    "key": key, "fee": fee, "tick_spacing": spacing,
+                    "quote_sym": qsym, "quote_addr": key[1] if q_is_c1 else key[0],
+                    "quote_decimals": qinfo["decimals"], "quote_usd": qusd,
+                    "tick": tick, "sqrtp": sqrtp, "liquidity": liq, "tvl_usd": tvl,
+                    "token0": key[0], "token1": key[1], "quote_is_token1": q_is_c1,
+                })
+            except Exception:
+                continue
+    return out
+
+
+def ensure_permit2(w3: Web3, chain_id: int, pk: str, token: str, spender: str,
+                   need_wei: int) -> list[tuple[str, str]]:
+    """Approval dua tahap Permit2: ERC20→Permit2 (sekali, infinite — standar Permit2),
+    lalu Permit2→spender DIBATASI: jumlah pas + kedaluwarsa 1 jam."""
+    cfg = CHAINS[chain_id]
+    account = w3.eth.account.from_key(pk)
+    token = Web3.to_checksum_address(token)
+    p2_addr = Web3.to_checksum_address(cfg["permit2"])
+    p2 = w3.eth.contract(address=p2_addr, abi=PERMIT2_ABI)
+    steps = []
+    if erc20(w3, token).functions.allowance(account.address, p2_addr).call() < need_wei:
+        h = send_tx(w3, pk, {"to": token,
+                             "data": calldata(erc20(w3, token).functions.approve(p2_addr, MAX_UINT256))})
+        wait_ok(w3, h, "approve permit2")
+        steps.append(("approve", h))
+    spender = Web3.to_checksum_address(spender)
+    amt, exp, _ = p2.functions.allowance(account.address, token, spender).call()
+    now = int(time.time())
+    if amt < need_wei or exp < now + DEADLINE_SECS:
+        need160 = min(need_wei, 2 ** 160 - 1)
+        h = send_tx(w3, pk, {"to": p2_addr,
+                             "data": calldata(p2.functions.approve(token, spender, need160, now + 3600))})
+        wait_ok(w3, h, "permit2 approve")
+        steps.append(("permit2", h))
+    return steps
+
+
+def _v4_unlock(actions: list[int], params: list[bytes]) -> bytes:
+    return abi_encode(["bytes", "bytes[]"], [bytes(actions), params])
+
+
+_V4_POOLKEY_T = "(address,address,uint24,int24,address)"
+
+
+def v4_swap(chain_id: int, pk: str, key: tuple, token_in: str, amount_in: int,
+            slippage_pct: float) -> str | None:
+    """Swap exact-in single via UniversalRouter (command V4_SWAP).
+    minOut dihitung dari harga pool sekarang − slippage."""
+    if amount_in <= 0:
+        return None
+    w3 = get_w3(chain_id)
+    cfg = CHAINS[chain_id]
+    if not verify_v4(w3, chain_id):
+        raise RuntimeError("Kontrak V4 gagal verifikasi on-chain — swap dibatalkan.")
+    account = w3.eth.account.from_key(pk)
+    ur_addr = Web3.to_checksum_address(cfg["v4_router"])
+    ur = _v4c(w3, chain_id, "v4_router", V4_UR_ABI)
+    pid = v4_pool_id(key)
+    sqrtp, _ = v4_slot0(w3, chain_id, pid)
+    zero_for_one = token_in.lower() == key[0].lower()
+    raw = (sqrtp / Q96) ** 2  # c1 per c0
+    out_est = amount_in * raw if zero_for_one else (amount_in / raw if raw else 0)
+    min_out = int(out_est * (100 - slippage_pct) / 100)
+    if min_out <= 0:
+        raise RuntimeError("Estimasi hasil swap v4 = 0.")
+    cur_in = key[0] if zero_for_one else key[1]
+    cur_out = key[1] if zero_for_one else key[0]
+
+    value = 0
+    if cur_in.lower() == V4_NATIVE:
+        value = amount_in
+    else:
+        ensure_permit2(w3, chain_id, pk, cur_in, ur_addr, amount_in)
+
+    amount_in = min(amount_in, MAX_UINT128)
+    p_swap = abi_encode([f"({_V4_POOLKEY_T},bool,uint128,uint128,bytes)"],
+                        [(tuple(key), zero_for_one, amount_in, min(min_out, MAX_UINT128), b"")])
+    p_settle = abi_encode(["address", "uint256"], [cur_in, amount_in])
+    p_take = abi_encode(["address", "uint256"], [cur_out, min_out])
+    unlock = _v4_unlock([V4_SWAP_IN_SINGLE, V4_SETTLE_ALL, V4_TAKE_ALL], [p_swap, p_settle, p_take])
+    data = calldata(ur.functions.execute(bytes([UR_CMD_V4_SWAP]), [unlock],
+                                         int(time.time()) + DEADLINE_SECS))
+    tx = {"to": ur_addr, "data": data, "value": value}
+    _preflight(w3, account.address, tx)
+    h = send_tx(w3, pk, tx)
+    wait_ok(w3, h, "swap v4")
+    return h
+
+
+def _v4_ensure_funds(w3: Web3, chain_id: int, pk: str, currency: str, need_wei: int,
+                     slippage_pct: float) -> list[tuple[str, str]]:
+    """Native → cukup cek saldo (tanpa wrap). ERC20 → jalur ensure_quote_balance biasa."""
+    if currency.lower() == V4_NATIVE:
+        account = w3.eth.account.from_key(pk)
+        bal = w3.eth.get_balance(account.address)
+        gas_reserve = w3.to_wei("0.0005", "ether")
+        if bal < need_wei + gas_reserve:
+            raise RuntimeError(
+                f"Saldo native kurang: punya {bal / 1e18:.6f}, butuh {need_wei / 1e18:.6f} + gas")
+        return []
+    return ensure_quote_balance(w3, chain_id, pk, currency, need_wei, slippage_pct)
+
+
+V4_TID_RE = None  # placeholder biar grep gampang
+
+
+def mint_v4(chain_id: int, pk: str, pool_info: dict, budget: float,
+            strategy: dict, slippage_pct: float) -> dict:
+    """Mint posisi v4 via PositionManager.modifyLiquidities.
+    Mode sama dengan v3 (lower/upper/wide/stable); budget satuan quote (upper: meme)."""
+    w3 = get_w3(chain_id)
+    cfg = CHAINS[chain_id]
+    if not verify_v4(w3, chain_id):
+        raise RuntimeError("Kontrak V4 gagal verifikasi on-chain — batal.")
+    account = w3.eth.account.from_key(pk)
+    posm_addr = Web3.to_checksum_address(cfg["v4_posm"])
+    posm = _v4c(w3, chain_id, "v4_posm", V4_POSM_ABI)
+    key = tuple(pool_info["key"])
+    pid = v4_pool_id(key)
+    spacing = pool_info["tick_spacing"]
+    mode = strategy["mode"]
+    q_is_t1 = pool_info["quote_is_token1"]
+    quote = key[1] if q_is_t1 else key[0]
+    meme = key[0] if q_is_t1 else key[1]
+    qdec = pool_info["quote_decimals"]
+    minfo = token_info(w3, meme)  # meme tidak pernah native
+    steps = []
+
+    # ---- Fase 1: siapkan dana ----
+    keep_wei = meme_got = dep_wei = 0
+    if mode == "upper":
+        dep_wei = int(Decimal(str(budget)) * Decimal(10) ** minfo["decimals"])
+        if dep_wei <= 0:
+            raise RuntimeError("Amount 0.")
+        bal = erc20(w3, meme).functions.balanceOf(account.address).call()
+        if bal < dep_wei:
+            raise RuntimeError(f"Saldo meme kurang: punya {bal / 10 ** minfo['decimals']:.6g}, butuh {budget}")
+    else:
+        budget_wei = int(Decimal(str(budget)) * Decimal(10) ** qdec)
+        if budget_wei <= 0:
+            raise RuntimeError("Amount 0.")
+        steps += _v4_ensure_funds(w3, chain_id, pk, quote, budget_wei, slippage_pct)
+        avail = _v4_balance(w3, quote, account.address)
+        if quote.lower() == V4_NATIVE:
+            avail = max(0, avail - w3.to_wei("0.0005", "ether"))
+        budget_wei = min(budget_wei, avail)
+        if mode in ("wide", "stable"):
+            sqrtp, cur_tick = v4_slot0(w3, chain_id, pid)
+            t_lo, t_hi = calc_strategy_range(cur_tick, pool_info["fee"], q_is_t1, mode,
+                                             strategy["low_pct"], strategy["up_pct"],
+                                             strategy.get("gap", 1), spacing=spacing)
+            keep, _sw = plan_two_sided(sqrtp, t_lo, t_hi, budget_wei, q_is_t1)
+            raw = (sqrtp / Q96) ** 2
+            meme_price_q = raw if q_is_t1 else (1 / raw if raw else 0)
+            meme_bal = erc20(w3, meme).functions.balanceOf(account.address).call()
+            meme_val_q = int(meme_bal * meme_price_q)
+            keep_frac = keep / budget_wei if budget_wei else 0
+            quote_dep = min(int((budget_wei + meme_val_q) * keep_frac), budget_wei)
+            swap_wei = max(0, budget_wei - quote_dep)
+            swapped = False
+            if swap_wei > budget_wei // 500:
+                h = v4_swap(chain_id, pk, key, quote, swap_wei, slippage_pct)
+                if h:
+                    steps.append(("swap", h))
+                    swapped = True
+            keep_wei = quote_dep
+            meme_got = poll_balance(w3, meme, account.address, meme_bal + 1) if swapped else meme_bal
+        else:  # lower — quote saja
+            dep_wei = budget_wei
+
+    # ---- Fase 2: mint (retry 3×, harga dibaca ulang tiap attempt) ----
+    receipt = None
+    last_err = None
+    for attempt in range(3):
+        sqrtp, cur_tick = v4_slot0(w3, chain_id, pid)
+        tick_lower, tick_upper = calc_strategy_range(
+            cur_tick, pool_info["fee"], q_is_t1, mode, strategy["low_pct"], strategy["up_pct"],
+            strategy.get("gap", 1), spacing=spacing)
+        if mode == "upper":
+            a0d, a1d = (dep_wei, 0) if q_is_t1 else (0, dep_wei)
+        elif mode in ("wide", "stable"):
+            a0d, a1d = (meme_got, keep_wei) if q_is_t1 else (keep_wei, meme_got)
+        else:
+            a0d, a1d = (0, dep_wei) if q_is_t1 else (dep_wei, 0)
+        lq = int(liquidity_for_amounts(sqrtp, tick_lower, tick_upper, a0d, a1d))
+        if lq <= 0:
+            raise RuntimeError("Liquidity terhitung 0 — cek amount / salah satu sisi kosong.")
+        lq = lq - lq // 5000 - 1  # margin pembulatan: jumlah yang ditarik posm ≤ desired
+        u0, u1 = amounts_from_liquidity(lq, sqrtp, tick_lower, tick_upper)
+        a0max = min(int(u0 * (1 + slippage_pct / 100)) + 2, MAX_UINT128, max(a0d, 2))
+        a1max = min(int(u1 * (1 + slippage_pct / 100)) + 2, MAX_UINT128, max(a1d, 2))
+        for cur, amax in ((key[0], a0max), (key[1], a1max)):
+            if cur.lower() != V4_NATIVE and amax > 2:  # 2 wei = sisi kosong single-sided
+                steps += ensure_permit2(w3, chain_id, pk, cur, posm_addr, amax)
+        actions = [V4_MINT, V4_SETTLE_PAIR]
+        p_mint = abi_encode(
+            [_V4_POOLKEY_T, "int24", "int24", "uint256", "uint128", "uint128", "address", "bytes"],
+            [key, tick_lower, tick_upper, lq, a0max, a1max, account.address, b""])
+        params = [p_mint, abi_encode(["address", "address"], [key[0], key[1]])]
+        value = 0
+        if key[0].lower() == V4_NATIVE:
+            value = a0max
+            actions.append(V4_SWEEP)
+            params.append(abi_encode(["address", "address"], [V4_NATIVE, account.address]))
+        data = calldata(posm.functions.modifyLiquidities(
+            _v4_unlock(actions, params), int(time.time()) + DEADLINE_SECS))
+        tx = {"to": posm_addr, "data": data, "value": value}
+        try:
+            _preflight(w3, account.address, tx)
+            h = send_tx(w3, pk, tx)
+            receipt = wait_ok(w3, h, "mint v4")
+            steps.append(("mint", h))
+            break
+        except Exception as e:
+            last_err = e
+            if attempt < 2:
+                time.sleep(2)
+    if receipt is None:
+        raise RuntimeError(f"Mint v4 gagal 3× (harga bergerak?). Detail: {last_err}")
+
+    token_id = None
+    for log in receipt.logs:
+        if (log.address.lower() == posm_addr.lower() and len(log.topics) == 4
+                and log.topics[0].hex().removeprefix("0x") == ERC721_TRANSFER_TOPIC.removeprefix("0x")):
+            token_id = int(log.topics[3].hex(), 16)
+            break
+
+    qusd = pool_info["quote_usd"]
+    raw = (sqrtp / Q96) ** 2
+    mprice_q = raw if q_is_t1 else (1 / raw if raw else 0)
+    uq, um = (u1, u0) if q_is_t1 else (u0, u1)
+    deposited_usd = (uq + um * mprice_q) / 10 ** qdec * qusd
+    deposit_sym = minfo["symbol"] if mode == "upper" else pool_info["quote_sym"]
+    return {"token_id": token_id, "steps": steps, "mode": mode,
+            "tick_lower": tick_lower, "tick_upper": tick_upper, "cur_tick": cur_tick,
+            "deposited": budget, "deposit_sym": deposit_sym, "deposited_usd": deposited_usd}
+
+
+def _v4_tick_from_info(info: int) -> tuple[int, int]:
+    """PositionInfo packed: [200b poolId][24b tickUpper][24b tickLower][8b flag]."""
+    def s24(v):
+        return v - 2 ** 24 if v >= 2 ** 23 else v
+    return s24((info >> 8) & 0xFFFFFF), s24((info >> 32) & 0xFFFFFF)
+
+
+def _v4_pending_fees(w3: Web3, chain_id: int, pid: bytes, tid: int,
+                     lo: int, hi: int, liq: int) -> tuple[int, int]:
+    """Fee unclaimed = liq × (feeGrowthInside sekarang − snapshot posisi) / 2^128."""
+    cfg = CHAINS[chain_id]
+    sv = _v4c(w3, chain_id, "v4_stateview", V4_STATEVIEW_ABI)
+    fg0, fg1 = sv.functions.getFeeGrowthInside(pid, lo, hi).call()
+    _, fg0l, fg1l = sv.functions.getPositionInfo(
+        pid, Web3.to_checksum_address(cfg["v4_posm"]), lo, hi, tid.to_bytes(32, "big")).call()
+    f0 = liq * ((fg0 - fg0l) % 2 ** 256) // 2 ** 128
+    f1 = liq * ((fg1 - fg1l) % 2 ** 256) // 2 ** 128
+    return f0, f1
+
+
+def _v4_position_detail(w3: Web3, chain_id: int, tid: int, account_addr: str) -> dict | None:
+    """None kalau posisi bukan milik wallet / sudah di-burn / kosong."""
+    cfg = CHAINS[chain_id]
+    posm = _v4c(w3, chain_id, "v4_posm", V4_POSM_ABI)
+    try:
+        if posm.functions.ownerOf(tid).call().lower() != account_addr.lower():
+            return None
+    except Exception:
+        return None  # burned
+    try:
+        key, info = posm.functions.getPoolAndPositionInfo(tid).call()
+        key = tuple(key)
+        tick_lo, tick_hi = _v4_tick_from_info(info)
+        liq = posm.functions.getPositionLiquidity(tid).call()
+        pid = v4_pool_id(key)
+        sqrtp, cur_tick = v4_slot0(w3, chain_id, pid)
+        f0 = f1 = 0
+        if liq > 0:
+            f0, f1 = _v4_pending_fees(w3, chain_id, pid, tid, tick_lo, tick_hi, liq)
+        if liq == 0 and f0 == 0 and f1 == 0:
+            return None
+
+        i0 = _v4_currency_info(w3, chain_id, key[0])
+        i1 = _v4_currency_info(w3, chain_id, key[1])
+        a0_raw, a1_raw = amounts_from_liquidity(liq, sqrtp, tick_lo, tick_hi)
+        qsym, q_is_t1 = _v4_quote_side(chain_id, key[0], key[1])
+
+        raw_price = (sqrtp / Q96) ** 2
+        usd = unclaimed_usd = 0.0
+        usd0 = usd1 = fees_usd0 = fees_usd1 = 0.0
+        mc_lower = mc_upper = mc_now = None
+        if qsym:
+            qusd = quote_usd_price(w3, chain_id, qsym if qsym in cfg["quotes"] or qsym in cfg["stable_syms"]
+                                   else cfg["wrapped_symbol"])
+            if q_is_t1:
+                qdec, mdec, meme_addr = i1["decimals"], i0["decimals"], key[0]
+                meme_in_q = raw_price * 10 ** (mdec - qdec)
+                usd0 = (a0_raw / 10 ** mdec) * meme_in_q * qusd
+                usd1 = a1_raw / 10 ** qdec * qusd
+                fees_usd0 = (f0 / 10 ** mdec) * meme_in_q * qusd
+                fees_usd1 = f1 / 10 ** qdec * qusd
+            else:
+                qdec, mdec, meme_addr = i0["decimals"], i1["decimals"], key[1]
+                meme_in_q = (1 / raw_price) * 10 ** (mdec - qdec) if raw_price else 0
+                usd0 = a0_raw / 10 ** qdec * qusd
+                usd1 = (a1_raw / 10 ** mdec) * meme_in_q * qusd
+                fees_usd0 = f0 / 10 ** qdec * qusd
+                fees_usd1 = (f1 / 10 ** mdec) * meme_in_q * qusd
+            usd = usd0 + usd1
+            unclaimed_usd = fees_usd0 + fees_usd1
+            try:
+                supply = token_supply(w3, meme_addr)
+
+                def meme_q_at(t):
+                    r = tick_to_price(t)
+                    return (r if q_is_t1 else (1 / r if r else 0)) * 10 ** (mdec - qdec)
+                mcs = sorted([meme_q_at(tick_lo) * qusd * supply, meme_q_at(tick_hi) * qusd * supply])
+                mc_lower, mc_upper = mcs
+                mc_now = meme_in_q * qusd * supply
+            except Exception:
+                pass
+
+        return {
+            "ver": 4, "pid": f"v4:{tid}", "token_id": f"v4:{tid}", "v4_tid": tid,
+            "key": key, "pool_id": pid,
+            "token0": key[0], "token1": key[1], "sym0": i0["symbol"], "sym1": i1["symbol"],
+            "dec0": i0["decimals"], "dec1": i1["decimals"], "fee": key[2],
+            "pool": "0x" + pid.hex().removeprefix("0x"),
+            "tick_lower": tick_lo, "tick_upper": tick_hi, "cur_tick": cur_tick,
+            "liquidity": liq, "amount0": a0_raw / 10 ** i0["decimals"], "amount1": a1_raw / 10 ** i1["decimals"],
+            "fees0": f0 / 10 ** i0["decimals"], "fees1": f1 / 10 ** i1["decimals"],
+            "in_range": tick_lo <= cur_tick < tick_hi,
+            "value_usd": usd, "unclaimed_usd": unclaimed_usd,
+            "usd0": usd0, "usd1": usd1, "fees_usd0": fees_usd0, "fees_usd1": fees_usd1,
+            "quote_sym": qsym, "quote_is_token1": q_is_t1,
+            "mc_lower": mc_lower, "mc_upper": mc_upper, "mc_now": mc_now,
+        }
+    except Exception:
+        return None
+
+
+def increase_v4(chain_id: int, pk: str, tid: int, budget_quote: float,
+                slippage_pct: float) -> dict:
+    """Tambah dana ke posisi v4. Komposisi mengikuti range vs harga (sama seperti v3)."""
+    w3 = get_w3(chain_id)
+    cfg = CHAINS[chain_id]
+    if not verify_v4(w3, chain_id):
+        raise RuntimeError("Kontrak V4 gagal verifikasi on-chain — batal.")
+    account = w3.eth.account.from_key(pk)
+    posm_addr = Web3.to_checksum_address(cfg["v4_posm"])
+    posm = _v4c(w3, chain_id, "v4_posm", V4_POSM_ABI)
+    key, info = posm.functions.getPoolAndPositionInfo(tid).call()
+    key = tuple(key)
+    tick_lo, tick_hi = _v4_tick_from_info(info)
+    pid = v4_pool_id(key)
+    qsym, q_is_t1 = _v4_quote_side(chain_id, key[0], key[1])
+    if not qsym:
+        raise RuntimeError("Pair tanpa quote yang dikenal bot.")
+    quote = key[1] if q_is_t1 else key[0]
+    meme = key[0] if q_is_t1 else key[1]
+    qinfo = _v4_currency_info(w3, chain_id, quote)
+    minfo = token_info(w3, meme)
+    qdec = qinfo["decimals"]
+    budget_wei = int(Decimal(str(budget_quote)) * Decimal(10) ** qdec)
+    if budget_wei <= 0:
+        raise RuntimeError("Amount 0.")
+
+    steps = _v4_ensure_funds(w3, chain_id, pk, quote, budget_wei, slippage_pct)
+    avail = _v4_balance(w3, quote, account.address)
+    if quote.lower() == V4_NATIVE:
+        avail = max(0, avail - w3.to_wei("0.0005", "ether"))
+    budget_wei = min(budget_wei, avail)
+
+    sqrtp, _ = v4_slot0(w3, chain_id, pid)
+    keep_wei, _sw = plan_two_sided(sqrtp, tick_lo, tick_hi, budget_wei, q_is_t1)
+    raw = (sqrtp / Q96) ** 2
+    meme_price_q = raw if q_is_t1 else (1 / raw if raw else 0)
+    meme_bal = erc20(w3, meme).functions.balanceOf(account.address).call()
+    meme_val_q = int(meme_bal * meme_price_q)
+    keep_frac = keep_wei / budget_wei if budget_wei else 0
+    quote_dep = min(int((budget_wei + meme_val_q) * keep_frac), budget_wei)
+    swap_wei = max(0, budget_wei - quote_dep)
+    swapped = False
+    if swap_wei > budget_wei // 500:
+        h = v4_swap(chain_id, pk, key, quote, swap_wei, slippage_pct)
+        if h:
+            steps.append(("swap", h))
+            swapped = True
+    meme_have = poll_balance(w3, meme, account.address, meme_bal + 1) if swapped else meme_bal
+
+    receipt = None
+    last_err = None
+    for attempt in range(3):
+        sqrtp, _ = v4_slot0(w3, chain_id, pid)
+        a0d, a1d = (meme_have, quote_dep) if q_is_t1 else (quote_dep, meme_have)
+        lq = int(liquidity_for_amounts(sqrtp, tick_lo, tick_hi, a0d, a1d))
+        if lq <= 0:
+            raise RuntimeError(
+                "Liquidity terhitung 0 — posisi in-range butuh dua sisi tapi salah satu kosong.")
+        lq = lq - lq // 5000 - 1
+        u0, u1 = amounts_from_liquidity(lq, sqrtp, tick_lo, tick_hi)
+        a0max = min(int(u0 * (1 + slippage_pct / 100)) + 2, MAX_UINT128, max(a0d, 2))
+        a1max = min(int(u1 * (1 + slippage_pct / 100)) + 2, MAX_UINT128, max(a1d, 2))
+        for cur, amax in ((key[0], a0max), (key[1], a1max)):
+            if cur.lower() != V4_NATIVE and amax > 2:  # 2 wei = sisi kosong single-sided
+                steps += ensure_permit2(w3, chain_id, pk, cur, posm_addr, amax)
+        actions = [V4_INCREASE, V4_SETTLE_PAIR]
+        p_inc = abi_encode(["uint256", "uint256", "uint128", "uint128", "bytes"],
+                           [tid, lq, a0max, a1max, b""])
+        params = [p_inc, abi_encode(["address", "address"], [key[0], key[1]])]
+        value = 0
+        if key[0].lower() == V4_NATIVE:
+            value = a0max
+            actions.append(V4_SWEEP)
+            params.append(abi_encode(["address", "address"], [V4_NATIVE, account.address]))
+        data = calldata(posm.functions.modifyLiquidities(
+            _v4_unlock(actions, params), int(time.time()) + DEADLINE_SECS))
+        tx = {"to": posm_addr, "data": data, "value": value}
+        try:
+            _preflight(w3, account.address, tx)
+            h = send_tx(w3, pk, tx)
+            receipt = wait_ok(w3, h, "increase v4")
+            steps.append(("increase", h))
+            break
+        except Exception as e:
+            last_err = e
+            if attempt < 2:
+                time.sleep(2)
+    if receipt is None:
+        raise RuntimeError(f"Add v4 gagal 3×. Detail: {last_err}")
+
+    qusd = quote_usd_price(w3, chain_id, qsym if qsym in cfg["quotes"] or qsym in cfg["stable_syms"]
+                           else cfg["wrapped_symbol"])
+    uq, um = (u1, u0) if q_is_t1 else (u0, u1)
+    added_usd = (uq + um * meme_price_q) / 10 ** qdec * qusd
+    return {"steps": steps, "added_usd": added_usd, "quote_sym": qsym,
+            "quote_in": uq / 10 ** qdec, "meme_in": um / 10 ** minfo["decimals"],
+            "meme_sym": minfo["symbol"], "quote_dep": quote_dep / 10 ** qdec}
+
+
+def _v4_modify(w3, chain_id, pk, posm, actions, params, what) -> str:
+    account = w3.eth.account.from_key(pk)
+    data = calldata(posm.functions.modifyLiquidities(
+        _v4_unlock(actions, params), int(time.time()) + DEADLINE_SECS))
+    tx = {"to": Web3.to_checksum_address(CHAINS[chain_id]["v4_posm"]), "data": data}
+    _preflight(w3, account.address, tx)
+    h = send_tx(w3, pk, tx)
+    wait_ok(w3, h, what)
+    return h
+
+
+def decrease_v4(chain_id: int, pk: str, tid: int, pct: int, slippage_pct: float) -> dict:
+    """Kurangi posisi v4 pct% (fee unclaimed ikut terambil — v4 menyetor fee
+    setiap modifyLiquidity). Mins ber-slippage dari harga sekarang."""
+    if not 1 <= pct <= 99:
+        raise RuntimeError("Persen harus 1–99 (100% = pakai Close).")
+    w3 = get_w3(chain_id)
+    if not verify_v4(w3, chain_id):
+        raise RuntimeError("Kontrak V4 gagal verifikasi on-chain — batal.")
+    account = w3.eth.account.from_key(pk)
+    posm = _v4c(w3, chain_id, "v4_posm", V4_POSM_ABI)
+    key, info = posm.functions.getPoolAndPositionInfo(tid).call()
+    key = tuple(key)
+    tick_lo, tick_hi = _v4_tick_from_info(info)
+    liq = posm.functions.getPositionLiquidity(tid).call()
+    part = liq * pct // 100
+    if part == 0:
+        raise RuntimeError("Liquidity 0 — posisi sudah kosong.")
+    pid = v4_pool_id(key)
+    sqrtp, _ = v4_slot0(w3, chain_id, pid)
+    u0, u1 = amounts_from_liquidity(part, sqrtp, tick_lo, tick_hi)
+    slip = (100 - slippage_pct) / 100
+    p_dec = abi_encode(["uint256", "uint256", "uint128", "uint128", "bytes"],
+                       [tid, part, int(u0 * slip), int(u1 * slip), b""])
+    p_take = abi_encode(["address", "address", "address"], [key[0], key[1], account.address])
+    h = _v4_modify(w3, chain_id, pk, posm, [V4_DECREASE, V4_TAKE_PAIR], [p_dec, p_take], "decrease v4")
+    f0, f1 = _v4_pending_fees(w3, chain_id, pid, tid, tick_lo, tick_hi, liq) if liq else (0, 0)
+    i0 = _v4_currency_info(w3, chain_id, key[0])
+    i1 = _v4_currency_info(w3, chain_id, key[1])
+    return {"steps": [("decrease", h)],
+            "got0": (u0 + f0) / 10 ** i0["decimals"], "got1": (u1 + f1) / 10 ** i1["decimals"],
+            "sym0": i0["symbol"], "sym1": i1["symbol"]}
+
+
+def collect_v4(chain_id: int, pk: str, tid: int) -> dict:
+    """Klaim fee posisi v4: DECREASE_LIQUIDITY 0 + TAKE_PAIR."""
+    w3 = get_w3(chain_id)
+    if not verify_v4(w3, chain_id):
+        raise RuntimeError("Kontrak V4 gagal verifikasi on-chain — batal.")
+    account = w3.eth.account.from_key(pk)
+    posm = _v4c(w3, chain_id, "v4_posm", V4_POSM_ABI)
+    key, info = posm.functions.getPoolAndPositionInfo(tid).call()
+    key = tuple(key)
+    tick_lo, tick_hi = _v4_tick_from_info(info)
+    liq = posm.functions.getPositionLiquidity(tid).call()
+    pid = v4_pool_id(key)
+    f0, f1 = _v4_pending_fees(w3, chain_id, pid, tid, tick_lo, tick_hi, liq) if liq else (0, 0)
+    if f0 == 0 and f1 == 0:
+        raise RuntimeError("Tidak ada fee untuk diklaim.")
+    p_dec = abi_encode(["uint256", "uint256", "uint128", "uint128", "bytes"],
+                       [tid, 0, 0, 0, b""])
+    p_take = abi_encode(["address", "address", "address"], [key[0], key[1], account.address])
+    h = _v4_modify(w3, chain_id, pk, posm, [V4_DECREASE, V4_TAKE_PAIR], [p_dec, p_take], "collect v4")
+    i0 = _v4_currency_info(w3, chain_id, key[0])
+    i1 = _v4_currency_info(w3, chain_id, key[1])
+    return {"steps": [("collect", h)],
+            "got0": f0 / 10 ** i0["decimals"], "got1": f1 / 10 ** i1["decimals"],
+            "sym0": i0["symbol"], "sym1": i1["symbol"]}
+
+
+def close_v4(chain_id: int, pk: str, tid: int, slippage_pct: float, autoswap: bool) -> dict:
+    """Full exit v4: BURN_POSITION + TAKE_PAIR (principal + fee sekaligus),
+    lalu auto-swap meme → quote pool via UR. Quote native = terima ETH langsung."""
+    w3 = get_w3(chain_id)
+    if not verify_v4(w3, chain_id):
+        raise RuntimeError("Kontrak V4 gagal verifikasi on-chain — batal.")
+    account = w3.eth.account.from_key(pk)
+    posm = _v4c(w3, chain_id, "v4_posm", V4_POSM_ABI)
+    key, info = posm.functions.getPoolAndPositionInfo(tid).call()
+    key = tuple(key)
+    tick_lo, tick_hi = _v4_tick_from_info(info)
+    liq = posm.functions.getPositionLiquidity(tid).call()
+    pid = v4_pool_id(key)
+    sqrtp, _ = v4_slot0(w3, chain_id, pid)
+    u0, u1 = amounts_from_liquidity(liq, sqrtp, tick_lo, tick_hi)
+    f0, f1 = _v4_pending_fees(w3, chain_id, pid, tid, tick_lo, tick_hi, liq) if liq else (0, 0)
+    slip = (100 - slippage_pct) / 100
+    i0 = _v4_currency_info(w3, chain_id, key[0])
+    i1 = _v4_currency_info(w3, chain_id, key[1])
+    qsym, q_is_t1 = _v4_quote_side(chain_id, key[0], key[1])
+    meme = key[0] if q_is_t1 else key[1]
+
+    pre_meme = erc20(w3, meme).functions.balanceOf(account.address).call() if meme.lower() != V4_NATIVE else 0
+
+    p_burn = abi_encode(["uint256", "uint128", "uint128", "bytes"],
+                        [tid, int(u0 * slip), int(u1 * slip), b""])
+    p_take = abi_encode(["address", "address", "address"], [key[0], key[1], account.address])
+    h = _v4_modify(w3, chain_id, pk, posm, [V4_BURN, V4_TAKE_PAIR], [p_burn, p_take], "close v4")
+    steps = [("burn", h)]
+
+    swaps = []
+    if autoswap and meme.lower() != V4_NATIVE:
+        got_meme = u0 + f0 if q_is_t1 else u1 + f1
+        expected = pre_meme + int(got_meme * 0.9)
+        bal = poll_balance(w3, meme, account.address, max(int(expected), 1))
+        msym = (i0 if q_is_t1 else i1)["symbol"]
+        if bal == 0:
+            swaps.append((msym, "SWAP GAGAL: saldo terbaca 0 (RPC lag) — jual manual"))
+        else:
+            try:
+                sh = v4_swap(chain_id, pk, key, meme, bal, slippage_pct)
+                if sh:
+                    swaps.append((msym, sh))
+            except Exception as e:
+                swaps.append((msym, f"SWAP GAGAL: {e}"))
+
+    return {"steps": steps, "swaps": swaps,
+            "got0": (u0 + f0) / 10 ** i0["decimals"], "got1": (u1 + f1) / 10 ** i1["decimals"],
+            "sym0": i0["symbol"], "sym1": i1["symbol"]}
+
+
+# ══════════════════════════ Dispatcher lintas-versi ══════════════════════════
+def parse_pid(pid) -> tuple[int, object]:
+    """'183469' → (3, 183469) · 'v4:12' → (4, 12) · 'v2:0xabc' → (2, '0xabc')."""
+    s = str(pid)
+    if s.startswith("v4:"):
+        return 4, int(s[3:])
+    if s.startswith("v2:"):
+        return 2, s[3:]
+    return 3, int(s)
+
+
+def list_all_positions(chain_id: int, pk: str, v2_refs: list[str] = (),
+                       v4_refs: list[str] = ()) -> list[dict]:
+    """Posisi v3 (enumerasi NPM) + v4/v2 (dari registry bot). v3 diberi ver/pid."""
+    w3 = get_w3(chain_id)
+    account = w3.eth.account.from_key(pk)
+    out = []
+    for p in list_positions(chain_id, pk):
+        p.setdefault("ver", 3)
+        p.setdefault("pid", str(p["token_id"]))
+        out.append(p)
+    for r in v4_refs:
+        try:
+            d = _v4_position_detail(w3, chain_id, int(r), account.address)
+            if d:
+                out.append(d)
+        except Exception:
+            continue
+    for r in v2_refs:
+        d = _v2_position_detail(w3, chain_id, r, account.address)
+        if d:
+            out.append(d)
+    return out
+
+
+def add_any(chain_id: int, pk: str, pid, budget_quote: float, slippage_pct: float) -> dict:
+    ver, ref = parse_pid(pid)
+    if ver == 3:
+        return increase_position(chain_id, pk, ref, budget_quote, slippage_pct)
+    if ver == 4:
+        return increase_v4(chain_id, pk, ref, budget_quote, slippage_pct)
+    raise RuntimeError("Add posisi v2: paste alamat token lagi lalu pilih pool [v2] yang sama.")
+
+
+def reduce_any(chain_id: int, pk: str, pid, pct: int, slippage_pct: float) -> dict:
+    ver, ref = parse_pid(pid)
+    if ver == 3:
+        return decrease_position(chain_id, pk, ref, pct)
+    if ver == 4:
+        return decrease_v4(chain_id, pk, ref, pct, slippage_pct)
+    return reduce_v2(chain_id, pk, ref, pct, slippage_pct, autoswap=False)
+
+
+def collect_any(chain_id: int, pk: str, pid) -> dict:
+    ver, ref = parse_pid(pid)
+    if ver == 3:
+        return collect_fees(chain_id, pk, ref)
+    if ver == 4:
+        return collect_v4(chain_id, pk, ref)
+    raise RuntimeError("Fee LP v2 auto-compound ke dalam posisi — tidak ada yang bisa diklaim terpisah.")
+
+
+def close_any(chain_id: int, pk: str, pid, slippage_pct: float, autoswap: bool) -> dict:
+    ver, ref = parse_pid(pid)
+    if ver == 3:
+        return close_position(chain_id, pk, ref, slippage_pct, autoswap)
+    if ver == 4:
+        return close_v4(chain_id, pk, ref, slippage_pct, autoswap)
+    return reduce_v2(chain_id, pk, ref, 100, slippage_pct, autoswap=autoswap)
