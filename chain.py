@@ -177,6 +177,18 @@ ROUTER_ABI = [
 ]
 
 ERC721_TRANSFER_TOPIC = Web3.keccak(text="Transfer(address,address,uint256)").hex()
+INCREASE_LIQ_TOPIC = Web3.keccak(text="IncreaseLiquidity(uint256,uint128,uint256,uint256)").hex()
+
+
+def _increase_amounts(receipt, npm_addr: str) -> tuple[int, int] | None:
+    """(amount0, amount1) aktual yang masuk posisi, dari event IncreaseLiquidity NPM."""
+    for log in receipt.logs:
+        if (log.address.lower() == npm_addr.lower() and log.topics
+                and log.topics[0].hex().removeprefix("0x") == INCREASE_LIQ_TOPIC.removeprefix("0x")):
+            d = log.data.hex().removeprefix("0x")
+            if len(d) >= 192:
+                return int(d[64:128], 16), int(d[128:192], 16)
+    return None
 
 
 # ---------- Helpers matematika tick/price ----------
@@ -860,6 +872,16 @@ def mint_position(chain_id: int, pk: str, pool_info: dict, budget: float,
             token_id = int(log.topics[3].hex(), 16)
             break
 
+    if mode in ("wide", "stable"):
+        # USD dari jumlah AKTUAL yang masuk posisi (termasuk meme dari wallet)
+        amts = _increase_amounts(receipt, npm_addr)
+        if amts:
+            a0, a1 = amts
+            q_amt, m_amt = (a1, a0) if q_is_t1 else (a0, a1)
+            raw = (slot0[0] / Q96) ** 2
+            mprice_q = raw if q_is_t1 else (1 / raw if raw else 0)
+            deposited_usd = (q_amt + m_amt * mprice_q) / 10 ** qdec * pool_info["quote_usd"]
+
     deposit_sym = (token_info(w3, meme)["symbol"] if mode == "upper" else pool_info["quote_sym"])
     return {
         "token_id": token_id, "steps": steps, "mode": mode,
@@ -1193,6 +1215,10 @@ def increase_position(chain_id: int, pk: str, token_id: int, budget_quote: float
         s0 = pool.functions.slot0().call()
         a0d, a1d = (meme_have, quote_dep) if q_is_t1 else (quote_dep, meme_have)
         lq = int(liquidity_for_amounts(s0[0], tick_lo, tick_hi, a0d, a1d))
+        if lq <= 0:
+            raise RuntimeError(
+                "Liquidity terhitung 0 — posisi in-range butuh dua sisi tapi salah satu "
+                "sisi kosong (saldo meme 0 dan swap ter-skip). Coba amount lebih besar.")
         u0, u1 = amounts_from_liquidity(lq, s0[0], tick_lo, tick_hi)
         a0m, a1m = int(u0 * slip * 0.95), int(u1 * slip * 0.95)
         params = (token_id, a0d, a1d, a0m, a1m, int(time.time()) + DEADLINE_SECS)
@@ -1210,10 +1236,21 @@ def increase_position(chain_id: int, pk: str, token_id: int, budget_quote: float
         raise RuntimeError(f"Add gagal 3× (harga bergerak / saldo kurang). Detail: {last_err}")
 
     qusd = quote_usd_price(w3, chain_id, qsym)
-    implied_total = int(quote_dep / keep_frac) if keep_frac > 0 else budget_wei + meme_val_q
-    added_usd = min(budget_wei + meme_val_q, implied_total) / 10 ** qdec * qusd
+    minfo = token_info(w3, meme)
+    amts = _increase_amounts(receipt, npm_addr)
+    if amts:
+        # USD dari jumlah AKTUAL yang masuk (termasuk meme dari wallet), bukan estimasi budget
+        a0, a1 = amts
+        q_amt, m_amt = (a1, a0) if q_is_t1 else (a0, a1)
+        added_usd = (q_amt + m_amt * meme_price_q) / 10 ** qdec * qusd
+        quote_in, meme_in = q_amt / 10 ** qdec, m_amt / 10 ** minfo["decimals"]
+    else:
+        implied_total = int(quote_dep / keep_frac) if keep_frac > 0 else budget_wei + meme_val_q
+        added_usd = min(budget_wei + meme_val_q, implied_total) / 10 ** qdec * qusd
+        quote_in = meme_in = None
     return {"steps": steps, "added_usd": added_usd, "quote_sym": qsym,
-            "quote_dep": quote_dep / 10 ** qdec}
+            "quote_dep": quote_dep / 10 ** qdec,
+            "quote_in": quote_in, "meme_in": meme_in, "meme_sym": minfo["symbol"]}
 
 
 def decrease_position(chain_id: int, pk: str, token_id: int, pct: int) -> dict:

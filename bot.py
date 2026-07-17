@@ -1253,6 +1253,10 @@ async def do_add_exec(update: Update, token_id: int, val: float, is_pct: bool):
             return
     store.record_event(cid, "mint", token_id, r["added_usd"], "add", wallet=wallet_address())
     lines = [f"✅ <b>Added #{token_id}</b> (~{ch.fmt_usd(r['added_usd'])})"]
+    if r.get("quote_in") is not None:
+        lines.append(f"Masuk: {ch.fmt_amount(r['quote_in'])} {r['quote_sym']}"
+                     f" + {ch.fmt_amount(r['meme_in'])} {r['meme_sym']}"
+                     f" <i>(meme dari wallet dipakai duluan)</i>")
     for label, h in r["steps"]:
         lines.append(f"{label}: {ch.tx_link(cid, h)}")
     lines.append(ch.pos_link(cid, token_id))
