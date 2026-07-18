@@ -968,7 +968,10 @@ def mint_position(chain_id: int, pk: str, pool_info: dict, budget: float,
             raise RuntimeError("Amount 0.")
         bal = erc20(w3, meme).functions.balanceOf(account.address).call()
         if bal < dep_wei:
-            raise RuntimeError(f"Saldo meme kurang: punya {bal / 10 ** mdec:.6g}, butuh {budget}")
+            if dep_wei - bal <= dep_wei // 10000 + 1:
+                dep_wei = bal  # selisih pembulatan float dari amount 100% — pakai saldo penuh
+            else:
+                raise RuntimeError(f"Saldo meme kurang: punya {bal / 10 ** mdec:.6g}, butuh {budget}")
         steps += ensure_approval(w3, pk, meme, npm_addr, dep_wei)
         deposited_usd = budget * _meme_usd(w3, chain_id, pool_info)
     elif mode in ("wide", "stable"):
@@ -2190,7 +2193,10 @@ def mint_v4(chain_id: int, pk: str, pool_info: dict, budget: float,
             raise RuntimeError("Amount 0.")
         bal = erc20(w3, meme).functions.balanceOf(account.address).call()
         if bal < dep_wei:
-            raise RuntimeError(f"Saldo meme kurang: punya {bal / 10 ** minfo['decimals']:.6g}, butuh {budget}")
+            if dep_wei - bal <= dep_wei // 10000 + 1:
+                dep_wei = bal  # selisih pembulatan float dari amount 100% — pakai saldo penuh
+            else:
+                raise RuntimeError(f"Saldo meme kurang: punya {bal / 10 ** minfo['decimals']:.6g}, butuh {budget}")
     else:
         budget_wei = int(Decimal(str(budget)) * Decimal(10) ** qdec)
         if budget_wei <= 0:
