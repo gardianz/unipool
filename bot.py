@@ -187,10 +187,13 @@ def menu_kb() -> InlineKeyboardMarkup:
 
 
 BACK_ROW = [InlineKeyboardButton("⬅️ Menu", callback_data="menu|main")]
+DEL_BTN = InlineKeyboardButton("✖", callback_data="del")  # hapus pesan (anti spam chat)
 NAV_KB = InlineKeyboardMarkup([
     [InlineKeyboardButton("📊 Posisi", callback_data="go|list"),
-     InlineKeyboardButton("🏠 Menu", callback_data="go|main")],
+     InlineKeyboardButton("🏠 Menu", callback_data="go|main"),
+     DEL_BTN],
 ])
+DEL_KB = InlineKeyboardMarkup([[DEL_BTN]])
 
 
 def build_main_menu() -> str:
@@ -1566,7 +1569,7 @@ async def do_close(update: Update, pid: str, autoswap: bool):
                 lines.append(f"swapped {esc(sym)} → {esc(ch.CHAINS[cid]['wrapped_symbol'])}: {ch.tx_link(cid, h)}")
             else:
                 lines.append(f"{esc(sym)}: {esc(h)}")
-        await reply(update, "\n".join(lines))
+        await reply(update, "\n".join(lines), DEL_KB)
 
 
 # ---------- Callback router ----------
@@ -1577,6 +1580,12 @@ async def on_callback(update: Update, _):
     await q.answer()
     data = q.data or ""
 
+    if data == "del":
+        try:
+            await q.message.delete()
+        except Exception:
+            await q.edit_message_reply_markup(None)  # >48 jam tidak bisa dihapus — copot tombol saja
+        return
     if data == "cancel":
         await q.edit_message_reply_markup(None)
         await reply(update, "❌ Cancelled.")
@@ -1755,7 +1764,7 @@ async def monitor_loop(app):
                 meme_ca = p["token0"] if p["quote_is_token1"] else p["token1"]
                 kb = InlineKeyboardMarkup([
                     [InlineKeyboardButton("📋 Detail", callback_data=f"pos|{p['pid']}"),
-                     InlineKeyboardButton("🗑 Close", callback_data=f"close|{p['pid']}")],
+                     InlineKeyboardButton("🗑 Close", callback_data=f"close|{p['pid']}"), DEL_BTN],
                     chart_buttons(cid, p["pool"], meme_ca),
                 ])
                 for chat_id in allowed_chat_ids():
