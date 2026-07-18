@@ -141,6 +141,8 @@ Cek log: `journalctl -u unipool -f` · restart: `sudo systemctl restart unipool`
 
 **`telegram.error.NetworkError: Bad Gateway` di log** — server Telegram lagi gangguan sesaat (HTTP 502). Bot retry otomatis, tidak perlu diapa-apakan.
 
+**`429 Too Many Requests` dari Alchemy** — kena limit compute-unit free tier. Bot sekarang retry otomatis dengan backoff (hormati Retry-After) dan meng-cache `eth_chainId`, jadi error ini harusnya hilang sendiri. Kalau masih sering: naikkan interval alert (`/set alert 120` atau `300`), atau upgrade plan Alchemy.
+
 ## Catatan risiko
 
 - Bot ini memindahkan **dana sungguhan** di chain live. Uji dengan nominal kecil dulu.

@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 import requests
 from eth_abi import encode as abi_encode
 from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from web3 import Web3
 from web3.exceptions import ContractLogicError
 
@@ -397,13 +398,29 @@ def fmt_amount(v: float) -> str:
     return f"{v:.4e}"
 
 
+def _rpc_retry() -> Retry:
+    """Retry otomatis untuk rate limit / gangguan sesaat RPC (Alchemy 429 dst).
+    Backoff 0.6→9.6 detik, hormati header Retry-After. Aman untuk JSON-RPC:
+    request read idempoten; eth_sendRawTransaction kirim bytes yang sama
+    (hash tx sama) jadi re-broadcast tidak dobel."""
+    return Retry(total=6, backoff_factor=0.6, status_forcelist=(429, 502, 503, 504),
+                 allowed_methods=None, respect_retry_after_header=True)
+
+
+def _rpc_session() -> requests.Session:
+    s = requests.Session()
+    s.mount("https://", HTTPAdapter(max_retries=_rpc_retry()))
+    s.mount("http://", HTTPAdapter(max_retries=_rpc_retry()))
+    return s
+
+
 # ---------- Bypass blokir DNS ISP (DNS-over-HTTPS + koneksi langsung ke IP) ----------
 class _SNIAdapter(HTTPAdapter):
     """Konek ke IP tapi SNI + verifikasi cert tetap pakai hostname asli."""
 
     def __init__(self, hostname: str):
         self._hostname = hostname
-        super().__init__()
+        super().__init__(max_retries=_rpc_retry())
 
     def init_poolmanager(self, *args, **kwargs):
         kwargs["server_hostname"] = self._hostname
@@ -436,7 +453,9 @@ def _forced_ip_w3(rpc_url: str) -> Web3 | None:
     session.mount(f"https://{ip}", _SNIAdapter(u.hostname))
     session.headers["Host"] = u.hostname
     ip_url = rpc_url.replace(u.hostname, ip, 1)
-    return Web3(Web3.HTTPProvider(ip_url, request_kwargs={"timeout": 30}, session=session))
+    provider = Web3.HTTPProvider(ip_url, request_kwargs={"timeout": 30}, session=session)
+    provider.cache_allowed_requests = True  # eth_chainId dkk tidak di-query berulang
+    return Web3(provider)
 
 
 # ---------- Koneksi & util dasar ----------
@@ -460,7 +479,9 @@ def get_w3(chain_id: int, fresh: bool = False) -> Web3:
     rpcs += cfg["rpcs"]
     errs = []
     for rpc in rpcs:
-        candidates = [Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 30}))]
+        provider = Web3.HTTPProvider(rpc, request_kwargs={"timeout": 30}, session=_rpc_session())
+        provider.cache_allowed_requests = True  # eth_chainId dkk tidak di-query berulang
+        candidates = [Web3(provider)]
         for i, w3 in enumerate(candidates):
             try:
                 if w3.eth.chain_id == chain_id:
@@ -648,7 +669,7 @@ def discover_pools(chain_id: int, token_addr: str) -> dict:
               if Web3.to_checksum_address(qaddr) != token]
     combos = [(qsym, q, fee) for qsym, q in quotes for fee in (100, 500, 3000, 10000)]
 
-    with ThreadPoolExecutor(max_workers=8) as ex:
+    with ThreadPoolExecutor(max_workers=5) as ex:
         tinfo_f = ex.submit(token_info, w3, token)
         qmeta_f = {qsym: (ex.submit(token_info, w3, q),
                           ex.submit(quote_usd_price, w3, chain_id, qsym))
@@ -1074,7 +1095,7 @@ def list_positions(chain_id: int, pk: str, max_positions: int = 40) -> list[dict
 
     n = npm.functions.balanceOf(account.address).call()
     idxs = list(range(n - 1, max(-1, n - 1 - max_positions), -1))  # terbaru dulu
-    with ThreadPoolExecutor(max_workers=8) as ex:
+    with ThreadPoolExecutor(max_workers=5) as ex:
         tids = list(ex.map(lambda i: npm.functions.tokenOfOwnerByIndex(account.address, i).call(), idxs))
         raws = list(ex.map(lambda t: npm.functions.positions(t).call(), tids))
 
@@ -1286,7 +1307,7 @@ def price_history(chain_id: int, pool_addr: str, span_secs: int, points: int = 7
         except Exception:
             return None
 
-    with ThreadPoolExecutor(max_workers=8) as ex:
+    with ThreadPoolExecutor(max_workers=5) as ex:
         ticks = list(ex.map(tick_at, blocks))
     out = []
     for b, t in zip(blocks, ticks):
