@@ -518,23 +518,34 @@ async def on_address(update: Update, _):
         await edit(status, f"❌ Tidak ada pool v2/v3/v4 untuk {esc(res['token']['symbol'])} di {esc(cfg['name'])}.")
         return
 
+    top = pools[:8]
+    # vol 30 hari via GeckoTerminal — sequential (rate limit ketat), gagal = tampil "–"
+    vol30s = await asyncio.to_thread(lambda: [ch.dex_vol30(cid, p["pool"]) for p in top])
+
+    tsym = res["token"]["symbol"]
+    lines = [f"Found {len(pools)} pool(s) untuk <b>{esc(tsym)}</b> ({_t.time() - t0:.1f}s):", ""]
     buttons = []
-    for i, p in enumerate(pools[:8], 1):
+    for i, (p, v30) in enumerate(zip(top, vol30s), 1):
         key = uuid.uuid4().hex[:10]
         PENDING[key] = {"chain": cid, "token": res["token"], "pool_info": p,
                         "mode": "v2" if p.get("ver") == 2 else "lower",
                         "low_pct": s["width_pct"], "up_pct": 100.0,
                         "amount_pct": s["amount_pct"], "amount_fixed": s["amount_fixed"],
                         "gap": int(s.get("gap", 1)), "vol": None, "rec": None}
-        label = (f"{i}. [v{p.get('ver', 3)}] {p['quote_sym']} {p['fee'] / 10000:.2f}% · "
-                 f"{ch.fmt_usd(p['tvl_usd'])}")
-        if p.get("apr_pct"):
-            label += f" · APR {p['apr_pct']:,.0f}%"
-        buttons.append([InlineKeyboardButton(label, callback_data=f"pool|{key}")])
+        apr = f"APR ~{p['apr_pct']:,.0f}%" if p.get("apr_pct") else "APR –"
+        v1 = ch.fmt_usd(p["vol24_usd"]) if p.get("vol24_usd") is not None else "–"
+        v30t = ch.fmt_usd(v30) if v30 else "–"
+        lines += [
+            f"<b>{i}. [v{p.get('ver', 3)}] {esc(tsym)}/{esc(p['quote_sym'])} · fee {p['fee'] / 10000:.2f}%</b>",
+            f"    TVL {ch.fmt_usd(p['tvl_usd'])} · {apr}",
+            f"    Vol 1D {v1} · 30D {v30t}",
+        ]
+        buttons.append([InlineKeyboardButton(
+            f"{i}. [v{p.get('ver', 3)}] {p['quote_sym']} {p['fee'] / 10000:.2f}% · {ch.fmt_usd(p['tvl_usd'])}",
+            callback_data=f"pool|{key}")])
+    lines.append("\nPilih pool:")
     buttons.append([InlineKeyboardButton("✖ Cancel", callback_data="cancel")])
-    await edit(status,
-               f"Found {len(pools)} pool(s) untuk <b>{esc(res['token']['symbol'])}</b> ({_t.time() - t0:.1f}s). Pilih:",
-               InlineKeyboardMarkup(buttons))
+    await edit(status, "\n".join(lines), InlineKeyboardMarkup(buttons))
 
 
 # ---------- Mint flow ----------
