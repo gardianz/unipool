@@ -1248,8 +1248,9 @@ def token_usd_price(w3: Web3, chain_id: int, token_addr: str, _cache={}) -> floa
             in_q = raw * 10 ** (mdec - qd) if token == t0 else ((1 / raw) * 10 ** (mdec - qd) if raw else 0)
             price = in_q * qusd
             best_liq_usd = liq_usd
-    # fallback 1: pair Uniswap V2
-    if not price and cfg.get("v2_factory"):
+    # fallback 1: pair Uniswap V2 — filter & kompetisi likuiditas sama seperti v3
+    # (pair dust tanpa filter pernah bikin harga meleset 10^12×, mis. NVDA $15 miliar)
+    if cfg.get("v2_factory"):
         v2f = w3.eth.contract(address=Web3.to_checksum_address(cfg["v2_factory"]), abi=V2_FACTORY_ABI)
         for qsym, qaddr in cfg["quotes"].items():
             q = Web3.to_checksum_address(qaddr)
@@ -1265,19 +1266,28 @@ def token_usd_price(w3: Web3, chain_id: int, token_addr: str, _cache={}) -> floa
                 if rt == 0:
                     continue
                 qd = token_info(w3, q)["decimals"]
-                price = (rq / rt) * 10 ** (mdec - qd) * quote_usd_price(w3, chain_id, qsym)
-                break
+                qusd = quote_usd_price(w3, chain_id, qsym)
+                liq_usd = rq / 10 ** qd * qusd
+                if liq_usd < 10 or liq_usd <= best_liq_usd:
+                    continue
+                price = (rq / rt) * 10 ** (mdec - qd) * qusd
+                best_liq_usd = liq_usd
             except Exception:
                 continue
-    # fallback 2: API dexscreener (menutup v4 dll)
-    if not price:
+    # fallback 2: API dexscreener (menutup v4, quote non-standar, dll).
+    # Juga dipakai sebagai pembanding kalau backing on-chain lemah (<$500) —
+    # likuiditas terbesar menang.
+    if not price or best_liq_usd < 500:
         try:
             r = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{token}", timeout=8)
             pairs = [p for p in (r.json().get("pairs") or [])
                      if p.get("chainId") == cfg.get("dexscreener")]
             pairs.sort(key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0), reverse=True)
             if pairs:
-                price = float(pairs[0].get("priceUsd") or 0)
+                dex_liq = float((pairs[0].get("liquidity") or {}).get("usd") or 0)
+                dex_price = float(pairs[0].get("priceUsd") or 0)
+                if dex_price > 0 and dex_liq > best_liq_usd:
+                    price = dex_price
         except Exception:
             pass
     _cache[key] = (price, time.time())
