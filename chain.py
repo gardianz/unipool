@@ -51,6 +51,9 @@ CHAINS = {
         "v4_stateview": "0xf3334192d15450cdd385c8b70e03f9a6bd9e673b",
         "v4_quoter": "0x8dc178efb8111bb0973dd9d722ebeff267c98f94",
         "v4_router": "0x8876789976decbfcbbbe364623c63652db8c0904",
+        # UR Robinhood = build custom: ExactInputSingleParams punya field ekstra
+        # uint256 minHopPriceX36 (diverifikasi dari source Blockscout). BSC = standar.
+        "v4_swap_hop_field": True,
         "permit2": "0x000000000022D473030F116dDEE9F6B43aC78BA3",
         "wrapped": "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73",
         "wrapped_symbol": "WETH",
@@ -2063,8 +2066,13 @@ def v4_swap(chain_id: int, pk: str, key: tuple, token_in: str, amount_in: int,
         ensure_permit2(w3, chain_id, pk, cur_in, ur_addr, amount_in)
 
     amount_in = min(amount_in, MAX_UINT128)
-    p_swap = abi_encode([f"({_V4_POOLKEY_T},bool,uint128,uint128,bytes)"],
-                        [(tuple(key), zero_for_one, amount_in, min(min_out, MAX_UINT128), b"")])
+    if cfg.get("v4_swap_hop_field"):
+        # build custom (Robinhood): field ekstra minHopPriceX36 sebelum hookData; 0 = tanpa limit
+        p_swap = abi_encode([f"({_V4_POOLKEY_T},bool,uint128,uint128,uint256,bytes)"],
+                            [(tuple(key), zero_for_one, amount_in, min(min_out, MAX_UINT128), 0, b"")])
+    else:
+        p_swap = abi_encode([f"({_V4_POOLKEY_T},bool,uint128,uint128,bytes)"],
+                            [(tuple(key), zero_for_one, amount_in, min(min_out, MAX_UINT128), b"")])
     p_settle = abi_encode(["address", "uint256"], [cur_in, amount_in])
     p_take = abi_encode(["address", "uint256"], [cur_out, min_out])
     unlock = _v4_unlock([V4_SWAP_IN_SINGLE, V4_SETTLE_ALL, V4_TAKE_ALL], [p_swap, p_settle, p_take])

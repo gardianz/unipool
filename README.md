@@ -1,12 +1,15 @@
 # unipool
 
-Bot Telegram untuk farming fee LP **Uniswap V3** di **Robinhood Chain** (chain id 4663) dan **BSC** (chain id 56).
+Bot Telegram untuk farming fee LP **Uniswap V2 + V3 + V4** di **Robinhood Chain** (chain id 4663) dan **BSC** (chain id 56).
 
-Paste alamat token → bot cari pool → pilih strategi → mint posisi LP. Pantau lewat `/list` (PnL, fee, chart live), tutup posisi satu tombol dengan auto-swap. Semua data dibaca langsung dari blockchain — tidak bergantung UI Uniswap yang sering gagal fetch harga.
+Paste alamat token → bot cari pool (v2/v3/v4 sekaligus) → pilih strategi → mint posisi LP. Pantau lewat `/list` (PnL, fee, chart), tutup posisi satu tombol dengan auto-swap. Semua data dibaca langsung dari blockchain — tidak bergantung UI Uniswap yang sering gagal fetch harga.
 
 ## Fitur
 
-- 🔍 **Auto pool discovery** — scan semua fee tier (0.01%–1%) × semua quote (WETH/USDG di Robinhood, WBNB/USDT/USDC di BSC), urut TVL
+- 🔍 **Auto pool discovery v2/v3/v4** — scan semua fee tier (0.01%–1%) × semua quote (WETH/USDG di Robinhood, WBNB/USDT/USDC di BSC), termasuk pool v4 ber-quote **ETH native**, urut TVL dengan label [v2]/[v3]/[v4]
+- 🧬 **Uniswap V4** — mint/add/reduce/collect/close via PositionManager + Permit2 (approval dibatasi: jumlah pas + kedaluwarsa 1 jam), swap via UniversalRouter; pool ber-hook dilewati (vanilla saja)
+- 💧 **Uniswap V2** — add liquidity full-range 50/50 (swap otomatis setengah budget), reduce/close via router; fee 0.3% auto-compound ke posisi
+- 🛡️ **Anti pool beracun** — probe swap bolak-balik ~$100 (Quoter v4 / matematika reserves v2): pool dust atau harga dimanipulasi dibuang dari daftar; semua alamat kontrak v2/v4 diverifikasi silang on-chain sebelum tx pertama (fail-closed)
 - 🎯 **4 strategi range**: Stable (±6%), Wide (dua sisi), Lower (setor quote saja, nampung kalau harga turun), Upper (setor token saja, jual bertahap kalau naik) + rekomendasi otomatis
 - ✏️ **Custom range** via persen atau **market cap** (`mc 300k 800k`), custom amount (persen saldo / nilai pasti)
 - 🔁 **Auto-wrap** ETH→WETH, **auto-swap** komposisi dua sisi (token existing di wallet dipakai duluan); pair non-WETH (mis. USDG) otomatis dibeli dari saldo WETH/ETH saat mint
@@ -81,7 +84,7 @@ Log `LP bot jalan. Wallet: 0x...` = siap. Buka chat bot kamu di Telegram, kirim 
 2. Pilih pool → muncul **kartu konfirmasi**: strategi, range (dalam market cap), komposisi deposit, rencana wrap/swap
 3. Atur pakai tombol (strategi / preset range / amount) atau **✏️ Custom** — balas dengan `40 120` (persen) atau `mc 300k 800k`
 4. **✅ Confirm mint** → bot eksekusi wrap → approve → mint, kirim semua link transaksi
-5. `/list` → klik posisi untuk kartu detail; tombol **📈 GMGN** / **📊 DexScreener** (chart), **➕ Add**, **➖ Reduce**, **💰 Fee** (collect fee tanpa close), **🗑 Close**
+5. `/list` → klik posisi untuk kartu detail; tombol **📈 GMGN** / **📊 DexScreener** (chart), **➕ Add**, **➖ Reduce**, **💰 Fee** (collect fee tanpa close; tidak ada di v2 karena auto-compound), **🗑 Close**
 6. Close → pilih **swap semua → WETH** atau **tahan token**
 
 ## Perintah
@@ -141,11 +144,14 @@ Cek log: `journalctl -u unipool -f` · restart: `sudo systemctl restart unipool`
 ## Catatan risiko
 
 - Bot ini memindahkan **dana sungguhan** di chain live. Uji dengan nominal kecil dulu.
+- Token **fee-on-transfer** tidak didukung di jalur v2 (router standar) dan berisiko di v3/v4.
+- Pool v4 dengan **hooks** sengaja tidak didukung — hook bisa berisi kode arbitrer (risiko rug).
+- Posisi v4 dan LP v2 dicatat di `history.json` lokal (registry) — jangan hapus file itu selama masih ada posisi terbuka; posisi tetap aman on-chain, tapi bot tidak bisa menampilkannya lagi tanpa registry (v4 PositionManager tidak bisa di-enumerate).
 - LP memecoin berisiko tinggi: fee tidak menutup rugi kalau harga token jatuh permanen (impermanent loss). Anggap sebagai beli token diskon sambil dibayar menunggu — bukan mesin uang pasif.
 - Private key tersimpan plaintext di `.env` pada mesin yang menjalankan bot. Amankan mesinnya.
 
 ## Struktur kode
 
-- `bot.py` — UI Telegram (handler, kartu konfirmasi, chart server lokal, monitor alert)
-- `chain.py` — inti web3: discovery, mint, list, close, swap, riwayat harga
+- `bot.py` — UI Telegram (handler, kartu konfirmasi, monitor alert)
+- `chain.py` — inti web3: discovery + aksi v2/v3/v4, swap, verifikasi kontrak, riwayat harga
 - `store.py` — settings + riwayat PnL (`settings.json`, `history.json`)
