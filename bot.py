@@ -518,7 +518,7 @@ async def on_address(update: Update, _):
         await edit(status, f"❌ Tidak ada pool v2/v3/v4 untuk {esc(res['token']['symbol'])} di {esc(cfg['name'])}.")
         return
 
-    top = pools[:8]
+    top = pools[:10]
     # vol 30 hari via GeckoTerminal — sequential (rate limit ketat), gagal = tampil "–"
     vol30s = await asyncio.to_thread(lambda: [ch.dex_vol30(cid, p["pool"]) for p in top])
 

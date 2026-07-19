@@ -133,6 +133,8 @@ POOL_ABI = [
     {"constant": True, "inputs": [], "name": "liquidity", "outputs": [{"name": "", "type": "uint128"}], "type": "function", "stateMutability": "view"},
     {"constant": True, "inputs": [], "name": "token0", "outputs": [{"name": "", "type": "address"}], "type": "function", "stateMutability": "view"},
     {"constant": True, "inputs": [], "name": "token1", "outputs": [{"name": "", "type": "address"}], "type": "function", "stateMutability": "view"},
+    {"constant": True, "inputs": [], "name": "fee", "outputs": [{"name": "", "type": "uint24"}], "type": "function", "stateMutability": "view"},
+    {"constant": True, "inputs": [], "name": "tickSpacing", "outputs": [{"name": "", "type": "int24"}], "type": "function", "stateMutability": "view"},
     {"constant": True, "inputs": [{"name": "secondsAgos", "type": "uint32[]"}], "name": "observe", "outputs": [
         {"name": "tickCumulatives", "type": "int56[]"},
         {"name": "secondsPerLiquidityCumulativeX128s", "type": "uint160[]"}], "type": "function", "stateMutability": "view"},
@@ -644,19 +646,28 @@ def quote_usd_price(w3: Web3, chain_id: int, quote_sym: str, _cache={}) -> float
     return 0.0
 
 
-def dex_volumes(chain_id: int, token_addr: str) -> dict:
-    """Volume 24 jam per pool dari dexscreener: {pool_addr_lower: vol_usd}."""
+def _dex_pairs(chain_id: int, token_addr: str, _cache={}) -> list[dict]:
+    """Daftar pair dexscreener utk token di chain ini (cache 2 menit).
+    Data eksternal — SELALU verifikasi on-chain sebelum dipakai."""
     cfg = CHAINS[chain_id]
+    key = (chain_id, token_addr.lower())
+    hit = _cache.get(key)
+    if hit and time.time() - hit[1] < 120:
+        return hit[0]
     try:
         r = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{token_addr}", timeout=8)
-        out = {}
-        for pr in (r.json().get("pairs") or []):
-            if pr.get("chainId") != cfg.get("dexscreener"):
-                continue
-            out[(pr.get("pairAddress") or "").lower()] = float((pr.get("volume") or {}).get("h24") or 0)
-        return out
+        pairs = [p for p in (r.json().get("pairs") or [])
+                 if p.get("chainId") == cfg.get("dexscreener")]
     except Exception:
-        return {}
+        return []
+    _cache[key] = (pairs, time.time())
+    return pairs
+
+
+def dex_volumes(chain_id: int, token_addr: str) -> dict:
+    """Volume 24 jam per pool dari dexscreener: {pool_addr_lower: vol_usd}."""
+    return {(p.get("pairAddress") or "").lower(): float((p.get("volume") or {}).get("h24") or 0)
+            for p in _dex_pairs(chain_id, token_addr)}
 
 
 def dex_vol30(chain_id: int, pool_addr: str, _cache={}) -> float | None:
@@ -743,6 +754,14 @@ def discover_pools(chain_id: int, token_addr: str) -> dict:
                 pools += fut.result()
             except Exception:
                 continue
+        # pool fee non-standar (v3 custom tier / v4 fee-spacing bebas) dari dexscreener,
+        # semua diverifikasi on-chain sebelum masuk daftar
+        try:
+            skip_v3 = {p["pool"].lower() for p in pools if p.get("ver", 3) == 3}
+            skip_v4 = {str(p["pool"]).lower() for p in pools if p.get("ver") == 4}
+            pools += discover_dex_pools(w3, chain_id, token, skip_v3, skip_v4)
+        except Exception:
+            pass
         tinfo = tinfo_f.result()
         vols = vols_f.result()
 
@@ -753,6 +772,161 @@ def discover_pools(chain_id: int, token_addr: str) -> dict:
         p["apr_pct"] = (v * p["fee"] / 1e6 / p["tvl_usd"] * 365 * 100) if (v and p["tvl_usd"]) else None
     pools.sort(key=lambda p: p["tvl_usd"], reverse=True)
     return {"token": tinfo, "pools": pools}
+
+
+V4_INIT_TOPIC = "0x" + Web3.keccak(
+    text="Initialize(bytes32,address,address,uint24,int24,address,uint160,int24)").hex().removeprefix("0x")
+
+
+def _v4_key_from_init(w3: Web3, chain_id: int, pool_id_hex: str, _cache={}) -> tuple | None:
+    """PoolKey dari event Initialize PoolManager (immutable → cache permanen).
+    Return None kalau tidak ketemu / hash tidak cocok / pakai hooks."""
+    cfg = CHAINS[chain_id]
+    ck = (chain_id, pool_id_hex.lower())
+    if ck in _cache:
+        return _cache[ck]
+    pm = Web3.to_checksum_address(cfg["v4_pm"])
+    log = None
+    try:
+        logs = w3.eth.get_logs({"address": pm, "fromBlock": 0, "toBlock": "latest",
+                                "topics": [V4_INIT_TOPIC, pool_id_hex]})
+        if logs:
+            lg = logs[0]
+            log = {"topics": [t.hex() if hasattr(t, "hex") else t for t in lg["topics"]],
+                   "data": lg["data"].hex() if hasattr(lg["data"], "hex") else lg["data"]}
+    except Exception:
+        # RPC batasi range getLogs → fallback API explorer Blockscout
+        try:
+            r = requests.get(f"{cfg['explorer']}/api", params={
+                "module": "logs", "action": "getLogs", "fromBlock": "0", "toBlock": "latest",
+                "address": pm, "topic0": V4_INIT_TOPIC, "topic1": pool_id_hex,
+                "topic0_1_opr": "and"}, timeout=15)
+            res = r.json().get("result")
+            if isinstance(res, list) and res:
+                log = res[0]
+        except Exception:
+            pass
+    key = None
+    if log:
+        try:
+            t2, t3 = log["topics"][2], log["topics"][3]
+            c0 = Web3.to_checksum_address("0x" + str(t2).removeprefix("0x")[-40:])
+            c1 = Web3.to_checksum_address("0x" + str(t3).removeprefix("0x")[-40:])
+            d = str(log["data"]).removeprefix("0x")
+            fee, sp = int(d[0:64], 16), int(d[64:128], 16)
+            hooks = "0x" + d[152:192]
+            cand = (c0, c1, fee, sp, Web3.to_checksum_address(hooks))
+            # verifikasi: hash key harus == poolId, dan hanya pool vanilla (hooks 0)
+            calc = "0x" + v4_pool_id(cand).hex().removeprefix("0x")
+            if calc.lower() == pool_id_hex.lower() and int(hooks, 16) == 0:
+                key = cand
+        except Exception:
+            key = None
+    _cache[ck] = key
+    return key
+
+
+def discover_dex_pools(w3: Web3, chain_id: int, token: str,
+                       skip_v3: set, skip_v4: set) -> list[dict]:
+    """Pool tambahan dari daftar dexscreener yang kelewat scan standar:
+    v3 fee non-standar (diverifikasi via factory.getPool) dan v4 fee/spacing
+    custom (PoolKey dipulihkan dari log Initialize, hash diverifikasi)."""
+    cfg = CHAINS[chain_id]
+    token = Web3.to_checksum_address(token)
+    quotes_lc = {a.lower(): s for s, a in cfg["quotes"].items()}
+    out = []
+    pairs = _dex_pairs(chain_id, token)
+    pairs.sort(key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0), reverse=True)
+    factory = w3.eth.contract(address=Web3.to_checksum_address(cfg["factory"]), abi=FACTORY_ABI)
+
+    cands = []
+    n3 = n4 = 0
+    for pr in pairs:
+        labels = pr.get("labels") or []
+        addr = pr.get("pairAddress") or ""
+        if float((pr.get("liquidity") or {}).get("usd") or 0) < 50:
+            continue
+        if "v3" in labels and addr.lower() not in skip_v3 and n3 < 6:
+            cands.append(("v3", addr))
+            n3 += 1
+        elif "v4" in labels and len(addr) == 66 and addr.lower() not in skip_v4 and n4 < 8:
+            cands.append(("v4", addr))
+            n4 += 1
+
+    def build(item):
+        kind, addr = item
+        try:
+            if kind == "v3":
+                pool = w3.eth.contract(address=Web3.to_checksum_address(addr), abi=POOL_ABI)
+                t0, t1 = pool.functions.token0().call(), pool.functions.token1().call()
+                fee = pool.functions.fee().call()
+                # otentikasi: alamat harus terdaftar di factory Uniswap
+                if factory.functions.getPool(t0, t1, fee).call().lower() != addr.lower():
+                    return None
+                if t1.lower() in quotes_lc:
+                    qsym, q, q_is_t1 = quotes_lc[t1.lower()], t1, True
+                elif t0.lower() in quotes_lc:
+                    qsym, q, q_is_t1 = quotes_lc[t0.lower()], t0, False
+                else:
+                    return None
+                slot0 = pool.functions.slot0().call()
+                qdec = token_info(w3, q)["decimals"]
+                qusd = quote_usd_price(w3, chain_id, qsym)
+                q_bal = erc20(w3, q).functions.balanceOf(addr).call() / 10 ** qdec
+                if q_bal * qusd * 2 < 10:
+                    return None
+                return {
+                    "ver": 3, "pool": Web3.to_checksum_address(addr), "fee": fee,
+                    "tick_spacing": pool.functions.tickSpacing().call(),
+                    "quote_sym": qsym, "quote_addr": q, "quote_decimals": qdec, "quote_usd": qusd,
+                    "tick": slot0[1], "sqrtp": slot0[0],
+                    "liquidity": pool.functions.liquidity().call(),
+                    "tvl_usd": q_bal * qusd * 2, "token0": t0, "token1": t1,
+                    "quote_is_token1": q_is_t1,
+                }
+            else:
+                key = _v4_key_from_init(w3, chain_id, addr)
+                if not key:
+                    return None
+                qsym4, q_is_c1 = _v4_quote_side(chain_id, key[0], key[1])
+                if not qsym4:
+                    return None
+                qaddr = key[1] if q_is_c1 else key[0]
+                if qaddr.lower() == V4_NATIVE:
+                    qsym4 = cfg["native_symbol"]
+                pid = v4_pool_id(key)
+                sv = _v4c(w3, chain_id, "v4_stateview", V4_STATEVIEW_ABI)
+                sqrtp, tick, _, _ = sv.functions.getSlot0(pid).call()
+                pliq = sv.functions.getLiquidity(pid).call()
+                if sqrtp == 0 or pliq == 0:
+                    return None
+                qinfo = _v4_currency_info(w3, chain_id, qaddr)
+                price_sym = qsym4 if qaddr.lower() != V4_NATIVE else cfg["wrapped_symbol"]
+                qusd = quote_usd_price(w3, chain_id, price_sym)
+                q_virt = (pliq * sqrtp // Q96) if q_is_c1 else (pliq * Q96 // sqrtp if sqrtp else 0)
+                tvl = q_virt / 10 ** qinfo["decimals"] * qusd * 2
+                if tvl < 10:
+                    return None
+                probe = int(min(100 / qusd if qusd else 0,
+                                q_virt / 10 ** qinfo["decimals"] / 100 or 1) * 10 ** qinfo["decimals"]) or 1
+                if not v4_roundtrip_ok(w3, chain_id, key, q_is_c1, probe):
+                    return None
+                return {
+                    "ver": 4, "pool": "0x" + pid.hex().removeprefix("0x"), "pool_id": pid,
+                    "key": key, "fee": key[2], "tick_spacing": key[3],
+                    "quote_sym": qsym4, "quote_addr": key[1] if q_is_c1 else key[0],
+                    "quote_decimals": qinfo["decimals"], "quote_usd": qusd,
+                    "tick": tick, "sqrtp": sqrtp, "liquidity": pliq, "tvl_usd": tvl,
+                    "token0": key[0], "token1": key[1], "quote_is_token1": q_is_c1,
+                }
+        except Exception:
+            return None
+
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        for r in ex.map(build, cands):
+            if r:
+                out.append(r)
+    return out
 
 
 # ---------- Kalkulasi range strategi ----------
@@ -983,7 +1157,8 @@ def mint_position(chain_id: int, pk: str, pool_info: dict, budget: float,
         slot0 = pool.functions.slot0().call()
         t_lo, t_hi = calc_strategy_range(slot0[1], pool_info["fee"], q_is_t1, mode,
                                          strategy["low_pct"], strategy["up_pct"],
-                                         strategy.get("gap", 1))
+                                         strategy.get("gap", 1),
+                                         spacing=pool_info.get("tick_spacing"))
         keep_wei, swap_wei = plan_two_sided(slot0[0], t_lo, t_hi, budget_wei, q_is_t1)
         # meme yang sudah ada di wallet dihitung duluan — swap cuma nutup kekurangan
         raw = (slot0[0] / Q96) ** 2  # token1 per token0 (rasio wei)
@@ -1028,7 +1203,7 @@ def mint_position(chain_id: int, pk: str, pool_info: dict, budget: float,
         cur_tick = slot0[1]
         tick_lower, tick_upper = calc_strategy_range(
             cur_tick, pool_info["fee"], q_is_t1, mode, strategy["low_pct"], strategy["up_pct"],
-            strategy.get("gap", 1))
+            strategy.get("gap", 1), spacing=pool_info.get("tick_spacing"))
 
         if mode == "upper":
             if not q_is_t1:  # meme = token1
