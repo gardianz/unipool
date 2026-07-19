@@ -15,6 +15,7 @@ Paste alamat token → bot cari pool (v2/v3/v4 sekaligus) → pilih strategi →
 - 🔁 **Auto-wrap** ETH→WETH, **auto-swap** komposisi dua sisi (token existing di wallet dipakai duluan); pair non-WETH (mis. USDG) otomatis dibeli dari saldo WETH/ETH saat mint
 - 📊 **/list** — nilai posisi, fee unclaimed, PnL per posisi & portfolio, status IN/OUT range
 - 📈 **Chart** — tombol langsung ke GMGN & DexScreener per posisi/pool
+- ⚖️ **Rebalance satu tombol** — close (fee ikut terambil) → swap komposisi → mint ulang dengan lebar range sama dipusatkan di harga sekarang; pilih Wide/Lower/Upper; hanya dana hasil posisi itu yang dipakai; tombolnya juga muncul di alert keluar range
 - 🔔 **Alert** otomatis saat posisi keluar/masuk range
 - 🧭 **Menu navigasi** — `/start` membuka dashboard (saldo + tombol Posisi/Dompet/Pengaturan/Chain); semua setting bisa diubah lewat tombol tanpa hafal perintah
 - 🛡️ **Failover RPC** multi-endpoint + bypass blokir DNS ISP Indonesia (DoH + koneksi IP langsung, sertifikat tetap diverifikasi)
@@ -84,7 +85,7 @@ Log `LP bot jalan. Wallet: 0x...` = siap. Buka chat bot kamu di Telegram, kirim 
 2. Pilih pool → muncul **kartu konfirmasi**: strategi, range (dalam market cap), komposisi deposit, rencana wrap/swap
 3. Atur pakai tombol (strategi / preset range / amount) atau **✏️ Custom** — balas dengan `40 120` (persen) atau `mc 300k 800k`
 4. **✅ Confirm mint** → bot eksekusi wrap → approve → mint, kirim semua link transaksi
-5. `/list` → klik posisi untuk kartu detail; tombol **📈 GMGN** / **📊 DexScreener** (chart), **➕ Add**, **➖ Reduce**, **💰 Fee** (collect fee tanpa close; tidak ada di v2 karena auto-compound), **🗑 Close**
+5. `/list` → klik posisi untuk kartu detail; tombol **📈 GMGN** / **📊 DexScreener** (chart), **➕ Add**, **➖ Reduce**, **💰 Fee** (collect fee tanpa close; tidak ada di v2 karena auto-compound), **⚖️ Rebalance** (mint ulang di harga sekarang), **🗑 Close**
 6. Close → pilih **swap semua → WETH** atau **tahan token**
 
 ## Perintah

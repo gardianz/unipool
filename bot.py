@@ -1313,12 +1313,14 @@ def position_kb(cid: int, p: dict) -> InlineKeyboardMarkup:
     if ver != 2:  # fee v2 auto-compound — tidak ada klaim terpisah
         actions.append(InlineKeyboardButton("💰 Fee", callback_data=f"fee|{pid}"))
     actions.append(InlineKeyboardButton("🗑 Close", callback_data=f"close|{pid}"))
-    return InlineKeyboardMarkup([
-        chart_buttons(cid, p["pool"], meme_ca) + [InlineKeyboardButton("🔄", callback_data=f"pos|{pid}")],
-        actions,
-        [InlineKeyboardButton("⬅️ Posisi", callback_data="menu|list"),
-         InlineKeyboardButton("🏠 Menu", callback_data="menu|main")],
-    ])
+    rows = [chart_buttons(cid, p["pool"], meme_ca) + [InlineKeyboardButton("🔄", callback_data=f"pos|{pid}")],
+            actions]
+    if ver != 2:
+        rows.append([InlineKeyboardButton("⚖️ Rebalance (mint ulang di harga sekarang)",
+                                          callback_data=f"reb|{pid}")])
+    rows.append([InlineKeyboardButton("⬅️ Posisi", callback_data="menu|list"),
+                 InlineKeyboardButton("🏠 Menu", callback_data="menu|main")])
+    return InlineKeyboardMarkup(rows)
 
 
 async def show_position(update: Update, msg, pid: str):
@@ -1496,6 +1498,84 @@ async def do_collect(update: Update, pid: str):
              "<i>Posisi tetap jalan — liquidity tidak berubah.</i>"]
     for label, h in r["steps"]:
         lines.append(f"{label}: {ch.tx_link(cid, h)}")
+    await edit(status, "\n".join(lines), NAV_KB)
+
+
+# ---------- Rebalance ----------
+async def ask_rebalance(update: Update, pid: str):
+    s = store.load_settings()
+    cid = s["chain"]
+    if str(pid).startswith("v2:"):
+        await reply(update, "Posisi v2 full-range — tidak perlu rebalance.")
+        return
+
+    def work():
+        return next((p for p in list_positions_all(cid) if p["pid"] == str(pid)), None)
+
+    p = await asyncio.to_thread(work)
+    if not p:
+        await reply(update, f"❌ Posisi {disp_pid(pid)} tidak ditemukan.")
+        return
+    meme_sym = p["sym0"] if p["quote_is_token1"] else p["sym1"]
+    status = "🟢 IN" if p["in_range"] else "🔴 OUT"
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⚖️ Wide — dua sisi", callback_data=f"rebok|{pid}|wide")],
+        [InlineKeyboardButton(f"Lower — {p['quote_sym'] or 'quote'} saja (nampung turun)",
+                              callback_data=f"rebok|{pid}|lower"),
+         InlineKeyboardButton(f"Upper — {meme_sym} saja (jual naik)",
+                              callback_data=f"rebok|{pid}|upper")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="cancel")],
+    ])
+    await reply(update, (
+        f"⚖️ <b>Rebalance {_pos_disp(p)}?</b>\n"
+        f"{esc(p['sym1'])}/{esc(p['sym0'])} · Val ~{ch.fmt_usd(p['value_usd'])} · {status}\n"
+        f"Range: {esc(range_str(p))}\n\n"
+        f"Close (fee ikut terambil) → swap komposisi → mint ulang dengan "
+        f"<b>lebar range sama</b> dipusatkan di harga sekarang.\n"
+        f"<i>Hanya dana hasil posisi ini yang dipakai. 3–5 transaksi.</i>"), kb)
+
+
+async def do_rebalance(update: Update, pid: str, mode: str):
+    s = store.load_settings()
+    cid = s["chain"]
+
+    def snapshot():
+        return next((p for p in list_positions_all(cid) if p["pid"] == str(pid)), None)
+
+    pos = await asyncio.to_thread(snapshot)
+    status = await reply(update, f"⏳ Rebalance {disp_pid(pid)} → {mode}... (close → swap → mint)")
+    async with TX_LOCK:
+        try:
+            r = await asyncio.to_thread(ch.rebalance_position, cid, pk(), pid, mode,
+                                        s["slippage_pct"], int(s.get("gap", 1)))
+        except Exception as e:
+            await edit(status, f"❌ Rebalance gagal: {esc(e)}\n"
+                               f"<i>Kalau close sudah jalan, dananya aman di wallet — "
+                               f"cek /wallet lalu mint manual.</i>")
+            return
+
+    ver, old_ref = ch.parse_pid(pid)
+    ev_old = old_ref if ver == 3 else str(pid)
+    if pos:
+        store.record_event(cid, "close", ev_old, pos["value_usd"], "rebalance out", wallet=wallet_address())
+        if pos["unclaimed_usd"] > 0:
+            store.record_event(cid, "fees", ev_old, pos["unclaimed_usd"], wallet=wallet_address())
+    new_pid = f"v4:{r['token_id']}" if ver == 4 else r["token_id"]
+    if ver == 4:
+        store.drop_ref(cid, wallet_address(), "v4", str(old_ref))
+        if r["token_id"]:
+            store.add_ref(cid, wallet_address(), "v4", str(r["token_id"]))
+    store.record_event(cid, "mint", new_pid, r["deposited_usd"], "rebalance in", wallet=wallet_address())
+
+    lines = [f"✅ <b>Rebalanced {disp_pid(pid)} → #{r['token_id']}</b> [v{ver}] · {STRAT_LABEL[mode]}",
+             f"Closed: {ch.fmt_amount(r['closed_got0'])} {esc(r['closed_sym0'])} + "
+             f"{ch.fmt_amount(r['closed_got1'])} {esc(r['closed_sym1'])} (termasuk fee)",
+             f"Minted: ~{ch.fmt_amount(r['deposited'])} {esc(r['deposit_sym'])} "
+             f"({ch.fmt_usd(r['deposited_usd'])})"]
+    for label, h in r["steps"]:
+        lines.append(f"{label}: {ch.tx_link(cid, h)}")
+    if r["token_id"]:
+        lines.append(ch.pos_link_any(cid, new_pid))
     await edit(status, "\n".join(lines), NAV_KB)
 
 
@@ -1718,6 +1798,14 @@ async def on_callback(update: Update, _):
     if data.startswith("fee|"):
         await do_collect(update, data.split("|", 1)[1])
         return
+    if data.startswith("reb|"):
+        await ask_rebalance(update, data.split("|", 1)[1])
+        return
+    if data.startswith("rebok|"):
+        _, tid, mode = data.split("|")
+        await q.edit_message_reply_markup(None)
+        await do_rebalance(update, tid, mode)
+        return
     if data.startswith("red|"):
         await ask_reduce(update, data.split("|", 1)[1])
         return
@@ -1775,6 +1863,7 @@ async def monitor_loop(app):
                 meme_ca = p["token0"] if p["quote_is_token1"] else p["token1"]
                 kb = InlineKeyboardMarkup([
                     [InlineKeyboardButton("📋 Detail", callback_data=f"pos|{p['pid']}"),
+                     InlineKeyboardButton("⚖️ Rebalance", callback_data=f"reb|{p['pid']}"),
                      InlineKeyboardButton("🗑 Close", callback_data=f"close|{p['pid']}"), DEL_BTN],
                     chart_buttons(cid, p["pool"], meme_ca),
                 ])

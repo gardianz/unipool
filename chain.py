@@ -2863,3 +2863,187 @@ def close_any(chain_id: int, pk: str, pid, slippage_pct: float, autoswap: bool) 
     if ver == 4:
         return close_v4(chain_id, pk, ref, slippage_pct, autoswap)
     return reduce_v2(chain_id, pk, ref, 100, slippage_pct, autoswap=autoswap)
+
+
+# ══════════════════════════ Rebalance ══════════════════════════
+def _span_to_pcts(span: int, mode: str) -> tuple[float, float]:
+    """Konversi lebar range lama (tick) → (low_pct, up_pct) untuk strategi baru.
+    wide = span dibagi dua sisi; lower/upper = span penuh satu sisi."""
+    def dn(t):  # % turun untuk t tick ke bawah
+        return (1 - 1.0001 ** -t) * 100
+    def up(t):  # % naik untuk t tick ke atas
+        return (1.0001 ** t - 1) * 100
+    span = max(span, 2)
+    if mode == "wide":
+        half = span // 2
+        return dn(half), up(half)
+    if mode == "lower":
+        return dn(span), 100.0
+    return 50.0, up(span)  # upper
+
+
+def _wallet_balance(w3: Web3, cur: str, addr: str) -> int:
+    if cur.lower() == V4_NATIVE:
+        return w3.eth.get_balance(addr)
+    return erc20(w3, cur).functions.balanceOf(addr).call()
+
+
+def rebalance_position(chain_id: int, pk: str, pid, mode: str, slippage_pct: float,
+                       gap: int = 1) -> dict:
+    """Close posisi → swap komposisi sesuai mode → mint ulang dengan lebar range
+    sama, dipusatkan di harga sekarang. Fee unclaimed ikut ter-reinvest.
+    Hanya dana HASIL posisi ini yang dipakai (delta saldo, bukan seluruh wallet)."""
+    ver, ref = parse_pid(pid)
+    if ver == 2:
+        raise RuntimeError("Posisi v2 full-range — tidak perlu rebalance.")
+    if mode not in ("wide", "lower", "upper"):
+        raise RuntimeError("Mode rebalance: wide / lower / upper.")
+    w3 = get_w3(chain_id)
+    cfg = CHAINS[chain_id]
+    account = w3.eth.account.from_key(pk)
+
+    # ---- baca posisi lama + susun pool_info untuk mint ulang ----
+    if ver == 3:
+        npm = w3.eth.contract(address=Web3.to_checksum_address(cfg["npm"]), abi=NPM_ABI)
+        (_, _, t0, t1, fee, lo, hi, liq, _, _, _, _) = npm.functions.positions(ref).call()
+        if liq == 0:
+            raise RuntimeError("Liquidity 0 — posisi sudah kosong.")
+        factory = w3.eth.contract(address=Web3.to_checksum_address(cfg["factory"]), abi=FACTORY_ABI)
+        pool_addr = factory.functions.getPool(t0, t1, fee).call()
+        pool_c = w3.eth.contract(address=Web3.to_checksum_address(pool_addr), abi=POOL_ABI)
+        quotes_lc = {a.lower(): s for s, a in cfg["quotes"].items()}
+        if t1.lower() in quotes_lc:
+            qsym, q_is_t1 = quotes_lc[t1.lower()], True
+        elif t0.lower() in quotes_lc:
+            qsym, q_is_t1 = quotes_lc[t0.lower()], False
+        else:
+            raise RuntimeError("Pair tanpa quote yang dikenal bot.")
+        quote = t1 if q_is_t1 else t0
+        meme = t0 if q_is_t1 else t1
+        qdec = token_info(w3, quote)["decimals"]
+        try:
+            spacing = pool_c.functions.tickSpacing().call()
+        except Exception:
+            spacing = TICK_SPACING.get(fee)
+        s0 = pool_c.functions.slot0().call()
+        pool_info = {"ver": 3, "pool": pool_addr, "fee": fee, "tick_spacing": spacing,
+                     "quote_sym": qsym, "quote_addr": quote, "quote_decimals": qdec,
+                     "quote_usd": quote_usd_price(w3, chain_id, qsym),
+                     "tick": s0[1], "sqrtp": s0[0],
+                     "token0": t0, "token1": t1, "quote_is_token1": q_is_t1}
+    else:
+        if not verify_v4(w3, chain_id):
+            raise RuntimeError("Kontrak V4 gagal verifikasi on-chain — batal.")
+        posm = _v4c(w3, chain_id, "v4_posm", V4_POSM_ABI)
+        key, info = posm.functions.getPoolAndPositionInfo(ref).call()
+        key = tuple(key)
+        lo, hi = _v4_tick_from_info(info)
+        liq = posm.functions.getPositionLiquidity(ref).call()
+        if liq == 0:
+            raise RuntimeError("Liquidity 0 — posisi sudah kosong.")
+        qsym, q_is_t1 = _v4_quote_side(chain_id, key[0], key[1])
+        if not qsym:
+            raise RuntimeError("Pair tanpa quote yang dikenal bot.")
+        quote = key[1] if q_is_t1 else key[0]
+        meme = key[0] if q_is_t1 else key[1]
+        if quote.lower() == V4_NATIVE:
+            qsym = cfg["native_symbol"]
+        qinfo = _v4_currency_info(w3, chain_id, quote)
+        qdec = qinfo["decimals"]
+        pid4 = v4_pool_id(key)
+        sqrtp, tick = v4_slot0(w3, chain_id, pid4)
+        price_sym = qsym if quote.lower() != V4_NATIVE else cfg["wrapped_symbol"]
+        pool_info = {"ver": 4, "pool": "0x" + pid4.hex().removeprefix("0x"), "pool_id": pid4,
+                     "key": key, "fee": key[2], "tick_spacing": key[3],
+                     "quote_sym": qsym, "quote_addr": quote, "quote_decimals": qdec,
+                     "quote_usd": quote_usd_price(w3, chain_id, price_sym),
+                     "tick": tick, "sqrtp": sqrtp,
+                     "token0": key[0], "token1": key[1], "quote_is_token1": q_is_t1}
+    minfo = token_info(w3, meme)
+    span = hi - lo
+    if span >= 400_000:
+        raise RuntimeError("Range posisi hampir full-range — tidak akan pernah keluar range, "
+                           "rebalance tidak berguna.")
+
+    # ---- close (tanpa autoswap; komposisi diatur di bawah) ----
+    pre_q = _wallet_balance(w3, quote, account.address)
+    pre_m = erc20(w3, meme).functions.balanceOf(account.address).call()
+    if ver == 3:
+        closed = close_position(chain_id, pk, ref, slippage_pct, autoswap=False)
+    else:
+        closed = close_v4(chain_id, pk, ref, slippage_pct, autoswap=False)
+    steps = list(closed["steps"])
+
+    got_m = (closed["got0"] if q_is_t1 else closed["got1"]) * 10 ** minfo["decimals"]
+    if got_m > 0:
+        poll_balance(w3, meme, account.address, pre_m + int(got_m * 0.9))
+    m_delta = erc20(w3, meme).functions.balanceOf(account.address).call() - pre_m
+    q_delta = _wallet_balance(w3, quote, account.address) - pre_q  # native: sudah minus gas
+    q_delta = max(0, q_delta)
+    m_delta = max(0, m_delta)
+    if q_delta == 0 and m_delta == 0:
+        raise RuntimeError("Hasil close terbaca 0 (RPC lag) — dana aman di wallet, mint manual saja.")
+
+    # ---- swap komposisi sesuai mode (hanya dana hasil close) ----
+    sqrtp_now = (pool_info["sqrtp"] if ver == 3 else v4_slot0(w3, chain_id, pool_info["pool_id"])[0])
+    raw = (sqrtp_now / Q96) ** 2
+    mprice_q = raw if q_is_t1 else (1 / raw if raw else 0)  # quote-wei per meme-wei
+
+    def do_swap(token_in, token_out, amt_wei):
+        if amt_wei <= 0:
+            return
+        if ver == 3:
+            h = swap_to_token(chain_id, pk, token_in, token_out, pool_info["fee"], amt_wei, slippage_pct)
+        else:
+            h = v4_swap(chain_id, pk, pool_info["key"], token_in, amt_wei, slippage_pct)
+        if h:
+            steps.append(("swap", h))
+
+    low_pct, up_pct = _span_to_pcts(span, mode)
+    if mode == "lower" and m_delta > 0:
+        do_swap(meme, quote, m_delta)  # lower = 100% quote
+    elif mode == "upper" and q_delta > 0:
+        keep_gas = w3.to_wei("0.0005", "ether") if quote.lower() == V4_NATIVE else 0
+        do_swap(quote, meme, max(0, q_delta - keep_gas))  # upper = 100% meme
+    elif mode == "wide":
+        # sisi meme berlebih → jual kelebihannya ke quote (arah quote→meme diurus mesin mint)
+        cur_tick_now = pool_info["tick"] if ver == 3 else v4_slot0(w3, chain_id, pool_info["pool_id"])[1]
+        sp_ = pool_info["tick_spacing"] or TICK_SPACING.get(pool_info["fee"], 60)
+        t_lo, t_hi = calc_strategy_range(cur_tick_now, pool_info["fee"], q_is_t1, "wide",
+                                         low_pct, up_pct, gap, spacing=sp_)
+        total_q = q_delta + int(m_delta * mprice_q)
+        keep, _sw = plan_two_sided(sqrtp_now, t_lo, t_hi, max(total_q, 1), q_is_t1)
+        need_m_q = max(total_q, 1) - keep          # nilai sisi meme yang dibutuhkan (quote-wei)
+        have_m_q = int(m_delta * mprice_q)
+        excess_q = have_m_q - need_m_q
+        if excess_q > total_q // 100 and mprice_q > 0:
+            do_swap(meme, quote, int(excess_q / mprice_q))
+
+    # ---- baca ulang delta setelah swap → budget mint (hanya proceeds) ----
+    time.sleep(1)
+    q_delta = max(0, _wallet_balance(w3, quote, account.address) - pre_q)
+    m_delta = max(0, erc20(w3, meme).functions.balanceOf(account.address).call() - pre_m)
+    if mode == "upper":
+        budget = m_delta / 10 ** minfo["decimals"]
+    else:
+        if quote.lower() == V4_NATIVE:
+            q_delta = max(0, q_delta - w3.to_wei("0.0005", "ether"))
+        budget = q_delta / 10 ** qdec
+    if budget <= 0:
+        raise RuntimeError("Budget mint 0 setelah close+swap — dana aman di wallet, mint manual saja.")
+
+    strategy = {"mode": mode, "low_pct": low_pct, "up_pct": up_pct, "gap": gap}
+    if ver == 3:
+        r = mint_position(chain_id, pk, pool_info, budget, strategy, slippage_pct)
+    else:
+        r = mint_v4(chain_id, pk, pool_info, budget, strategy, slippage_pct)
+    steps += r["steps"]
+
+    return {"ver": ver, "old_ref": ref, "steps": steps,
+            "closed_got0": closed["got0"], "closed_got1": closed["got1"],
+            "closed_sym0": closed["sym0"], "closed_sym1": closed["sym1"],
+            "token_id": r["token_id"], "mode": mode,
+            "tick_lower": r["tick_lower"], "tick_upper": r["tick_upper"],
+            "cur_tick": r["cur_tick"], "deposited": r["deposited"],
+            "deposit_sym": r["deposit_sym"], "deposited_usd": r["deposited_usd"],
+            "quote_sym": pool_info["quote_sym"], "meme_sym": minfo["symbol"]}
