@@ -765,6 +765,24 @@ def discover_pools(chain_id: int, token_addr: str) -> dict:
         tinfo = tinfo_f.result()
         vols = vols_f.result()
 
+    # TVL v4 dari dexscreener (reserve riil, termasuk likuiditas parkir di luar range —
+    # estimasi virtual cuma menghitung liquidity aktif di tick sekarang, bisa jauh
+    # di bawah angka UI Uniswap). Probe round-trip tetap jadi gerbang keamanannya.
+    dexliq = {}
+    try:
+        for pr in _dex_pairs(chain_id, token):
+            lq = float((pr.get("liquidity") or {}).get("usd") or 0)
+            if lq > 0:
+                dexliq[(pr.get("pairAddress") or "").lower()] = lq
+    except Exception:
+        pass
+    for p in pools:
+        if p.get("ver") == 4:
+            real = dexliq.get(str(p["pool"]).lower())
+            if real:
+                p["tvl_usd"] = real
+    pools.sort(key=lambda p: p["tvl_usd"], reverse=True)
+
     for p in pools:
         v = vols.get(p["pool"].lower())
         p["vol24_usd"] = v
