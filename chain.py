@@ -464,6 +464,7 @@ def _forced_ip_w3(rpc_url: str) -> Web3 | None:
 
 # ---------- Koneksi & util dasar ----------
 _W3_CACHE: dict[int, tuple[Web3, float]] = {}
+_NONCE_NEXT: dict[str, int] = {}  # alamat → nonce berikutnya (pelacak lokal utk tx beruntun)
 
 
 def get_w3(chain_id: int, fresh: bool = False) -> Web3:
@@ -546,24 +547,39 @@ def send_tx(w3: Web3, pk: str, tx: dict) -> str:
     except Exception:
         tx["gasPrice"] = w3.eth.gas_price
 
-    # nonce "pending" + retry: replika RPC bisa telat sinkron setelah tx beruntun
+    # Nonce: replika RPC sering telat sinkron setelah tx beruntun (close→swap→mint),
+    # jadi lacak sendiri nonce berikutnya per alamat dan ambil yang tertinggi.
+    # Catatan: web3 v7 melempar Web3RPCError (bukan ValueError) untuk error RPC,
+    # makanya except-nya harus generik — dicek dari pesan.
     last_err = None
-    for attempt in range(4):
-        tx["nonce"] = w3.eth.get_transaction_count(account.address, "pending")
+    addr_lc = account.address.lower()
+    for attempt in range(5):
+        rpc_n = w3.eth.get_transaction_count(account.address, "pending")
+        n = max(rpc_n, min(_NONCE_NEXT.get(addr_lc, 0), rpc_n + 3))
+        tx["nonce"] = n
         signed = w3.eth.account.sign_transaction(tx, pk)
         try:
             h = w3.eth.send_raw_transaction(signed.raw_transaction)
+            _NONCE_NEXT[addr_lc] = n + 1
             return "0x" + h.hex().removeprefix("0x")
-        except ValueError as e:
+        except Exception as e:
             s = str(e).lower()
-            if "already known" in s or "already exists" in s:
+            if "already known" in s or "already exists" in s or "known transaction" in s:
+                _NONCE_NEXT[addr_lc] = n + 1
                 return "0x" + signed.hash.hex().removeprefix("0x")
-            if "nonce too low" in s or "nonce" in s and "low" in s:
+            if "nonce too low" in s or ("nonce" in s and "low" in s):
+                # negara chain sudah lewat — sinkronkan cache lalu ulang
+                _NONCE_NEXT[addr_lc] = max(_NONCE_NEXT.get(addr_lc, 0), n + 1)
                 last_err = e
-                time.sleep(1.5)
+                time.sleep(2)
+                continue
+            if "replacement transaction underpriced" in s or "nonce too high" in s:
+                _NONCE_NEXT.pop(addr_lc, None)  # cache salah arah — reset, percaya RPC
+                last_err = e
+                time.sleep(2)
                 continue
             raise
-    raise RuntimeError(f"Gagal kirim tx setelah 4 percobaan (nonce): {last_err}")
+    raise RuntimeError(f"Gagal kirim tx setelah 5 percobaan (nonce): {last_err}")
 
 
 def poll_balance(w3: Web3, token: str, addr: str, min_expected: int,
