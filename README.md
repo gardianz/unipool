@@ -168,6 +168,76 @@ sudo systemctl enable --now unipool
 
 Cek log: `journalctl -u unipool -f` · restart: `sudo systemctl restart unipool` (perlu setiap `git pull`).
 
+## Web UI di VPS + akses dari ponsel
+
+> ⚠️ **UI web ini menandatangani transaksi dengan private key.** Siapa pun yang bisa
+> membuka halamannya bisa memindahkan dana. **Jangan pernah bind ke IP publik.** Pakai
+> jaringan privat (Tailscale) — port tidak pernah terekspos ke internet.
+
+### Cara aman: Tailscale (disarankan)
+
+Tailscale = VPN mesh gratis. VPS dan ponsel masuk satu jaringan privat terenkripsi;
+UI cuma hidup di jaringan itu, tak ada port yang terbuka ke publik.
+
+**1. Pasang Tailscale di VPS lalu login:**
+```bash
+curl -fsSL https://tailscale.com/install.sh | sh
+sudo tailscale up
+tailscale ip -4          # catat IP-nya, mis. 100.101.102.103 (stabil per device)
+```
+
+**2. Pasang aplikasi Tailscale di ponsel** (Play Store / App Store), login akun yang sama.
+
+**3. Buat token akses + set host ke IP Tailscale, di `.env`:**
+```bash
+# token acak; jangan dibagikan
+echo "WEB_TOKEN=$(python3 -c 'import secrets;print(secrets.token_urlsafe(24))')" >> .env
+echo "WEB_HOST=100.101.102.103" >> .env    # ganti dgn 'tailscale ip -4' milikmu
+```
+Bind ke IP Tailscale = socket cuma ada di jaringan privat, tidak pernah di IP publik VPS.
+`WEB_TOKEN` jadi lapis kedua (server menolak start non-localhost tanpa token).
+
+**4. Service systemd untuk web:**
+```bash
+sudo tee /etc/systemd/system/unipool-web.service > /dev/null <<'UNIT'
+[Unit]
+Description=unipool web UI
+After=network-online.target tailscaled.service
+
+[Service]
+User=ubuntu
+WorkingDirectory=/home/ubuntu/unipool
+ExecStart=/home/ubuntu/unipool/.venv/bin/python3 web.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+sudo systemctl daemon-reload
+sudo systemctl enable --now unipool-web
+```
+
+**5. Dari ponsel** (Tailscale aktif), buka browser:
+```
+http://100.101.102.103:8899/?t=<WEB_TOKEN>
+```
+Sesudah pertama kali, token tersimpan di halaman — **bookmark URL beserta `?t=`**.
+Cek log: `journalctl -u unipool-web -f`. Restart tiap `git pull`: `sudo systemctl restart unipool-web`.
+
+### Alternatif tanpa pasang apa pun di VPS: SSH tunnel (laptop)
+
+Web tetap bind `127.0.0.1` (default). Dari laptop:
+```bash
+ssh -L 8899:127.0.0.1:8899 user@vps
+```
+lalu buka `http://127.0.0.1:8899`. Di ponsel bisa via app SSH (Termux/Terminus) dengan
+port-forward yang sama, tapi ribet — Tailscale jauh lebih enak untuk ponsel.
+
+> **Jangan** pakai `WEB_HOST=0.0.0.0` (bind ke semua interface = terekspos ke internet),
+> sekalipun ada `WEB_TOKEN`. Token lewat HTTP itu polos; sekali bocor, dana bisa hilang.
+> Tailscale menghilangkan seluruh permukaan serang ini.
+
 ## Troubleshooting
 
 **SSL "Hostname mismatch" ke `rpc.mainnet.chain.robinhood.com`** — DNS ISP Indonesia memblokir domain robinhood.com (redirect internetpositif.id). Bot otomatis bypass: resolve IP asli via DNS-over-HTTPS lalu konek langsung (sertifikat tetap diverifikasi). Alternatif permanen: ganti DNS Windows/router ke `1.1.1.1`.
