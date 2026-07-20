@@ -66,7 +66,13 @@ $('#modal').addEventListener('click', e => { if (e.target.id === 'modal') closeM
 // ══════════ state ══════════
 const S = {
   chain: null, settings: {}, token: null, pools: [], pool: null,
-  tf: '15m', candles: [], min: null, max: null, mode: 'lower',
+  tf: '15m', candles: [], min: null, max: null,
+  // Niat user = (mode, lowPct, upPct). Ini sumber kebenaran, BUKAN S.min/S.max.
+  // Harga meme bergerak terus; kalau mode disimpulkan ulang dari batas absolut
+  // tiap kali harga berubah, range single-sided bisa berubah sendiri jadi dua
+  // sisi — dan mint dua sisi menukar separuh modal ke meme. Mode hanya berubah
+  // kalau user yang mengubahnya (preset atau drag melewati harga).
+  mode: 'lower', lowPct: 30, upPct: 30,
   preview: null, amountPct: 50, amountFixed: null, bars: [], busy: false,
   unit: 'mc',        // sumbu harga: market cap atau harga quote
   ana: 'liq',        // panel analytics: liquidity | volume
@@ -93,7 +99,8 @@ function autoscale(orig) {
   const hi = Math.max(r ? r.priceRange.maxValue : -Infinity, toUnit(S.max) ?? -Infinity);
   if (!isFinite(lo) || !isFinite(hi) || lo >= hi) return r;
   const pad = (hi - lo) * 0.05;
-  return {priceRange: {minValue: lo - pad, maxValue: hi + pad}};
+  // harga/market cap tidak pernah negatif — jangan sisakan ruang di bawah nol
+  return {priceRange: {minValue: Math.max(lo - pad, lo * 0.5, 0), maxValue: hi + pad}};
 }
 
 function initChart() {
@@ -144,7 +151,7 @@ function initChart() {
     setBound(dragging, fromUnit(u));
     syncFromDrag(false);
   });
-  const stop = () => { if (dragging) { dragging = null; syncFromDrag(true); } };
+  const stop = () => { if (dragging) { dragging = null; commitDrag(); } };
   overlay.addEventListener('pointerup', stop);
   overlay.addEventListener('pointercancel', stop);
 
@@ -153,6 +160,13 @@ function initChart() {
     chart.applyOptions({width: el.clientWidth, height: el.clientHeight});
     drawHandles();
   }).observe(el);
+
+  /* Skala harga chart dihitung ulang secara asinkron setelah applyOptions,
+     jadi priceToCoordinate() yang dipanggil langsung memberi posisi lama —
+     batang geser jadi tidak sejajar dengan garisnya (bisa meleset puluhan
+     piksel). Posisikan ulang tiap frame supaya selalu menempel. */
+  const tick = () => { drawHandles(); requestAnimationFrame(tick); };
+  requestAnimationFrame(tick);
 }
 
 /* MIN/MAX tidak boleh saling melewati, dan tidak boleh nempel persis di harga
@@ -175,11 +189,11 @@ function drawHandles() {
   for (const h of overlay.children) {
     const v = h.dataset.k === 'min' ? S.min : S.max;
     const y = v ? series.priceToCoordinate(toUnit(v)) : null;
-    if (y == null) { h.style.display = 'none'; continue; }
-    h.style.display = 'block';
-    h.style.top = y + 'px';
+    if (y == null) { if (h.style.display !== 'none') h.style.display = 'none'; continue; }
+    const top = Math.round(y) + 'px';
+    if (h.style.display !== 'block') h.style.display = 'block';
+    if (h.style.top !== top) h.style.top = top;   // tulis hanya kalau berubah
   }
-  drawLiq();
 }
 
 function setPriceLines() {
@@ -192,7 +206,7 @@ function setPriceLines() {
   lineMin = mk(S.min, 'MIN');
   lineMax = mk(S.max, 'MAX');
   series.applyOptions({autoscaleInfoProvider: autoscale});  // paksa hitung ulang skala
-  drawHandles();
+  drawHandles(); drawLiq();
 }
 
 // ══════════ histogram likuiditas horizontal (sumbu-x = harga/MC) ══════════
@@ -297,7 +311,7 @@ function initLiqDrag() {
     setBound(liqDrag, liqPriceAt(ev.clientX));
     syncFromDrag(false);
   });
-  const stop = () => { if (liqDrag) { liqDrag = null; syncFromDrag(true); } };
+  const stop = () => { if (liqDrag) { liqDrag = null; commitDrag(); } };
   w.addEventListener('pointerup', stop);
   w.addEventListener('pointercancel', stop);
   new ResizeObserver(drawLiq).observe(w);
@@ -369,19 +383,30 @@ function note(g, W, H, txt) {
 }
 
 // ══════════ range ⇄ mode ══════════
-function modeFromRange() {
+/* Mode disimpulkan HANYA saat user menggeser batas (aksi eksplisit), lalu
+   dikunci sebagai niat. Setelah itu harga boleh bergerak tanpa mengubahnya. */
+function modeFromBounds(min, max) {
   const now = S.pool.price;
-  if (S.max != null && S.max <= now * 1.002) return 'lower';
-  if (S.min != null && S.min >= now * 0.998) return 'upper';
+  if (max != null && max <= now * 1.002) return 'lower';
+  if (min != null && min >= now * 0.998) return 'upper';
   return 'wide';
 }
 
-function pctsFromRange() {
+const pctsFromRange = () => ({
+  low_pct: Math.max(0.01, Math.min(99, S.lowPct)),
+  up_pct: Math.max(0.01, S.upPct),
+});
+
+/* Batas tampilan diturunkan dari niat + harga sekarang. Untuk single-sided,
+   sisi yang menempel harga ikut bergerak bersama harga — persis seperti yang
+   nanti dihitung server, jadi tidak ada lagi MAX yang "ketinggalan" di atas
+   harga dan membalik mode. */
+function applyIntent(refresh = true) {
   const now = S.pool.price;
-  return {
-    low_pct: Math.max(0.01, Math.min(99, (1 - (S.min ?? now) / now) * 100)),
-    up_pct: Math.max(0.01, ((S.max ?? now) / now - 1) * 100),
-  };
+  if (S.mode === 'lower') { S.min = now * (1 - S.lowPct / 100); S.max = now; }
+  else if (S.mode === 'upper') { S.min = now; S.max = now * (1 + S.upPct / 100); }
+  else { S.min = now * (1 - S.lowPct / 100); S.max = now * (1 + S.upPct / 100); }
+  syncFromDrag(refresh);
 }
 
 let prevT;
@@ -393,7 +418,18 @@ function syncFromDrag(final) {
   setPct('#maxPct', ((S.max ?? now) / now - 1) * 100);
   setPriceLines();
   clearTimeout(prevT);
-  prevT = setTimeout(refreshPreview, final ? 0 : 400);
+  if (final !== null) prevT = setTimeout(refreshPreview, final ? 0 : 400);
+}
+
+/* Dipanggil setiap kali user selesai menggeser: batas yang kelihatan
+   diterjemahkan balik jadi niat (mode + persen). */
+function commitDrag() {
+  const now = S.pool.price;
+  S.mode = modeFromBounds(S.min, S.max);
+  if (S.mode !== 'upper') S.lowPct = Math.max(0.01, Math.min(99, (1 - S.min / now) * 100));
+  if (S.mode !== 'lower') S.upPct = Math.max(0.01, (S.max / now - 1) * 100);
+  for (const x of $('#presets').querySelectorAll('button')) x.classList.remove('on');
+  syncFromDrag(true);
 }
 
 function setPct(sel, v) {
@@ -403,12 +439,10 @@ function setPct(sel, v) {
 }
 
 function applyPreset(mode, low, up) {
-  const now = S.pool.price;
   S.mode = mode;
-  if (mode === 'lower') { S.min = now * (1 - low / 100); S.max = now; }
-  else if (mode === 'upper') { S.min = now; S.max = now * (1 + up / 100); }
-  else { S.min = now * (1 - low / 100); S.max = now * (1 + up / 100); }
-  syncFromDrag(true);
+  if (low) S.lowPct = low;
+  if (up) S.upPct = up;
+  applyIntent();
 }
 
 // Penjaga urutan: drag cepat bisa memicu beberapa /api/preview sekaligus.
@@ -420,7 +454,6 @@ async function refreshPreview() {
   if (!S.pool) return;
   const seq = ++previewSeq;
   const poolKey = S.pool.key;
-  S.mode = modeFromRange();
   const {low_pct, up_pct} = pctsFromRange();
   const body = {
     key: poolKey, mode: S.mode, low_pct, up_pct,
@@ -454,12 +487,22 @@ async function refreshPreview() {
 /* Harga bergerak terus. Kalau S.pool.price basi, persen range dihitung
    terhadap harga lama → preset −30% bisa tampil jadi −66%. Setiap respons
    server membawa harga terbaru; pakai itu. */
-function setPrice(p) {
+function setPrice(p, reanchor = false) {
   if (!(p > 0) || !S.pool) return;
-  if (Math.abs(p / S.pool.price - 1) < 1e-9) return;
+  const moved = Math.abs(p / S.pool.price - 1);
+  if (moved < 1e-9) return;
   S.pool.price = p;
   S.pool.price_usd = p * S.pool.quote_usd;
   renderStats();
+  /* Harga bergerak → batas tampilan digeser ulang dari niat, supaya sisi
+     single-sided tetap menempel harga. Tanpa ini MAX ketinggalan di atas
+     harga dan range "single" berubah sendiri jadi dua sisi. */
+  if (reanchor && moved > 0.0005 && !dragging && !liqDrag && S.pool.ver !== 2) {
+    const now = S.pool.price;
+    if (S.mode === 'lower') S.max = now;
+    else if (S.mode === 'upper') S.min = now;
+    syncFromDrag(null);   // gambar ulang saja, jangan picu preview beruntun
+  }
   drawLiq(); drawAna();
 }
 
@@ -516,7 +559,7 @@ async function loadCandles() {
     S.candles = r.candles;
     if (r.quote_usd) S.pool.quote_usd = r.quote_usd;
     if (r.supply) S.pool.supply = r.supply;
-    setPrice(r.price);
+    setPrice(r.price, true);
     applyCandles();
     $('#srcinfo').textContent = r.candles.length
       ? `${r.candles.length} candle · sumber: ${r.source}`
@@ -854,10 +897,13 @@ $('#amt').oninput = () => {
 };
 for (const id of ['#minIn', '#maxIn']) {
   $(id).onchange = () => {
-    const v = parseFloat(String($(id).value).replace(/[$,KMB\s]/gi, ''));
+    const raw = String($(id).value).trim();
+    let v = parseFloat(raw.replace(/[$,\s]/g, ''));
+    const suf = raw.slice(-1).toUpperCase();          // terima "12.5M" / "800K"
+    if (suf === 'K') v *= 1e3; else if (suf === 'M') v *= 1e6; else if (suf === 'B') v *= 1e9;
     if (!(v > 0)) return;
     setBound(id === '#minIn' ? 'min' : 'max', fromUnit(v));
-    syncFromDrag(true);
+    commitDrag();
   };
 }
 for (const b of $('#unitsw').querySelectorAll('button')) {
