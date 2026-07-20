@@ -737,39 +737,145 @@ async function doMint() {
 }
 
 // ══════════ positions ══════════
+/* Pantauan live: selama tab Positions terbuka, data ditarik ulang berkala dan
+   angkanya di-patch di tempat. Render ulang penuh hanya kalau daftar posisinya
+   berubah — kalau tidak, kartu berkedip dan tombol kehilangan fokus. */
+let posTimer = null, posSeq = 0;
+const POLL_MS = 12000;
+
+function posLive(state, txt) {
+  $('#posLive').className = 'live ' + state;
+  $('#posLiveTxt').textContent = txt;
+}
+
 async function loadPositions(fresh) {
+  const seq = ++posSeq;
   if (!$('#poslist').querySelector('.pos'))
     $('#poslist').innerHTML = '<div class="empty"><span class="spin"></span> memuat posisi...</div>';
-  $('#posRefresh').disabled = true;
+  if (fresh) { $('#posRefresh').disabled = true; posLive('busy', 'menyegarkan…'); }
   try {
-    const r = await api('/api/positions?chain=' + S.chain + (fresh ? '&fresh=1' : '') +
+    const r = await api('/api/positions?chain=' + S.chain + (fresh ? '&fresh=1' : '&ttl=8') +
                         (TOKEN ? '&t=' + encodeURIComponent(TOKEN) : ''));
-    const s = r.summary;
-    const net = s.withdrawals + s.fees_claimed - s.deposits;
-    $('#pnl').innerHTML = `
-      <div><small>Total value</small><b>${usd(s.total_value)}</b></div>
-      <div><small>PnL tercatat</small><b class="${(s.pnl ?? 0) >= 0 ? 'ok' : 'bad'}">${s.pnl == null ? '—' : usd(s.pnl)}</b></div>
-      <div><small>Fee unclaimed</small><b class="ok">${usd(s.unclaimed)}</b></div>
-      <div><small>Fee terklaim</small><b>${usd(s.fees_claimed)}</b></div>
-      <div><small>Posisi terbuka</small><b>${s.open}</b></div>
-      <div><small>In range</small><b>${s.in_range} / ${s.open}</b></div>`;
-    $('#posSub').innerHTML = `Live dari chain · realized ${usd(net)} (deposit ${usd(s.deposits)}, withdraw ${usd(s.withdrawals)})`
-      + (r.stale ? ' · <span class="dim"><span class="spin"></span> menyegarkan…</span>' : '');
-    if (r.stale) setTimeout(() => loadPositions(), 6000);   // ambil hasil refresh latar
-    if (!r.positions.length) {
-      $('#poslist').innerHTML = '<div class="empty">Belum ada posisi aktif.</div>';
+    if (seq !== posSeq) return;
+    if (r.building) {                        // build pertama masih jalan di server
+      posLive('busy', 'memuat posisi…');
+      if (!$('#poslist').querySelector('.pos'))
+        $('#poslist').innerHTML = '<div class="empty"><span class="spin"></span> memuat posisi dari chain…</div>';
+      setTimeout(() => loadPositions(), 3000);
       return;
     }
-    $('#poslist').innerHTML = r.positions.map(posCard).join('');
-    for (const b of $('#poslist').querySelectorAll('button[data-act]')) {
-      b.onclick = () => posAction(b.dataset.pid, b.dataset.act, b.dataset.ver);
-    }
+    renderPositions(r);
+    posLive(r.stale ? 'busy' : 'on',
+      `Live · ${r.summary.in_range}/${r.summary.open} in range` +
+      (r.stale ? ' · menyegarkan…' : ''));
+    if (r.stale) setTimeout(() => loadPositions(), 5000);   // ambil hasil refresh latar
   } catch (e) {
-    $('#poslist').innerHTML = `<div class="empty bad">${e.message}</div>`;
+    if (seq !== posSeq) return;
+    posLive('off', 'terputus: ' + e.message);
+    if (!$('#poslist').querySelector('.pos'))
+      $('#poslist').innerHTML = `<div class="empty bad">${e.message}</div>`;
   } finally {
     $('#posRefresh').disabled = false;
   }
 }
+
+function renderPositions(r) {
+  const s = r.summary;
+  const net = s.withdrawals + s.fees_claimed - s.deposits;
+  setField('#pnl', 'total', usd(s.total_value));
+  setField('#pnl', 'pnl', s.pnl == null ? '—' : usd(s.pnl), (s.pnl ?? 0) >= 0 ? 'ok' : 'bad');
+  setField('#pnl', 'uncl', usd(s.unclaimed), 'ok');
+  setField('#pnl', 'claimed', usd(s.fees_claimed));
+  setField('#pnl', 'open', String(s.open));
+  setField('#pnl', 'inrange', `${s.in_range} / ${s.open}`);
+  if (!$('#pnl').querySelector('[data-f]')) {
+    $('#pnl').innerHTML = `
+      <div><small>Total value</small><b data-f="total">${usd(s.total_value)}</b></div>
+      <div><small>PnL</small><b data-f="pnl" class="${(s.pnl ?? 0) >= 0 ? 'ok' : 'bad'}">${s.pnl == null ? '—' : usd(s.pnl)}</b></div>
+      <div><small>Fee unclaimed</small><b data-f="uncl" class="ok">${usd(s.unclaimed)}</b></div>
+      <div><small>Fee terklaim</small><b data-f="claimed">${usd(s.fees_claimed)}</b></div>
+      <div><small>Posisi terbuka</small><b data-f="open">${s.open}</b></div>
+      <div><small>In range</small><b data-f="inrange">${s.in_range} / ${s.open}</b></div>`;
+  }
+  $('#posSub').innerHTML =
+    `realized ${usd(net)} (deposit ${usd(s.deposits)}, withdraw ${usd(s.withdrawals)})` +
+    ` · diperbarui ${new Date((r.ts || Date.now() / 1000) * 1000).toLocaleTimeString('id-ID')}`;
+
+  if (!r.positions.length) {
+    $('#poslist').innerHTML = '<div class="empty">Belum ada posisi aktif.</div>';
+    return;
+  }
+  const ids = r.positions.map(p => p.pid).join(',');
+  if (ids !== $('#poslist').dataset.ids) {
+    $('#poslist').dataset.ids = ids;
+    $('#poslist').innerHTML = r.positions.map(posCard).join('');
+    for (const b of $('#poslist').querySelectorAll('button[data-act]')) {
+      b.onclick = () => posAction(b.dataset.pid, b.dataset.act, b.dataset.ver);
+    }
+    return;
+  }
+  for (const p of r.positions) patchCard(p);
+}
+
+// tulis hanya kalau isinya berubah, lalu kedipkan sebentar
+function setField(scope, name, val, cls) {
+  const el = document.querySelector(`${scope} [data-f="${name}"]`);
+  if (!el || el.textContent === val) return;
+  el.textContent = val;
+  if (cls !== undefined) el.className = cls;
+  el.classList.remove('flash');
+  void el.offsetWidth;
+  el.classList.add('flash');
+}
+
+function patchCard(p) {
+  const sc = `#pos-${cssId(p.pid)}`;
+  const card = document.querySelector(sc);
+  if (!card) return;
+  const pnl = p.pnl_usd;
+  const pnlPct = (pnl != null && p.deposit_usd) ? (pnl / p.deposit_usd * 100) : null;
+  setField(sc, 'value', usd(p.value_usd));
+  setField(sc, 'uncl', usd(p.unclaimed_usd));
+  setField(sc, 'dep', p.deposit_usd ? usd(p.deposit_usd) : '—');
+  setField(sc, 'claimed', usd(p.fees_claimed_usd));
+  setField(sc, 'qamt', amt(p.quote_amount));
+  setField(sc, 'mamt', amt(p.meme_amount));
+  setField(sc, 'age', p.age || '');
+  setField(sc, 'pnl', pnl == null ? 'PnL belum tercatat'
+    : `${pnl >= 0 ? '▲' : '▼'} ${usd(pnl)}${pnlPct == null ? '' : ` (${pctTxt(pnlPct)})`}`,
+    `tag ${pnl == null ? 'neutral' : pnl >= 0 ? 'up' : 'down'}`);
+  setField(sc, 'inrange', p.in_range ? '● in range' : '○ out of range',
+    `tag ${p.in_range ? 'in' : 'out'}`);
+  setField(sc, 'note', rangeNote(p));
+  const bar = card.querySelector('.rbar');
+  if (bar && p.price_lower != null) {
+    const lo = Math.log(p.price_lower), hi = Math.log(p.price_upper);
+    const at = Math.max(0, Math.min(1, (Math.log(p.price_now) - lo) / (hi - lo || 1)));
+    bar.querySelector('b').style.left = at * 100 + '%';
+    [...bar.querySelectorAll('u')].forEach((u, i) => {
+      u.className = ((i + .5) / 34 <= at) ? 'a' : 'b';
+    });
+  }
+}
+
+const cssId = pid => String(pid).replace(/[^a-zA-Z0-9]/g, '_');
+
+function rangeNote(p) {
+  if (p.ver === 2 || p.price_lower == null) return 'full range';
+  return p.in_range
+    ? `in range · ${nf(p.to_min_pct, 1)}% ke min · ${nf(p.to_max_pct, 1)}% ke max`
+    : (p.price_now > p.price_upper
+        ? `out of range · harga ${nf((p.price_now / p.price_upper - 1) * 100, 1)}% di atas range`
+        : `out of range · harga ${nf((1 - p.price_now / p.price_lower) * 100, 1)}% di bawah range`);
+}
+
+function startPosPolling() {
+  stopPosPolling();
+  posTimer = setInterval(() => {
+    if (!S.busy && !document.hidden && !$('#view-pos').classList.contains('hide')) loadPositions();
+  }, POLL_MS);
+}
+function stopPosPolling() { if (posTimer) { clearInterval(posTimer); posTimer = null; } }
 
 /* Bar range ala UI LP: kotak-kotak dari MIN ke MAX, penanda harga sekarang.
    Bagian yang "terpakai" (sisi token yang masih dipegang) diwarnai. */
@@ -797,36 +903,31 @@ function posCard(p) {
   const ver = p.ver || (String(p.pid).startsWith('v4') ? 4 : String(p.pid).startsWith('v2') ? 2 : 3);
   const pnl = p.pnl_usd;
   const pnlPct = (pnl != null && p.deposit_usd) ? (pnl / p.deposit_usd * 100) : null;
-  const dist = p.ver === 2 || p.price_lower == null ? 'full range' :
-    p.in_range
-      ? `in range · ${nf(p.to_min_pct, 1)}% ke min · ${nf(p.to_max_pct, 1)}% ke max`
-      : (p.price_now > p.price_upper
-          ? `out of range · harga ${nf((p.price_now / p.price_upper - 1) * 100, 1)}% di atas range`
-          : `out of range · harga ${nf((1 - p.price_now / p.price_lower) * 100, 1)}% di bawah range`);
-  return `<div class="pos">
+  const pnlTxt = pnl == null ? 'PnL belum tercatat'
+    : `${pnl >= 0 ? '▲' : '▼'} ${usd(pnl)}${pnlPct == null ? '' : ` (${pctTxt(pnlPct)})`}`;
+  return `<div class="pos" id="pos-${cssId(p.pid)}">
     <div class="top">
       <span class="name">${p.quote_sym || p.sym1} / ${p.meme_sym || p.sym0}</span>
       <span class="badge v${ver}">v${ver}</span>
       <span class="chip">${(p.fee / 10000).toFixed(2)}%</span>
       <span class="chip mono">${p.pid}</span>
-      <span class="dim" style="margin-left:auto">${p.age || ''}</span>
+      <span class="dim" data-f="age" style="margin-left:auto">${p.age || ''}</span>
     </div>
     <div class="tags">
-      ${pnl == null ? '<span class="tag neutral">PnL belum tercatat</span>' :
-        `<span class="tag ${pnl >= 0 ? 'up' : 'down'}" title="${p.basis === 'onchain'
-          ? 'modal dibaca dari event on-chain, dinilai pada harga sekarang (sudah termasuk impermanent loss)'
-          : 'dari riwayat lokal bot'}">${pnl >= 0 ? '▲' : '▼'} ${usd(pnl)}${pnlPct == null ? '' : ` (${pctTxt(pnlPct)})`}</span>`}
-      <span class="tag ${p.in_range ? 'in' : 'out'}">${p.in_range ? '● in range' : '○ out of range'}</span>
+      <span data-f="pnl" class="tag ${pnl == null ? 'neutral' : pnl >= 0 ? 'up' : 'down'}" title="${p.basis === 'onchain'
+        ? 'modal dari event on-chain, dinilai pada harga sekarang (sudah termasuk impermanent loss)'
+        : 'dari riwayat lokal bot'}">${pnlTxt}</span>
+      <span data-f="inrange" class="tag ${p.in_range ? 'in' : 'out'}">${p.in_range ? '● in range' : '○ out of range'}</span>
     </div>
     ${rangeBar(p)}
-    <div class="posnote dim">${dist}</div>
+    <div class="posnote dim" data-f="note">${rangeNote(p)}</div>
     <div class="kv">
-      <div><span>Value</span><b>${usd(p.value_usd)}</b></div>
-      <div><span>Deposited</span><b>${p.deposit_usd ? usd(p.deposit_usd) : '—'}</b></div>
-      <div><span>Fee unclaimed</span><b class="ok">${usd(p.unclaimed_usd)}</b></div>
-      <div><span>Fee terklaim</span><b>${usd(p.fees_claimed_usd)}</b></div>
-      <div><span>${p.quote_sym || 'quote'}</span><b class="mono">${amt(p.quote_amount)}</b></div>
-      <div><span>${p.meme_sym || 'token'}</span><b class="mono">${amt(p.meme_amount)}</b></div>
+      <div><span>Value</span><b data-f="value">${usd(p.value_usd)}</b></div>
+      <div><span>Deposited</span><b data-f="dep">${p.deposit_usd ? usd(p.deposit_usd) : '—'}</b></div>
+      <div><span>Fee unclaimed</span><b data-f="uncl" class="ok">${usd(p.unclaimed_usd)}</b></div>
+      <div><span>Fee terklaim</span><b data-f="claimed">${usd(p.fees_claimed_usd)}</b></div>
+      <div><span>${p.quote_sym || 'quote'}</span><b data-f="qamt" class="mono">${amt(p.quote_amount)}</b></div>
+      <div><span>${p.meme_sym || 'token'}</span><b data-f="mamt" class="mono">${amt(p.meme_amount)}</b></div>
     </div>
     <div class="acts">
       ${ver === 2 ? '' : `<button class="primary sm" data-act="rebalance" data-pid="${p.pid}" data-ver="${ver}">⚖️ Rebalance</button>
@@ -955,9 +1056,13 @@ for (const t of document.querySelectorAll('.tab')) {
     const pos = t.dataset.view === 'pos';
     $('#view-pool').classList.toggle('hide', pos);
     $('#view-pos').classList.toggle('hide', !pos);
-    if (pos) loadPositions();
+    if (pos) { loadPositions(); startPosPolling(); } else stopPosPolling();
   };
 }
+// jeda polling saat tab browser disembunyikan, sambung lagi saat kembali
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && !$('#view-pos').classList.contains('hide')) loadPositions();
+});
 $('#chain').onchange = async e => {
   await api('/api/settings', {chain: +e.target.value});
   location.reload();

@@ -1402,6 +1402,9 @@ def _meme_usd(w3: Web3, chain_id: int, pool_info: dict) -> float:
 
 
 # ---------- Listing posisi ----------
+_TID_CACHE: dict = {}   # (chain, wallet) → (jumlah NFT, daftar tokenId)
+
+
 def list_positions(chain_id: int, pk: str, max_positions: int = 40) -> list[dict]:
     w3 = get_w3(chain_id)
     cfg = CHAINS[chain_id]
@@ -1410,9 +1413,17 @@ def list_positions(chain_id: int, pk: str, max_positions: int = 40) -> list[dict
     factory = w3.eth.contract(address=Web3.to_checksum_address(cfg["factory"]), abi=FACTORY_ABI)
 
     n = npm.functions.balanceOf(account.address).call()
+    # Daftar tokenId cuma berubah saat mint/close. Selama jumlahnya sama, pakai
+    # yang tersimpan — hemat n panggilan tokenOfOwnerByIndex tiap kali refresh.
+    ck = (chain_id, account.address.lower())
+    hit = _TID_CACHE.get(ck)
     idxs = list(range(n - 1, max(-1, n - 1 - max_positions), -1))  # terbaru dulu
     with ThreadPoolExecutor(max_workers=5) as ex:
-        tids = list(ex.map(lambda i: npm.functions.tokenOfOwnerByIndex(account.address, i).call(), idxs))
+        if hit and hit[0] == n and len(hit[1]) == len(idxs):
+            tids = hit[1]
+        else:
+            tids = list(ex.map(lambda i: npm.functions.tokenOfOwnerByIndex(account.address, i).call(), idxs))
+            _TID_CACHE[ck] = (n, tids)
         raws = list(ex.map(lambda t: npm.functions.positions(t).call(), tids))
 
         active = [(tid, p) for tid, p in zip(tids, raws)
@@ -1421,13 +1432,22 @@ def list_positions(chain_id: int, pk: str, max_positions: int = 40) -> list[dict
     return [r for r in results if r]
 
 
+def pool_addr_of(factory, t0: str, t1: str, fee: int, _cache={}) -> str:
+    """factory.getPool — pemetaan immutable, aman di-cache selamanya.
+    Menghemat 1 panggilan RPC per posisi tiap kali daftar posisi disegarkan."""
+    key = (t0.lower(), t1.lower(), fee)
+    if key not in _cache:
+        _cache[key] = factory.functions.getPool(t0, t1, fee).call()
+    return _cache[key]
+
+
 def _position_detail(w3: Web3, chain_id: int, npm, factory, account, tid: int, p) -> dict | None:
     cfg = CHAINS[chain_id]
     try:
         (_, _, t0, t1, fee, tick_lo, tick_hi, liq, _, _, owed0, owed1) = p
 
         i0, i1 = token_info(w3, t0), token_info(w3, t1)
-        pool_addr = factory.functions.getPool(t0, t1, fee).call()
+        pool_addr = pool_addr_of(factory, t0, t1, fee)
         slot0 = w3.eth.contract(address=Web3.to_checksum_address(pool_addr), abi=POOL_ABI).functions.slot0().call()
         sqrtp, cur_tick = slot0[0], slot0[1]
 

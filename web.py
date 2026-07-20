@@ -575,6 +575,7 @@ def _block_ts(chain_id: int, n: int, _cache={}) -> int | None:
 
 _POS_CACHE: dict = {}
 _POS_LOCK = threading.Lock()
+_POS_REFRESHING: dict = {}
 
 
 def api_positions(q, _b) -> dict:
@@ -582,25 +583,53 @@ def api_positions(q, _b) -> dict:
     data baru menyusul. Tanpa ini tiap buka tab menunggu puluhan panggilan RPC."""
     cid = int(q.get("chain", [store.load_settings()["chain"]])[0])
     fresh = q.get("fresh", ["0"])[0] == "1"
+    ttl = float(q.get("ttl", ["8"])[0])      # polling live pakai ttl kecil
     ck = (cid, bot.active_wallet_idx())
     hit = _POS_CACHE.get(ck)
-    if hit and not fresh and time.time() - hit[1] < 20:
-        return {**hit[0], "cached": True}
-    if hit and not fresh and not _POS_LOCK.locked():
-        # sajikan yang lama, muat ulang di belakang layar
-        threading.Thread(target=_positions_refresh, args=(cid, ck), daemon=True).start()
-        return {**hit[0], "cached": True, "stale": True}
-    res = _positions_build(cid)
-    _POS_CACHE[ck] = (res, time.time())
-    return res
+
+    def stale(extra=None):
+        return {**hit[0], "cached": True, "stale": bool(extra),
+                "age": round(time.time() - hit[1], 1), **(extra or {})}
+
+    if hit and not fresh and time.time() - hit[1] < ttl:
+        return {**hit[0], "cached": True, "age": round(time.time() - hit[1], 1)}
+    if hit:
+        # Cache ada → UI tidak pernah menunggu. Muat ulang di latar (single-flight);
+        # kalau refresh gagal (mis. RPC 429), cache lama tetap disajikan.
+        if not _POS_REFRESHING.get(ck):
+            _POS_REFRESHING[ck] = True
+            threading.Thread(target=_positions_refresh, args=(cid, ck), daemon=True).start()
+        return stale({"refreshing": True})
+
+    # Belum ada cache: satu build saja. Caller pertama membangun; caller lain
+    # (mis. poller yang menembak selama build lambat) tidak ikut antre di lock —
+    # mereka dibalas "membangun" supaya thread server tidak habis.
+    if not _POS_LOCK.acquire(blocking=False):
+        return {"positions": [], "summary": {}, "building": True}
+    try:
+        hit = _POS_CACHE.get(ck)
+        if hit:
+            return {**hit[0], "cached": True, "age": round(time.time() - hit[1], 1)}
+        try:
+            res = _positions_build(cid)
+        except Exception as e:
+            # gagal build pertama (mis. RPC rate-limit) — jangan lempar 400, suruh
+            # klien coba lagi; belum ada cache untuk disajikan
+            return {"positions": [], "summary": {}, "building": True, "warn": str(e)[:200]}
+        _POS_CACHE[ck] = (res, time.time())
+        return res
+    finally:
+        _POS_LOCK.release()
 
 
 def _positions_refresh(cid: int, ck):
-    with _POS_LOCK:
-        try:
-            _POS_CACHE[ck] = (_positions_build(cid), time.time())
-        except Exception:
-            pass
+    try:
+        res = _positions_build(cid)
+        _POS_CACHE[ck] = (res, time.time())
+    except Exception:
+        pass          # simpan cache lama; percobaan berikutnya coba lagi
+    finally:
+        _POS_REFRESHING[ck] = False
 
 
 def _positions_build(cid: int) -> dict:
@@ -688,7 +717,7 @@ def _positions_build(cid: int) -> dict:
     summ["in_range"] = sum(1 for p in out if p.get("in_range"))
     known = [p for p in out if p.get("pnl_usd") is not None]
     summ["pnl"] = sum(p["pnl_usd"] for p in known) if known else None
-    return {"positions": out, "summary": summ}
+    return {"positions": out, "summary": summ, "ts": int(time.time())}
 
 
 def ev_id(pid):
