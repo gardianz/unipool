@@ -78,6 +78,7 @@ main{max-width:1180px;margin:0 auto;padding:20px 18px 90px}
   border:1px solid var(--acc);color:var(--acc)}
 .presets{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px}
 .presets button{border-radius:20px;font-size:12px;padding:6px 13px}
+.presets .customchip{border-style:dashed}
 .hint{font-size:11px;color:var(--dim)}
 .tfrow{display:flex;align-items:center;gap:10px;margin-bottom:8px;flex-wrap:wrap}
 .tfs{display:flex;gap:4px}

@@ -372,28 +372,44 @@ def _budget(cid: int, p: dict, tk: dict, mode: str, b: dict) -> float:
     return bot.compute_amount(ctx)
 
 
+def _strategy(b, p, tk, cur, sp) -> tuple[dict, int, int, str]:
+    """Strategi + (tick_lower, tick_upper, mode efektif).
+    Kalau klien mengirim price_lower/price_upper, range dipakai apa adanya —
+    letaknya bebas, termasuk seluruhnya di bawah/atas harga sekarang. Mode
+    (sisi token yang disetor) diturunkan dari letak range, bukan dipilih user."""
+    q1 = p["quote_is_token1"]
+    if b.get("price_lower") and b.get("price_upper"):
+        lo, hi = ch.ticks_from_prices(float(b["price_lower"]), float(b["price_upper"]),
+                                      p["fee"], q1, tk["decimals"], p["quote_decimals"], sp)
+        return {"mode": "custom", "ticks": (lo, hi)}, lo, hi, ch.effective_mode(lo, hi, cur, q1)
+    mode = str(b.get("mode", "lower"))
+    st = {"mode": mode,
+          "low_pct": max(0.01, min(float(b.get("low_pct", 20)), 99.0)),
+          "up_pct": max(0.01, float(b.get("up_pct", 20))),
+          "gap": int(b.get("gap", store.load_settings().get("gap", 1)))}
+    lo, hi = ch.calc_strategy_range(cur, p["fee"], q1, mode, st["low_pct"], st["up_pct"],
+                                    st["gap"], spacing=sp)
+    return st, lo, hi, mode
+
+
 def api_preview(_q, b) -> dict:
-    """Range final + komposisi deposit. Tick dihitung server pakai
-    calc_strategy_range yang sama dengan bot — chart cuma kirim persen."""
+    """Range final + komposisi deposit. Tick selalu dihitung server (dibulatkan
+    ke tick spacing) — klien cuma mengirim batas yang diinginkan."""
     cid, p, tk = _pool(b)
     ver = p.get("ver", 3)
-    mode = str(b.get("mode", "lower"))
-    low = max(0.01, min(float(b.get("low_pct", 20)), 99.0))
-    up = max(0.01, float(b.get("up_pct", 20)))
-    gap = int(b.get("gap", store.load_settings().get("gap", 1)))
     tdec = tk["decimals"]
     cur = cur_tick_of(cid, p)
     now = meme_price_at(p, tdec, cur)
-    amount = _budget(cid, p, tk, mode, b)
-    dep_sym = tk["symbol"] if mode == "upper" else p["quote_sym"]
 
     if ver == 2:
-        return {"ver": 2, "price": now, "amount": amount, "dep_sym": dep_sym,
+        amount = _budget(cid, p, tk, "lower", b)
+        return {"ver": 2, "price": now, "amount": amount, "dep_sym": p["quote_sym"],
                 "usd": amount * p["quote_usd"], "full_range": True}
 
     sp = int(p.get("tick_spacing") or ch.TICK_SPACING.get(p["fee"], 60))
-    lo, hi = ch.calc_strategy_range(cur, p["fee"], p["quote_is_token1"], mode,
-                                    low, up, gap, spacing=sp)
+    _st, lo, hi, mode = _strategy(b, p, tk, cur, sp)
+    amount = _budget(cid, p, tk, mode, b)
+    dep_sym = tk["symbol"] if mode == "upper" else p["quote_sym"]
     p_lo, p_hi = sorted([meme_price_at(p, tdec, lo), meme_price_at(p, tdec, hi)])
     usd = amount * (p["quote_usd"] if mode != "upper" else now * p["quote_usd"])
 
@@ -420,6 +436,7 @@ def api_preview(_q, b) -> dict:
         "pct_upper": (p_hi / now - 1) * 100 if now else 0,
         "in_range": p_lo <= now <= p_hi,
         "amount": amount, "dep_sym": dep_sym, "usd": usd, "comp": comp,
+        "custom": bool(b.get("price_lower") and b.get("price_upper")),
         "mc_lower": p_lo * p["quote_usd"] * b.get("supply", 0) if b.get("supply") else None,
         "mc_upper": p_hi * p["quote_usd"] * b.get("supply", 0) if b.get("supply") else None,
     }
@@ -429,11 +446,11 @@ def api_mint(_q, b) -> dict:
     cid, p, tk = _pool(b)
     ver = p.get("ver", 3)
     s = store.load_settings()
-    mode = str(b.get("mode", "lower"))
-    strategy = {"mode": mode,
-                "low_pct": max(0.01, min(float(b.get("low_pct", 20)), 99.0)),
-                "up_pct": max(0.01, float(b.get("up_pct", 20))),
-                "gap": int(b.get("gap", s.get("gap", 1)))}
+    if ver == 2:
+        strategy, mode = {"mode": "lower"}, "lower"
+    else:
+        sp = int(p.get("tick_spacing") or ch.TICK_SPACING.get(p["fee"], 60))
+        strategy, _lo, _hi, mode = _strategy(b, p, tk, cur_tick_of(cid, p), sp)
     slip = float(b.get("slippage_pct", s["slippage_pct"]))
     amount = _budget(cid, p, tk, mode, b)
     if amount <= 0:
@@ -507,22 +524,23 @@ def _words(hexdata: str) -> list[int]:
     return [int(hexdata[i:i + 64], 16) for i in range(0, len(hexdata) - 63, 64)]
 
 
-def cost_basis(chain_id: int, tid: int, _cache={}) -> dict | None:
+def cost_basis(chain_id: int, tid: int, _cache={}, ttl: int = 900) -> dict | None:
     """Modal & hasil tarikan posisi v3 langsung dari event NPM (bukan dari
     history.json lokal) — supaya PnL tetap benar walau posisinya di-mint di
     luar bot ini. None kalau RPC tidak mendukung getLogs rentang penuh."""
     ck = (chain_id, int(tid))
     hit = _cache.get(ck)
-    if hit and time.time() - hit[1] < 120:
+    if hit and time.time() - hit[1] < ttl:
         return hit[0]
     npm = ch.CHAINS[chain_id]["npm"]
     t1 = "0x" + f"{int(tid):064x}"
-    inc = _logs(chain_id, npm, NPM_TOPICS["inc"], t1)
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=3) as ex:   # 3 query sekaligus, bukan berurutan
+        inc, dec, col = ex.map(lambda k: _logs(chain_id, npm, NPM_TOPICS[k], t1),
+                               ("inc", "dec", "col"))
     if not inc:
         _cache[ck] = (None, time.time())
         return None
-    dec = _logs(chain_id, npm, NPM_TOPICS["dec"], t1)
-    col = _logs(chain_id, npm, NPM_TOPICS["col"], t1)
 
     d0 = d1 = w0 = w1 = c0 = c1 = 0
     for lg in inc:                     # (liquidity, amount0, amount1)
@@ -555,8 +573,37 @@ def _block_ts(chain_id: int, n: int, _cache={}) -> int | None:
     return _cache[n]
 
 
+_POS_CACHE: dict = {}
+_POS_LOCK = threading.Lock()
+
+
 def api_positions(q, _b) -> dict:
+    """Cache pendek + refresh di latar: buka tab Positions langsung tampil,
+    data baru menyusul. Tanpa ini tiap buka tab menunggu puluhan panggilan RPC."""
     cid = int(q.get("chain", [store.load_settings()["chain"]])[0])
+    fresh = q.get("fresh", ["0"])[0] == "1"
+    ck = (cid, bot.active_wallet_idx())
+    hit = _POS_CACHE.get(ck)
+    if hit and not fresh and time.time() - hit[1] < 20:
+        return {**hit[0], "cached": True}
+    if hit and not fresh and not _POS_LOCK.locked():
+        # sajikan yang lama, muat ulang di belakang layar
+        threading.Thread(target=_positions_refresh, args=(cid, ck), daemon=True).start()
+        return {**hit[0], "cached": True, "stale": True}
+    res = _positions_build(cid)
+    _POS_CACHE[ck] = (res, time.time())
+    return res
+
+
+def _positions_refresh(cid: int, ck):
+    with _POS_LOCK:
+        try:
+            _POS_CACHE[ck] = (_positions_build(cid), time.time())
+        except Exception:
+            pass
+
+
+def _positions_build(cid: int) -> dict:
     key = bot.pk()
     addr = bot._addr_of(key)
     pos = ch.list_all_positions(cid, key, store.refs(cid, addr, "v2"), store.refs(cid, addr, "v4"))

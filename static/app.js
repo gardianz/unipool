@@ -67,12 +67,14 @@ $('#modal').addEventListener('click', e => { if (e.target.id === 'modal') closeM
 const S = {
   chain: null, settings: {}, token: null, pools: [], pool: null,
   tf: '15m', candles: [], min: null, max: null,
-  // Niat user = (mode, lowPct, upPct). Ini sumber kebenaran, BUKAN S.min/S.max.
-  // Harga meme bergerak terus; kalau mode disimpulkan ulang dari batas absolut
-  // tiap kali harga berubah, range single-sided bisa berubah sendiri jadi dua
-  // sisi — dan mint dua sisi menukar separuh modal ke meme. Mode hanya berubah
-  // kalau user yang mengubahnya (preset atau drag melewati harga).
-  mode: 'lower', lowPct: 30, upPct: 30,
+  /* Dua cara menentukan range:
+     - preset aktif  → batas diturunkan dari harga sekarang (ikut bergerak),
+                       server yang menghitung tick termasuk jarak aman dari harga
+     - preset null    → range CUSTOM: batas absolut, ditaruh persis di mana user
+                       menaruhnya. Boleh seluruhnya di bawah/atas harga sekarang
+                       (mis. harga 60k, range 20k–40k) dan tidak akan ditarik
+                       balik menempel harga. */
+  preset: 'lower30', mode: 'lower', lowPct: 30, upPct: 30,
   preview: null, amountPct: 50, amountFixed: null, bars: [], busy: false,
   unit: 'mc',        // sumbu harga: market cap atau harga quote
   ana: 'liq',        // panel analytics: liquidity | volume
@@ -169,17 +171,17 @@ function initChart() {
   requestAnimationFrame(tick);
 }
 
-/* MIN/MAX tidak boleh saling melewati, dan tidak boleh nempel persis di harga
-   sekarang: single-sided butuh jarak minimal 1 tick-spacing dari harga, kalau
-   nempel liquidity-nya 0 dan mint revert. */
+/* Satu-satunya batasan: MIN < MAX dengan jarak minimal 1 tick-spacing.
+   Letak range terhadap harga sekarang TIDAK dibatasi — range boleh sepenuhnya
+   di bawah atau di atas harga. */
 function setBound(which, v) {
-  const now = S.pool.price;
-  const eps = Math.max(now * 0.002, now * (S.pool.tick_spacing || 60) * 1e-4);
+  const sp = S.pool.tick_spacing || 60;
+  const gapFrac = Math.pow(1.0001, sp) - 1;            // lebar 1 tick-spacing
   if (which === 'min') {
-    if (S.max != null && v > S.max - eps) v = S.max - eps;
-    S.min = Math.max(v, now * 1e-6);
+    if (S.max != null && v > S.max / (1 + gapFrac)) v = S.max / (1 + gapFrac);
+    S.min = Math.max(v, 1e-30);
   } else {
-    if (S.min != null && v < S.min + eps) v = S.min + eps;
+    if (S.min != null && v < S.min * (1 + gapFrac)) v = S.min * (1 + gapFrac);
     S.max = v;
   }
 }
@@ -212,16 +214,24 @@ function setPriceLines() {
 // ══════════ histogram likuiditas horizontal (sumbu-x = harga/MC) ══════════
 let liqDrag = null;
 
+/* Jendela histogram ditentukan oleh sebaran likuiditas + harga sekarang, dan
+   HANYA melebar untuk range yang tidak terlalu ekstrem. Kalau jendelanya
+   dipaksa memuat batas −97%, semua bar mampat jadi garis rambut di satu sisi. */
 function liqBounds() {
   const now = S.pool ? S.pool.price : 0;
-  let lo = Math.min(S.min ?? now, now) * 0.55;
-  let hi = Math.max(S.max ?? now, now) * 1.8;
+  let lo = now, hi = now;
   for (const b of S.bars) { lo = Math.min(lo, b.p0); hi = Math.max(hi, b.p1); }
-  // batasi ke sekitar harga supaya bar tidak jadi garis rambut
-  lo = Math.max(lo, now / 12);
-  hi = Math.min(hi, now * 12);
-  return [lo, hi];
+  if (!(lo > 0) || hi <= lo) { lo = now / 3; hi = now * 3; }
+  // sisakan ruang untuk garis MIN/MAX, tapi jangan lebih dari 3× lebar likuiditas
+  const span = Math.log(hi / lo);
+  const cap = Math.exp(span * 1.5);
+  if (S.min > 0) lo = Math.max(Math.min(lo, S.min * 0.9), hi / cap / 3);
+  if (S.max > 0) hi = Math.min(Math.max(hi, S.max * 1.1), lo * cap * 3);
+  return [Math.max(lo, now / 5000), Math.min(hi, now * 5000)];
 }
+
+// batas yang jatuh di luar jendela digambar menempel tepi, dengan tanda ‹ / ›
+const clampLog = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 
 function drawLiq() {
   const cv = $('#liq');
@@ -265,14 +275,18 @@ function drawLiq() {
 
   // area range + garis harga sekarang
   if (S.min != null && S.max != null) {
+    const xa = X(clampLog(S.min, lo, hi)), xb = X(clampLog(S.max, lo, hi));
+    g.fillStyle = 'rgba(200,255,46,.07)';
+    g.fillRect(xa, 0, Math.max(1, xb - xa), plotH);
     g.strokeStyle = '#c8ff2e'; g.lineWidth = 2;
     for (const [v, lbl] of [[S.min, 'MIN'], [S.max, 'MAX']]) {
-      const x = Math.max(1, Math.min(W - 1, X(v)));
+      const off = v < lo ? '‹' : v > hi ? '›' : '';    // batas di luar jendela
+      const x = Math.max(1, Math.min(W - 1, X(clampLog(v, lo, hi))));
       g.beginPath(); g.moveTo(x, 0); g.lineTo(x, plotH); g.stroke();
       g.fillStyle = '#c8ff2e';
-      g.fillRect(x - 14, 0, 28, 13);
+      g.fillRect(x - 17, 0, 34, 13);
       g.fillStyle = '#0b0d0c'; g.font = '700 9px ui-monospace,monospace'; g.textAlign = 'center';
-      g.fillText(lbl, x, 10);
+      g.fillText(off ? off + lbl : lbl, x, 10);
     }
   }
   const xn = X(now);
@@ -383,24 +397,25 @@ function note(g, W, H, txt) {
 }
 
 // ══════════ range ⇄ mode ══════════
-/* Mode disimpulkan HANYA saat user menggeser batas (aksi eksplisit), lalu
-   dikunci sebagai niat. Setelah itu harga boleh bergerak tanpa mengubahnya. */
+/* Sisi token yang disetor ditentukan oleh LETAK range terhadap harga, bukan
+   oleh pilihan user. Server memakai aturan yang sama (effective_mode). */
 function modeFromBounds(min, max) {
   const now = S.pool.price;
-  if (max != null && max <= now * 1.002) return 'lower';
-  if (min != null && min >= now * 0.998) return 'upper';
+  if (max != null && max <= now) return 'lower';   // range di bawah harga → setor quote
+  if (min != null && min >= now) return 'upper';   // range di atas harga  → setor token
   return 'wide';
 }
 
-const pctsFromRange = () => ({
-  low_pct: Math.max(0.01, Math.min(99, S.lowPct)),
-  up_pct: Math.max(0.01, S.upPct),
-});
+/* Yang dikirim ke server. Preset aktif → mode + persen (server menambah jarak
+   aman dari harga). Custom → batas harga apa adanya. */
+function rangeReq() {
+  if (S.preset) {
+    return {mode: S.mode, low_pct: Math.max(0.01, Math.min(99, S.lowPct)),
+            up_pct: Math.max(0.01, S.upPct)};
+  }
+  return {price_lower: S.min, price_upper: S.max};
+}
 
-/* Batas tampilan diturunkan dari niat + harga sekarang. Untuk single-sided,
-   sisi yang menempel harga ikut bergerak bersama harga — persis seperti yang
-   nanti dihitung server, jadi tidak ada lagi MAX yang "ketinggalan" di atas
-   harga dan membalik mode. */
 function applyIntent(refresh = true) {
   const now = S.pool.price;
   if (S.mode === 'lower') { S.min = now * (1 - S.lowPct / 100); S.max = now; }
@@ -421,15 +436,19 @@ function syncFromDrag(final) {
   if (final !== null) prevT = setTimeout(refreshPreview, final ? 0 : 400);
 }
 
-/* Dipanggil setiap kali user selesai menggeser: batas yang kelihatan
-   diterjemahkan balik jadi niat (mode + persen). */
+/* Begitu user menggeser/mengetik sendiri, range jadi CUSTOM: batasnya absolut,
+   tidak lagi diturunkan dari harga, jadi tidak akan tertarik balik ke harga. */
 function commitDrag() {
-  const now = S.pool.price;
+  S.preset = null;
   S.mode = modeFromBounds(S.min, S.max);
-  if (S.mode !== 'upper') S.lowPct = Math.max(0.01, Math.min(99, (1 - S.min / now) * 100));
-  if (S.mode !== 'lower') S.upPct = Math.max(0.01, (S.max / now - 1) * 100);
-  for (const x of $('#presets').querySelectorAll('button')) x.classList.remove('on');
+  markPreset();
   syncFromDrag(true);
+}
+
+function markPreset() {
+  for (const x of $('#presets').querySelectorAll('button')) {
+    x.classList.toggle('on', S.preset ? x.dataset.id === S.preset : x.dataset.id === 'custom');
+  }
 }
 
 function setPct(sel, v) {
@@ -438,10 +457,12 @@ function setPct(sel, v) {
   el.className = 'badge-pct ' + (v >= 0 ? 'up' : 'down');
 }
 
-function applyPreset(mode, low, up) {
+function applyPreset(id, mode, low, up) {
+  S.preset = id;
   S.mode = mode;
   if (low) S.lowPct = low;
   if (up) S.upPct = up;
+  markPreset();
   applyIntent();
 }
 
@@ -454,9 +475,9 @@ async function refreshPreview() {
   if (!S.pool) return;
   const seq = ++previewSeq;
   const poolKey = S.pool.key;
-  const {low_pct, up_pct} = pctsFromRange();
+  const req = rangeReq();
   const body = {
-    key: poolKey, mode: S.mode, low_pct, up_pct,
+    key: poolKey, ...req,
     amount_pct: S.amountFixed ? 0 : S.amountPct,
     amount_fixed: S.amountFixed, supply: S.pool.supply || 0,
   };
@@ -464,8 +485,9 @@ async function refreshPreview() {
   try {
     const p = await api('/api/preview', body);
     if (seq !== previewSeq || !S.pool || S.pool.key !== poolKey) return;  // sudah basi
-    p.req = {mode: S.mode, low_pct, up_pct};   // dipakai lagi saat mint, biar persis
+    p.req = req;                 // dipakai lagi saat mint, biar persis sama
     S.preview = p;
+    S.mode = p.mode || S.mode;   // sisi deposit ditentukan server dari letak range
     setPrice(p.price);
     if (p.ver !== 2) {
       // snap ke tick asli hasil server (sudah dibulatkan ke tick spacing)
@@ -494,10 +516,9 @@ function setPrice(p, reanchor = false) {
   S.pool.price = p;
   S.pool.price_usd = p * S.pool.quote_usd;
   renderStats();
-  /* Harga bergerak → batas tampilan digeser ulang dari niat, supaya sisi
-     single-sided tetap menempel harga. Tanpa ini MAX ketinggalan di atas
-     harga dan range "single" berubah sendiri jadi dua sisi. */
-  if (reanchor && moved > 0.0005 && !dragging && !liqDrag && S.pool.ver !== 2) {
+  /* Preset ikut bergerak bersama harga (sisi single-sided tetap menempel harga).
+     Range custom TIDAK PERNAH digeser — user menaruhnya di situ dengan sengaja. */
+  if (reanchor && S.preset && moved > 0.0005 && !dragging && !liqDrag && S.pool.ver !== 2) {
     const now = S.pool.price;
     if (S.mode === 'lower') S.max = now;
     else if (S.mode === 'upper') S.min = now;
@@ -518,14 +539,14 @@ function renderDeposit(p) {
   $('#amtSym').textContent = p.dep_sym;
   if (!S.amountFixed) $('#amt').value = amt(p.amount);
   $('#sideNote').innerHTML = p.ver === 2 ? 'v2 = full range 50/50' :
-    (S.mode === 'lower' ? `Range di bawah harga · deposit ${p.dep_sym} saja` :
-     S.mode === 'upper' ? `Range di atas harga · deposit ${p.dep_sym} saja` :
-     'Range dua sisi');
+    (p.mode === 'lower' ? `Range di bawah harga · deposit ${p.dep_sym} saja` :
+     p.mode === 'upper' ? `Range di atas harga · deposit ${p.dep_sym} saja` :
+     'Range mencakup harga sekarang · dua sisi');
   const rows = [];
   if (p.ver === 2) {
     rows.push('LP v2 full range 50/50 — fee 0.3% auto-compound.');
   } else {
-    rows.push(MODE_TXT[S.mode]);
+    rows.push(MODE_TXT[p.mode] || MODE_TXT[S.mode]);
     const unit = S.unit === 'mc' && mcFactor() !== 1 ? 'market cap' : `${t.quote_sym}/${t.token_sym}`;
     rows.push(`Range (${unit}): <b>${fmtUnit(toUnit(p.price_lower))}</b> – <b>${fmtUnit(toUnit(p.price_upper))}</b>
       <span class="dim">(tick ${p.tick_lower} … ${p.tick_upper})</span>`);
@@ -602,29 +623,30 @@ async function openPool(key) {
     · <span class="mono">${String(p.pool).slice(0, 10)}…${String(p.pool).slice(-6)}</span>`;
   renderStats();
   buildPresets();
-  applyPreset('lower', 30, 30);
+  applyPreset('lower30', 'lower', 30, 30);
   await Promise.all([loadCandles(), loadLiq()]);
 }
 
 function buildPresets() {
   const v2 = S.pool.ver === 2;
   $('#presets').innerHTML = v2 ? '<span class="dim">v2 selalu full range</span>' : `
-    <button data-m="lower" data-l="10">−10% single</button>
-    <button data-m="lower" data-l="20">−20% single</button>
-    <button data-m="lower" data-l="30" class="on">−30% single</button>
-    <button data-m="lower" data-l="50">−50% single</button>
-    <button data-m="upper" data-u="20">+20% single</button>
-    <button data-m="upper" data-u="50">+50% single</button>
-    <button data-m="wide" data-l="5" data-u="5">±5%</button>
-    <button data-m="wide" data-l="10" data-u="10">±10%</button>
-    <button data-m="wide" data-l="20" data-u="20">±20%</button>`;
+    <button data-id="lower10" data-m="lower" data-l="10">−10% single</button>
+    <button data-id="lower20" data-m="lower" data-l="20">−20% single</button>
+    <button data-id="lower30" data-m="lower" data-l="30">−30% single</button>
+    <button data-id="lower50" data-m="lower" data-l="50">−50% single</button>
+    <button data-id="upper20" data-m="upper" data-u="20">+20% single</button>
+    <button data-id="upper50" data-m="upper" data-u="50">+50% single</button>
+    <button data-id="wide5" data-m="wide" data-l="5" data-u="5">±5%</button>
+    <button data-id="wide10" data-m="wide" data-l="10" data-u="10">±10%</button>
+    <button data-id="wide20" data-m="wide" data-l="20" data-u="20">±20%</button>
+    <button data-id="custom" class="customchip">custom</button>`;
   for (const b of $('#presets').querySelectorAll('button')) {
     b.onclick = () => {
-      for (const x of $('#presets').querySelectorAll('button')) x.classList.remove('on');
-      b.classList.add('on');
-      applyPreset(b.dataset.m, +(b.dataset.l || 0), +(b.dataset.u || 0));
+      if (b.dataset.id === 'custom') { commitDrag(); return; }   // kunci batas saat ini
+      applyPreset(b.dataset.id, b.dataset.m, +(b.dataset.l || 0), +(b.dataset.u || 0));
     };
   }
+  markPreset();
   $('#tfs').innerHTML = ['1m', '5m', '15m', '1h', '4h', '1d']
     .map(t => `<button data-tf="${t}"${t === S.tf ? ' class="on"' : ''}>${t.toUpperCase()}</button>`).join('');
   for (const b of $('#tfs').querySelectorAll('button')) {
@@ -697,7 +719,7 @@ async function doMint() {
     $('#mint').disabled = true;
     toast('<span class="spin"></span> Minting... jangan tutup halaman.', 'hold');
     try {
-      const req = p.req || {mode: S.mode, ...pctsFromRange()};
+      const req = p.req || rangeReq();
       const r = await api('/api/mint', {
         key: t.key, ...req,
         amount_pct: S.amountFixed ? 0 : S.amountPct, amount_fixed: S.amountFixed,
@@ -715,10 +737,13 @@ async function doMint() {
 }
 
 // ══════════ positions ══════════
-async function loadPositions() {
-  $('#poslist').innerHTML = '<div class="empty"><span class="spin"></span> memuat posisi...</div>';
+async function loadPositions(fresh) {
+  if (!$('#poslist').querySelector('.pos'))
+    $('#poslist').innerHTML = '<div class="empty"><span class="spin"></span> memuat posisi...</div>';
+  $('#posRefresh').disabled = true;
   try {
-    const r = await api('/api/positions?chain=' + S.chain + (TOKEN ? '&t=' + encodeURIComponent(TOKEN) : ''));
+    const r = await api('/api/positions?chain=' + S.chain + (fresh ? '&fresh=1' : '') +
+                        (TOKEN ? '&t=' + encodeURIComponent(TOKEN) : ''));
     const s = r.summary;
     const net = s.withdrawals + s.fees_claimed - s.deposits;
     $('#pnl').innerHTML = `
@@ -728,7 +753,9 @@ async function loadPositions() {
       <div><small>Fee terklaim</small><b>${usd(s.fees_claimed)}</b></div>
       <div><small>Posisi terbuka</small><b>${s.open}</b></div>
       <div><small>In range</small><b>${s.in_range} / ${s.open}</b></div>`;
-    $('#posSub').innerHTML = `Live dari chain · realized ${usd(net)} (deposit ${usd(s.deposits)}, withdraw ${usd(s.withdrawals)})`;
+    $('#posSub').innerHTML = `Live dari chain · realized ${usd(net)} (deposit ${usd(s.deposits)}, withdraw ${usd(s.withdrawals)})`
+      + (r.stale ? ' · <span class="dim"><span class="spin"></span> menyegarkan…</span>' : '');
+    if (r.stale) setTimeout(() => loadPositions(), 6000);   // ambil hasil refresh latar
     if (!r.positions.length) {
       $('#poslist').innerHTML = '<div class="empty">Belum ada posisi aktif.</div>';
       return;
@@ -739,6 +766,8 @@ async function loadPositions() {
     }
   } catch (e) {
     $('#poslist').innerHTML = `<div class="empty bad">${e.message}</div>`;
+  } finally {
+    $('#posRefresh').disabled = false;
   }
 }
 
@@ -887,7 +916,7 @@ async function loadState() {
 $('#go').onclick = discover;
 $('#ca').onkeydown = e => { if (e.key === 'Enter') discover(); };
 $('#mint').onclick = doMint;
-$('#posRefresh').onclick = loadPositions;
+$('#posRefresh').onclick = () => loadPositions(true);
 $('#closeEditor').onclick = () => { $('#editor').classList.add('hide'); S.pool = null; };
 $('#amt').oninput = () => {
   const v = parseFloat($('#amt').value);

@@ -1027,6 +1027,55 @@ def calc_quote_only_range(cur_tick: int, fee: int, width_pct: float, quote_is_to
     return calc_strategy_range(cur_tick, fee, quote_is_token1, "lower", width_pct, width_pct)
 
 
+# ---------- Range bebas (batas ditentukan user, tidak dipatok ke harga sekarang) ----------
+def ticks_from_prices(p_lo: float, p_hi: float, fee: int, quote_is_token1: bool,
+                      mdec: int, qdec: int, spacing: int | None = None) -> tuple[int, int]:
+    """Harga meme (dalam satuan quote) → batas tick, dibulatkan ke tick spacing.
+    Dipakai untuk range yang letaknya bebas — termasuk yang seluruhnya di bawah
+    atau di atas harga sekarang (mis. harga 60k, range 20k–40k)."""
+    sp = spacing or TICK_SPACING[fee]
+    if not (p_lo > 0 and p_hi > 0):
+        raise RuntimeError("Batas range harus lebih besar dari 0.")
+
+    def tick_of(p: float) -> float:
+        raw = p * 10 ** (qdec - mdec) if quote_is_token1 else 10 ** (mdec - qdec) / p
+        if raw <= 0:
+            raise RuntimeError("Batas range di luar jangkauan.")
+        return math.log(raw) / math.log(1.0001)
+
+    ta, tb = sorted([tick_of(p_lo), tick_of(p_hi)])
+    lo = round_down(int(math.floor(ta)), sp)
+    hi = round_up(int(math.ceil(tb)), sp)
+    if lo >= hi:
+        hi = lo + sp
+    return max(lo, MIN_TICK), min(hi, MAX_TICK)
+
+
+def effective_mode(tick_lower: int, tick_upper: int, cur_tick: int, quote_is_token1: bool) -> str:
+    """Sisi yang harus disetor untuk range tertentu.
+    tick ≥ upper → posisi 100% token1 · tick < lower → 100% token0 · sisanya dua sisi."""
+    if cur_tick >= tick_upper:
+        return "lower" if quote_is_token1 else "upper"
+    if cur_tick < tick_lower:
+        return "upper" if quote_is_token1 else "lower"
+    return "wide"
+
+
+def _range_of(strategy: dict, cur_tick: int, fee: int, q_is_t1: bool,
+              spacing: int | None) -> tuple[int, int, str]:
+    """(tick_lower, tick_upper, mode efektif) untuk strategi apa pun.
+    Range bebas dipakai apa adanya; mode-nya diturunkan dari posisi range
+    terhadap harga sekarang, bukan dari pilihan user."""
+    ticks = strategy.get("ticks")
+    if ticks:
+        lo, hi = int(ticks[0]), int(ticks[1])
+        return lo, hi, effective_mode(lo, hi, cur_tick, q_is_t1)
+    mode = strategy["mode"]
+    lo, hi = calc_strategy_range(cur_tick, fee, q_is_t1, mode, strategy["low_pct"],
+                                 strategy["up_pct"], strategy.get("gap", 1), spacing=spacing)
+    return lo, hi, mode
+
+
 def pool_volatility_daily(w3: Web3, pool_addr: str) -> float | None:
     """Estimasi volatilitas harian % dari TWAP oracle pool (drift tick 1 jam × √24).
     None kalau oracle belum punya riwayat (observationCardinality=1)."""
@@ -1186,6 +1235,11 @@ def mint_position(chain_id: int, pk: str, pool_info: dict, budget: float,
     steps = []
     slip = (100 - slippage_pct) / 100
 
+    # Range bebas: mode ditentukan oleh letak range terhadap harga, bukan pilihan user.
+    if strategy.get("ticks"):
+        mode = effective_mode(int(strategy["ticks"][0]), int(strategy["ticks"][1]),
+                              pool.functions.slot0().call()[1], q_is_t1)
+
     # ---- Fase 1: persiapan (wrap / swap / approve) — harga boleh gerak selama ini ----
     keep_wei = meme_got = dep_wei = 0
     if mode == "upper":
@@ -1207,10 +1261,8 @@ def mint_position(chain_id: int, pk: str, pool_info: dict, budget: float,
         steps += ensure_quote_balance(w3, chain_id, pk, quote, budget_wei, slippage_pct)
         budget_wei = min(budget_wei, erc20(w3, quote).functions.balanceOf(account.address).call())
         slot0 = pool.functions.slot0().call()
-        t_lo, t_hi = calc_strategy_range(slot0[1], pool_info["fee"], q_is_t1, mode,
-                                         strategy["low_pct"], strategy["up_pct"],
-                                         strategy.get("gap", 1),
-                                         spacing=pool_info.get("tick_spacing"))
+        t_lo, t_hi, _ = _range_of(strategy, slot0[1], pool_info["fee"], q_is_t1,
+                                  pool_info.get("tick_spacing"))
         keep_wei, swap_wei = plan_two_sided(slot0[0], t_lo, t_hi, budget_wei, q_is_t1)
         # meme yang sudah ada di wallet dihitung duluan — swap cuma nutup kekurangan
         raw = (slot0[0] / Q96) ** 2  # token1 per token0 (rasio wei)
@@ -1253,9 +1305,16 @@ def mint_position(chain_id: int, pk: str, pool_info: dict, budget: float,
     for attempt in range(3):
         slot0 = pool.functions.slot0().call()
         cur_tick = slot0[1]
-        tick_lower, tick_upper = calc_strategy_range(
-            cur_tick, pool_info["fee"], q_is_t1, mode, strategy["low_pct"], strategy["up_pct"],
-            strategy.get("gap", 1), spacing=pool_info.get("tick_spacing"))
+        tick_lower, tick_upper, now_mode = _range_of(
+            strategy, cur_tick, pool_info["fee"], q_is_t1, pool_info.get("tick_spacing"))
+        if now_mode != mode:
+            # harga menyeberang batas range setelah dana disiapkan → sisi token yang
+            # dibutuhkan berubah. Lebih baik berhenti daripada mint dengan sisi salah;
+            # dana tetap utuh di wallet.
+            raise RuntimeError(
+                f"Harga bergerak melewati batas range saat transaksi disiapkan "
+                f"(butuh sisi '{now_mode}', dana sudah disiapkan untuk '{mode}'). "
+                f"Dana aman di wallet — atur ulang range lalu coba lagi.")
 
         if mode == "upper":
             if not q_is_t1:  # meme = token1
@@ -2412,6 +2471,11 @@ def mint_v4(chain_id: int, pk: str, pool_info: dict, budget: float,
     minfo = token_info(w3, meme)  # meme tidak pernah native
     steps = []
 
+    # Range bebas: mode ditentukan oleh letak range terhadap harga.
+    if strategy.get("ticks"):
+        mode = effective_mode(int(strategy["ticks"][0]), int(strategy["ticks"][1]),
+                              v4_slot0(w3, chain_id, pid)[1], q_is_t1)
+
     # ---- Fase 1: siapkan dana ----
     keep_wei = meme_got = dep_wei = 0
     if mode == "upper":
@@ -2435,9 +2499,7 @@ def mint_v4(chain_id: int, pk: str, pool_info: dict, budget: float,
         budget_wei = min(budget_wei, avail)
         if mode in ("wide", "stable"):
             sqrtp, cur_tick = v4_slot0(w3, chain_id, pid)
-            t_lo, t_hi = calc_strategy_range(cur_tick, pool_info["fee"], q_is_t1, mode,
-                                             strategy["low_pct"], strategy["up_pct"],
-                                             strategy.get("gap", 1), spacing=spacing)
+            t_lo, t_hi, _ = _range_of(strategy, cur_tick, pool_info["fee"], q_is_t1, spacing)
             keep, _sw = plan_two_sided(sqrtp, t_lo, t_hi, budget_wei, q_is_t1)
             raw = (sqrtp / Q96) ** 2
             meme_price_q = raw if q_is_t1 else (1 / raw if raw else 0)
@@ -2462,9 +2524,13 @@ def mint_v4(chain_id: int, pk: str, pool_info: dict, budget: float,
     last_err = None
     for attempt in range(3):
         sqrtp, cur_tick = v4_slot0(w3, chain_id, pid)
-        tick_lower, tick_upper = calc_strategy_range(
-            cur_tick, pool_info["fee"], q_is_t1, mode, strategy["low_pct"], strategy["up_pct"],
-            strategy.get("gap", 1), spacing=spacing)
+        tick_lower, tick_upper, now_mode = _range_of(
+            strategy, cur_tick, pool_info["fee"], q_is_t1, spacing)
+        if now_mode != mode:
+            raise RuntimeError(
+                f"Harga bergerak melewati batas range saat transaksi disiapkan "
+                f"(butuh sisi '{now_mode}', dana sudah disiapkan untuk '{mode}'). "
+                f"Dana aman di wallet — atur ulang range lalu coba lagi.")
         if mode == "upper":
             a0d, a1d = (dep_wei, 0) if q_is_t1 else (0, dep_wei)
         elif mode in ("wide", "stable"):
