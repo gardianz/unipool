@@ -30,6 +30,10 @@ CHAINS = {
         "dexscreener": "robinhood",
         "gecko": "robinhood",
         "gmgn": "robinhood",
+        # Indexer alps (read-only) — daftar posisi Robinhood instan. Cuma dibaca
+        # untuk TAMPILAN; tidak pernah dipakai untuk transaksi (semua tx tetap
+        # langsung ke kontrak lewat RPC + key sendiri). Fallback ke RPC kalau mati.
+        "positions_api": "https://alps.farm/api/positions?owner=",
         "v2_factory": "0x8bceaa40b9acdfaedf85adf4ff01f5ad6517937f",
         # rpc.mainnet.chain.robinhood.com sering diblokir DNS ISP Indonesia
         # (redirect ke internetpositif.id) → fallback Blockscout eth-rpc

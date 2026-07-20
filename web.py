@@ -630,9 +630,95 @@ def _positions_refresh(cid: int, ck, full: bool = False, cold: bool = False):
         _POS_REFRESHING[ck] = False
 
 
+def _alps_positions(cid: int, addr: str) -> dict | None:
+    """Daftar posisi dari indexer alps (read-only). Hanya untuk TAMPILAN — tidak
+    pernah menyentuh key/tx. Kembalikan None kalau gagal supaya jatuh ke RPC.
+
+    Keamanan: cuma GET dengan alamat wallet (sudah publik on-chain). Tak ada key,
+    tanda tangan, atau transaksi — mustahil menguras dana lewat endpoint baca."""
+    api = ch.CHAINS[cid].get("positions_api")
+    if not api:
+        return None
+    try:
+        r = requests.get(api + addr, timeout=12,
+                         headers={"accept": "application/json"})
+        raw = r.json().get("positions")
+        if not isinstance(raw, list):
+            return None
+    except Exception:
+        return None
+
+    cfg = ch.CHAINS[cid]
+    quote_addrs = {cfg["wrapped"].lower()} | {cfg["quotes"][s].lower() for s in cfg["stable_syms"]}
+    out = []
+    for p in raw:
+        try:
+            if p.get("protocol") != "v3":       # alps Robinhood = v3 saja
+                continue
+            t0, t1 = p["token0"], p["token1"]
+            a0, a1 = t0["address"].lower(), t1["address"].lower()
+            q_is_t1 = a1 in quote_addrs or a0 not in quote_addrs   # quote condong ke token1
+            d0, d1 = int(t0["decimals"]), int(t1["decimals"])
+            amt0 = int(p["amount0"]) / 10 ** d0
+            amt1 = int(p["amount1"]) / 10 ** d1
+            fee0 = int(p["fees0"]) / 10 ** d0
+            fee1 = int(p["fees1"]) / 10 ** d1
+            mdec, qdec = (d0, d1) if q_is_t1 else (d1, d0)
+
+            def pq(t, _m=mdec, _q=qdec, _t1=q_is_t1):
+                raw_ = ch.tick_to_price(t)
+                return (raw_ if _t1 else (1 / raw_ if raw_ else 0)) * 10 ** (_m - _q)
+            lo, hi = sorted([pq(int(p["tickLower"])), pq(int(p["tickUpper"]))])
+            now = pq(int(p["currentTick"]))
+            pid = str(p["tokenId"])
+            out.append({
+                "ver": 3, "pid": pid, "fee": int(p["feeBps"]),
+                "sym0": t0["symbol"], "sym1": t1["symbol"], "dec0": d0, "dec1": d1,
+                "amount0": amt0, "amount1": amt1,
+                "quote_sym": t1["symbol"] if q_is_t1 else t0["symbol"],
+                "meme_sym": t0["symbol"] if q_is_t1 else t1["symbol"],
+                "quote_amount": amt1 if q_is_t1 else amt0,
+                "meme_amount": amt0 if q_is_t1 else amt1,
+                "quote_fees": fee1 if q_is_t1 else fee0,
+                "meme_fees": fee0 if q_is_t1 else fee1,
+                "quote_is_token1": q_is_t1,
+                "tick_lower": int(p["tickLower"]), "tick_upper": int(p["tickUpper"]),
+                "cur_tick": int(p["currentTick"]),
+                "price_lower": lo, "price_upper": hi, "price_now": now,
+                "to_min_pct": (now / lo - 1) * 100 if lo else None,
+                "to_max_pct": (hi / now - 1) * 100 if now else None,
+                "in_range": bool(p["inRange"]),
+                "value_usd": float(p["valueUsd"]), "unclaimed_usd": float(p["feesUsd"]),
+                "deposit_usd": float(p["depositsUsd"]), "fees_claimed_usd": float(p["claimedFeesUsd"]),
+                "pnl_usd": float(p["pnlUsd"]), "basis": "alps",
+                "age": store.fmt_age(store.mint_ts(cid, ev_id(pid))),
+                "link": ch.pos_link_any(cid, pid),
+            })
+        except Exception:
+            continue
+
+    summ = {
+        "total_value": sum(p["value_usd"] for p in out),
+        "unclaimed": sum(p["unclaimed_usd"] for p in out),
+        "fees_claimed": sum(p["fees_claimed_usd"] for p in out),
+        "deposits": sum(p["deposit_usd"] for p in out),
+        "withdrawals": 0.0,
+        "open": len(out), "in_range": sum(1 for p in out if p["in_range"]),
+        "pnl": sum(p["pnl_usd"] for p in out) if out else None,
+    }
+    return {"positions": out, "summary": summ, "ts": int(time.time()), "source": "alps"}
+
+
 def _positions_build(cid: int, full: bool = False, with_basis: bool = True) -> dict:
     key = bot.pk()
     addr = bot._addr_of(key)
+
+    # Fast-path: indexer alps (Robinhood) — instan, PnL sudah dihitung. Read-only,
+    # tak menyentuh key/tx. Gagal/timeout → jatuh mulus ke enumerasi RPC di bawah.
+    alps = _alps_positions(cid, addr)
+    if alps is not None and alps["positions"]:
+        return alps
+
     pos = ch.list_all_positions(cid, key, store.refs(cid, addr, "v2"),
                                 store.refs(cid, addr, "v4"), full=full)
 
@@ -725,7 +811,7 @@ def _positions_build(cid: int, full: bool = False, with_basis: bool = True) -> d
     summ["in_range"] = sum(1 for p in out if p.get("in_range"))
     known = [p for p in out if p.get("pnl_usd") is not None]
     summ["pnl"] = sum(p["pnl_usd"] for p in known) if known else None
-    return {"positions": out, "summary": summ, "ts": int(time.time())}
+    return {"positions": out, "summary": summ, "ts": int(time.time()), "source": "chain"}
 
 
 def ev_id(pid):
