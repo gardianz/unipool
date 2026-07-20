@@ -748,12 +748,25 @@ def discover_pools(chain_id: int, token_addr: str) -> dict:
             qusd = qmeta_f[qsym][1].result()
             q_bal = erc20(w3, q).functions.balanceOf(pool_addr).call() / 10 ** qdec
             t0, t1 = sorted([token, q])
+            q_is_t1 = q == t1
+            # TVL = kedua sisi reserve (bukan sisi quote × 2). Di pool v3 likuiditas
+            # sering menumpuk jauh di luar range pada sisi meme, jadi "quote × 2"
+            # bisa meleset puluhan kali lipat — dan APR ikut ngaco karenanya.
+            m_usd = 0.0
+            try:
+                mdec = tinfo_f.result()["decimals"]
+                raw = (slot0[0] / Q96) ** 2                       # token1 per token0 (rasio wei)
+                meme_in_q = (raw if q_is_t1 else (1 / raw if raw else 0)) * 10 ** (mdec - qdec)
+                m_bal = erc20(w3, token).functions.balanceOf(pool_addr).call() / 10 ** mdec
+                m_usd = m_bal * meme_in_q * qusd
+            except Exception:
+                m_usd = q_bal * qusd      # gagal baca sisi meme → balik ke estimasi lama
             return {
                 "ver": 3, "pool": pool_addr, "fee": fee, "quote_sym": qsym, "quote_addr": q,
                 "quote_decimals": qdec, "quote_usd": qusd,
                 "tick": slot0[1], "sqrtp": slot0[0], "liquidity": liq,
-                "tvl_usd": q_bal * qusd * 2,  # estimasi: sisi quote × 2
-                "token0": t0, "token1": t1, "quote_is_token1": q == t1,
+                "tvl_usd": q_bal * qusd + m_usd,
+                "token0": t0, "token1": t1, "quote_is_token1": q_is_t1,
             }
 
         vols_f = ex.submit(dex_volumes, chain_id, token)
@@ -907,16 +920,21 @@ def discover_dex_pools(w3: Web3, chain_id: int, token: str,
                 qdec = token_info(w3, q)["decimals"]
                 qusd = quote_usd_price(w3, chain_id, qsym)
                 q_bal = erc20(w3, q).functions.balanceOf(addr).call() / 10 ** qdec
-                if q_bal * qusd * 2 < 10:
+                if q_bal * qusd * 2 < 10:   # gerbang aman tetap pakai sisi quote saja
                     return None
+                meme = t0 if q_is_t1 else t1
+                mdec = token_info(w3, meme)["decimals"]
+                raw = (slot0[0] / Q96) ** 2
+                meme_in_q = (raw if q_is_t1 else (1 / raw if raw else 0)) * 10 ** (mdec - qdec)
+                m_bal = erc20(w3, meme).functions.balanceOf(addr).call() / 10 ** mdec
                 return {
                     "ver": 3, "pool": Web3.to_checksum_address(addr), "fee": fee,
                     "tick_spacing": pool.functions.tickSpacing().call(),
                     "quote_sym": qsym, "quote_addr": q, "quote_decimals": qdec, "quote_usd": qusd,
                     "tick": slot0[1], "sqrtp": slot0[0],
                     "liquidity": pool.functions.liquidity().call(),
-                    "tvl_usd": q_bal * qusd * 2, "token0": t0, "token1": t1,
-                    "quote_is_token1": q_is_t1,
+                    "tvl_usd": q_bal * qusd + m_bal * meme_in_q * qusd,
+                    "token0": t0, "token1": t1, "quote_is_token1": q_is_t1,
                 }
             else:
                 key = _v4_key_from_init(w3, chain_id, addr)

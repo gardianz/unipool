@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>unipool</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<header>
+  <div class="brand">▲ <b>unipool</b></div>
+  <nav>
+    <button class="tab on" data-view="pool">Pool</button>
+    <button class="tab" data-view="pos">Positions</button>
+  </nav>
+  <div class="right">
+    <select id="chain"></select>
+    <select id="wallet"></select>
+    <span id="bal" class="mono dim"></span>
+  </div>
+</header>
+
+<!-- ══════════ VIEW: POOL ══════════ -->
+<main id="view-pool">
+  <div class="search">
+    <input id="ca" placeholder="Paste contract address token (0x...)" spellcheck="false" autocomplete="off">
+    <button id="go" class="primary">Cari pool</button>
+  </div>
+
+  <div id="pools" class="pools hide"></div>
+
+  <section id="editor" class="hide">
+    <div class="head">
+      <div>
+        <h1 id="pair"></h1>
+        <div class="sub" id="pairsub"></div>
+      </div>
+      <button id="closeEditor" class="ghost">✕</button>
+    </div>
+
+    <div class="stats" id="stats"></div>
+
+    <div class="panel">
+      <div class="panel-head">
+        <span class="label">PRICE RANGE</span>
+        <span id="sideNote" class="pill"></span>
+      </div>
+
+      <div class="presets" id="presets"></div>
+
+      <div class="hint" id="dragHint">geser garis <b>MIN</b>/<b>MAX</b> di chart untuk atur range · scroll = zoom</div>
+
+      <div class="tfrow">
+        <div class="tfs" id="tfs"></div>
+        <div class="srcinfo mono dim" id="srcinfo"></div>
+      </div>
+
+      <div class="chartwrap">
+        <div id="chart"></div>
+        <div id="liqbox" class="liqbox"><canvas id="liq"></canvas></div>
+      </div>
+
+      <div class="ranges" id="ranges">
+        <div class="rbox">
+          <div class="rlabel">Min price</div>
+          <input id="minIn" class="mono" inputmode="decimal">
+          <div class="rpct" id="minPct"></div>
+        </div>
+        <div class="rbox">
+          <div class="rlabel">Max price</div>
+          <input id="maxIn" class="mono" inputmode="decimal">
+          <div class="rpct" id="maxPct"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head"><span class="label">DEPOSIT</span></div>
+      <div class="amt">
+        <input id="amt" class="mono" inputmode="decimal" placeholder="0.0">
+        <span id="amtSym" class="dim"></span>
+        <div class="pcts" id="amtPcts"></div>
+      </div>
+      <div id="depinfo" class="depinfo"></div>
+      <button id="mint" class="primary big" disabled>Mint position</button>
+      <div class="fine">Slippage <span id="slipTxt"></span>% · deadline 20 menit · range final dihitung server (dibulatkan ke tick spacing)</div>
+    </div>
+  </section>
+
+  <div id="poolEmpty" class="empty">Paste contract address untuk mulai.</div>
+</main>
+
+<!-- ══════════ VIEW: POSITIONS ══════════ -->
+<main id="view-pos" class="hide">
+  <div class="pnl" id="pnl"></div>
+  <div id="poslist" class="poslist"></div>
+</main>
+
+<div id="toast" class="toast hide"></div>
+<div id="modal" class="modal hide"><div class="sheet" id="sheet"></div></div>
+
+<script src="/lightweight-charts.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

@@ -1,8 +1,17 @@
 # unipool
 
-Bot Telegram untuk farming fee LP **Uniswap V2 + V3 + V4** di **Robinhood Chain** (chain id 4663) dan **BSC** (chain id 56).
+Bot Telegram **+ UI web** untuk farming fee LP **Uniswap V2 + V3 + V4** di **Robinhood Chain** (chain id 4663) dan **BSC** (chain id 56).
 
-Paste alamat token → bot cari pool (v2/v3/v4 sekaligus) → pilih strategi → mint posisi LP. Pantau lewat `/list` (PnL, fee, chart), tutup posisi satu tombol dengan auto-swap. Semua data dibaca langsung dari blockchain — tidak bergantung UI Uniswap yang sering gagal fetch harga.
+Paste alamat token → cari pool (v2/v3/v4 sekaligus) → pilih strategi → mint posisi LP. Pantau lewat `/list` (PnL, fee, chart), tutup posisi satu tombol dengan auto-swap. Semua data dibaca langsung dari blockchain — tidak bergantung UI Uniswap yang sering gagal fetch harga.
+
+Dua antarmuka, satu mesin (`chain.py`) — bisa dipakai bergantian, riwayat PnL-nya sama:
+
+| | Telegram (`bot.py`) | Web (`web.py`) |
+|---|---|---|
+| Atur range | tombol preset / persen / market cap | **geser garis MIN/MAX langsung di chart** |
+| Chart harga | link keluar (GMGN/DexScreener) | **candle real-time built-in + peta likuiditas** |
+| Alert keluar range | ✅ push otomatis | — (pantau di layar) |
+| Akses | dari HP di mana saja | localhost / SSH tunnel |
 
 ## Fitur
 
@@ -20,6 +29,33 @@ Paste alamat token → bot cari pool (v2/v3/v4 sekaligus) → pilih strategi →
 - 🧭 **Menu navigasi** — `/start` membuka dashboard (saldo + tombol Posisi/Dompet/Pengaturan/Chain); semua setting bisa diubah lewat tombol tanpa hafal perintah
 - 🛡️ **Failover RPC** multi-endpoint + bypass blokir DNS ISP Indonesia (DoH + koneksi IP langsung, sertifikat tetap diverifikasi)
 - 💰 Harga token berlapis: pool v3 → pair v2 → API dexscreener
+- 🖥️ **UI web** (`web.py`) — chart candle real-time, atur range dengan **drag garis MIN/MAX**, peta likuiditas, mint/add/reduce/collect/close/rebalance dari browser
+
+## UI web (chart + drag range)
+
+```bash
+python3 web.py          # → http://127.0.0.1:8899
+```
+
+Paste CA → pilih pool → **geser garis MIN/MAX di chart** untuk atur range, atau pakai preset
+(`−10/−20/−30/−50% single`, `+20/+50% single`, `±5/±10/±20%`). Panel deposit langsung
+memperbarui komposisi & nilai USD, lalu **Mint position**. Tab **Positions** untuk
+add/reduce/collect fee/rebalance/close.
+
+Detail teknis:
+
+- **Chart**: candle dari [GeckoTerminal](https://www.geckoterminal.com) (gratis, tanpa API key, timeframe 1M–1D). Orientasi harga dicocokkan otomatis dengan harga on-chain. Pool yang belum ter-index jatuh ke sampling `slot0` di blok lampau (butuh RPC archive). GMGN tidak dipakai: chain 4663 tidak ada di sana dan endpoint-nya di balik Cloudflare.
+- **Peta likuiditas**: dibaca on-chain dari `tickBitmap` + `ticks` (v3) / `getTickBitmap` + `getTickLiquidity` (v4) — bukan estimasi.
+- **Range tetap dihitung server.** Browser cuma mengirim *persen* lebar range; tick finalnya dihitung `calc_strategy_range()` yang sama dengan bot, lalu garis di chart di-snap ke harga tick hasil pembulatan. Jadi yang kamu lihat = yang di-mint.
+- **Alamat pool tidak pernah datang dari browser.** Hasil discovery disimpan di server, klien cuma memegang key-nya — data untuk membangun transaksi tidak bisa disisipi dari sisi klien.
+
+> ⚠️ **UI web memegang private key.** Default-nya hanya menerima koneksi `127.0.0.1`.
+> Untuk akses dari luar, jangan buka portnya — pakai SSH tunnel:
+> `ssh -L 8899:127.0.0.1:8899 user@vps`, lalu buka `http://127.0.0.1:8899` di laptop.
+> Kalau benar-benar perlu bind ke IP publik, `WEB_TOKEN` di `.env` wajib diisi
+> (server menolak start tanpa itu) dan aksesnya jadi `http://ip:8899/?t=<WEB_TOKEN>`.
+
+Env opsional: `WEB_HOST` (default `127.0.0.1`), `WEB_PORT` (default `8899`), `WEB_TOKEN`.
 
 ## Instalasi
 
@@ -156,5 +192,7 @@ Cek log: `journalctl -u unipool -f` · restart: `sudo systemctl restart unipool`
 ## Struktur kode
 
 - `bot.py` — UI Telegram (handler, kartu konfirmasi, monitor alert)
+- `web.py` — UI web (server stdlib `http.server`, tanpa dependency tambahan) + API JSON
+- `static/` — halaman web: `index.html`, `app.js`, `style.css`, `lightweight-charts.js` (TradingView, Apache-2.0, di-vendor supaya jalan offline)
 - `chain.py` — inti web3: discovery + aksi v2/v3/v4, swap, verifikasi kontrak, riwayat harga
 - `store.py` — settings + riwayat PnL (`settings.json`, `history.json`)
