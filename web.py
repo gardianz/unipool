@@ -524,14 +524,18 @@ def _words(hexdata: str) -> list[int]:
     return [int(hexdata[i:i + 64], 16) for i in range(0, len(hexdata) - 63, 64)]
 
 
-def cost_basis(chain_id: int, tid: int, _cache={}, ttl: int = 900) -> dict | None:
+def cost_basis(chain_id: int, tid: int, _cache={}, ttl: int = 900,
+               cache_only: bool = False) -> dict | None:
     """Modal & hasil tarikan posisi v3 langsung dari event NPM (bukan dari
     history.json lokal) — supaya PnL tetap benar walau posisinya di-mint di
-    luar bot ini. None kalau RPC tidak mendukung getLogs rentang penuh."""
+    luar bot ini. None kalau RPC tidak mendukung getLogs rentang penuh.
+    cache_only=True: kembalikan hanya kalau sudah di cache, tanpa query getLogs."""
     ck = (chain_id, int(tid))
     hit = _cache.get(ck)
     if hit and time.time() - hit[1] < ttl:
         return hit[0]
+    if cache_only:
+        return None
     npm = ch.CHAINS[chain_id]["npm"]
     t1 = "0x" + f"{int(tid):064x}"
     from concurrent.futures import ThreadPoolExecutor
@@ -591,40 +595,34 @@ def api_positions(q, _b) -> dict:
         return {**hit[0], "cached": True, "stale": bool(extra),
                 "age": round(time.time() - hit[1], 1), **(extra or {})}
 
+    # Request HTTP TIDAK PERNAH memblokir pada RPC. Bila cache ada → sajikan; bila
+    # tidak → balas "building" dan bangun di latar. Klien menampilkan spinner lalu
+    # menambal angkanya saat siap.
     if hit and not fresh and time.time() - hit[1] < ttl:
         return {**hit[0], "cached": True, "age": round(time.time() - hit[1], 1)}
+
+    # picu satu build/refresh di latar (single-flight). fresh=1 (tombol Refresh)
+    # memaksa scan penuh — tangkap posisi lama yang ditambah-liquidity tanpa mint baru.
+    if not _POS_REFRESHING.get(ck):
+        _POS_REFRESHING[ck] = True
+        threading.Thread(target=_positions_refresh,
+                         args=(cid, ck, fresh, hit is None), daemon=True).start()
+
     if hit:
-        # Cache ada → UI tidak pernah menunggu. Muat ulang di latar (single-flight);
-        # kalau refresh gagal (mis. RPC 429), cache lama tetap disajikan.
-        if not _POS_REFRESHING.get(ck):
-            _POS_REFRESHING[ck] = True
-            threading.Thread(target=_positions_refresh, args=(cid, ck), daemon=True).start()
         return stale({"refreshing": True})
+    return {"positions": [], "summary": {}, "building": True}
 
-    # Belum ada cache: satu build saja. Caller pertama membangun; caller lain
-    # (mis. poller yang menembak selama build lambat) tidak ikut antre di lock —
-    # mereka dibalas "membangun" supaya thread server tidak habis.
-    if not _POS_LOCK.acquire(blocking=False):
-        return {"positions": [], "summary": {}, "building": True}
+
+def _positions_refresh(cid: int, ck, full: bool = False, cold: bool = False):
     try:
-        hit = _POS_CACHE.get(ck)
-        if hit:
-            return {**hit[0], "cached": True, "age": round(time.time() - hit[1], 1)}
-        try:
-            res = _positions_build(cid)
-        except Exception as e:
-            # gagal build pertama (mis. RPC rate-limit) — jangan lempar 400, suruh
-            # klien coba lagi; belum ada cache untuk disajikan
-            return {"positions": [], "summary": {}, "building": True, "warn": str(e)[:200]}
-        _POS_CACHE[ck] = (res, time.time())
-        return res
-    finally:
-        _POS_LOCK.release()
-
-
-def _positions_refresh(cid: int, ck):
-    try:
-        res = _positions_build(cid)
+        if cold:
+            # dua tahap: dulu tampil cepat (value/fee/range, tanpa cost_basis) supaya
+            # klien berhenti menampilkan spinner, lalu isi PnL yang butuh getLogs.
+            try:
+                _POS_CACHE[ck] = (_positions_build(cid, full=False, with_basis=False), time.time())
+            except Exception:
+                pass
+        res = _positions_build(cid, full=full)
         _POS_CACHE[ck] = (res, time.time())
     except Exception:
         pass          # simpan cache lama; percobaan berikutnya coba lagi
@@ -632,16 +630,20 @@ def _positions_refresh(cid: int, ck):
         _POS_REFRESHING[ck] = False
 
 
-def _positions_build(cid: int) -> dict:
+def _positions_build(cid: int, full: bool = False, with_basis: bool = True) -> dict:
     key = bot.pk()
     addr = bot._addr_of(key)
-    pos = ch.list_all_positions(cid, key, store.refs(cid, addr, "v2"), store.refs(cid, addr, "v4"))
+    pos = ch.list_all_positions(cid, key, store.refs(cid, addr, "v2"),
+                                store.refs(cid, addr, "v4"), full=full)
 
     from concurrent.futures import ThreadPoolExecutor
     v3ids = [str(p.get("pid") or p.get("token_id")) for p in pos
              if p.get("ver", 3) == 3 and str(p.get("pid") or p.get("token_id")).isdigit()]
+    # cost_basis = 3 getLogs rentang-penuh per posisi → mahal. Untuk paint pertama
+    # dilewati (with_basis=False) supaya value/fee/range tampil cepat; PnL menyusul
+    # dari cache getLogs yang sudah panas di refresh berikutnya.
     cbs = {}
-    if v3ids:
+    if with_basis and v3ids:
         def safe(pid):
             try:
                 return cost_basis(cid, int(pid))
@@ -649,6 +651,12 @@ def _positions_build(cid: int) -> dict:
                 return None
         with ThreadPoolExecutor(max_workers=5) as ex:
             cbs = {pid: cb for pid, cb in zip(v3ids, ex.map(safe, v3ids)) if cb}
+    elif v3ids:
+        # pakai basis yang sudah panas di cache; jangan query getLogs baru
+        for pid in v3ids:
+            cb = cost_basis(cid, int(pid), cache_only=True)
+            if cb:
+                cbs[pid] = cb
 
     out = []
     for p in pos:

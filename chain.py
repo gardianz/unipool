@@ -411,10 +411,17 @@ def _rpc_retry() -> Retry:
                  allowed_methods=None, respect_retry_after_header=True)
 
 
+# Listing posisi menembak banyak read paralel (per posisi: slot0 + collect +
+# supply, plus cost_basis nested). Pool default requests = 10 → "pool full,
+# discarding connection" lalu koneksi dibuka ulang tiap kali = lambat. Besarkan.
+_POOL = 32
+
+
 def _rpc_session() -> requests.Session:
     s = requests.Session()
-    s.mount("https://", HTTPAdapter(max_retries=_rpc_retry()))
-    s.mount("http://", HTTPAdapter(max_retries=_rpc_retry()))
+    a = HTTPAdapter(max_retries=_rpc_retry(), pool_connections=_POOL, pool_maxsize=_POOL)
+    s.mount("https://", a)
+    s.mount("http://", a)
     return s
 
 
@@ -424,7 +431,7 @@ class _SNIAdapter(HTTPAdapter):
 
     def __init__(self, hostname: str):
         self._hostname = hostname
-        super().__init__(max_retries=_rpc_retry())
+        super().__init__(max_retries=_rpc_retry(), pool_connections=_POOL, pool_maxsize=_POOL)
 
     def init_poolmanager(self, *args, **kwargs):
         kwargs["server_hostname"] = self._hostname
@@ -1402,10 +1409,44 @@ def _meme_usd(w3: Web3, chain_id: int, pool_info: dict) -> float:
 
 
 # ---------- Listing posisi ----------
-_TID_CACHE: dict = {}   # (chain, wallet) → (jumlah NFT, daftar tokenId)
+import json as _json
+import os as _os
+_ACTIVE_FILE = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), ".active_positions.json")
+_ACTIVE_CACHE: dict = {}   # "chain:wallet" → [jumlah NFT, [tokenId aktif]]
 
 
-def list_positions(chain_id: int, pk: str, max_positions: int = 40) -> list[dict]:
+def _active_load() -> dict:
+    global _ACTIVE_CACHE
+    if not _ACTIVE_CACHE and _os.path.exists(_ACTIVE_FILE):
+        try:
+            with open(_ACTIVE_FILE) as f:
+                _ACTIVE_CACHE = _json.load(f)
+        except Exception:
+            _ACTIVE_CACHE = {}
+    return _ACTIVE_CACHE
+
+
+def _active_save(key: str, n: int, tids: list):
+    _ACTIVE_CACHE[key] = [n, tids]
+    try:
+        tmp = _ACTIVE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            _json.dump(_ACTIVE_CACHE, f)
+        _os.replace(tmp, _ACTIVE_FILE)
+    except Exception:
+        pass
+
+
+def _is_active(p) -> bool:
+    return not (p[7] == 0 and p[10] == 0 and p[11] == 0)   # liq==0 & owed0==0 & owed1==0
+
+
+def list_positions(chain_id: int, pk: str, max_positions: int = 40,
+                   full: bool = False) -> list[dict]:
+    """Posisi v3 aktif. Wallet lama bisa punya ratusan NFT tertutup — men-scan
+    semuanya tiap refresh mahal. Jadi: set tokenId aktif disimpan; refresh cuma
+    mengecek yang aktif + NFT yang baru di-mint (balanceOf naik). Scan penuh
+    hanya saat pertama, saat jumlah turun (ada yang di-burn), atau full=True."""
     w3 = get_w3(chain_id)
     cfg = CHAINS[chain_id]
     account = w3.eth.account.from_key(pk)
@@ -1413,21 +1454,27 @@ def list_positions(chain_id: int, pk: str, max_positions: int = 40) -> list[dict
     factory = w3.eth.contract(address=Web3.to_checksum_address(cfg["factory"]), abi=FACTORY_ABI)
 
     n = npm.functions.balanceOf(account.address).call()
-    # Daftar tokenId cuma berubah saat mint/close. Selama jumlahnya sama, pakai
-    # yang tersimpan — hemat n panggilan tokenOfOwnerByIndex tiap kali refresh.
-    ck = (chain_id, account.address.lower())
-    hit = _TID_CACHE.get(ck)
-    idxs = list(range(n - 1, max(-1, n - 1 - max_positions), -1))  # terbaru dulu
-    with ThreadPoolExecutor(max_workers=5) as ex:
-        if hit and hit[0] == n and len(hit[1]) == len(idxs):
-            tids = hit[1]
-        else:
-            tids = list(ex.map(lambda i: npm.functions.tokenOfOwnerByIndex(account.address, i).call(), idxs))
-            _TID_CACHE[ck] = (n, tids)
-        raws = list(ex.map(lambda t: npm.functions.positions(t).call(), tids))
+    ck = f"{chain_id}:{account.address.lower()}"
+    hit = _active_load().get(ck)
 
-        active = [(tid, p) for tid, p in zip(tids, raws)
-                  if not (p[7] == 0 and p[10] == 0 and p[11] == 0)]
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        if hit and not full and n >= hit[0]:
+            # Jalur cepat: cek ulang tokenId yang tadinya aktif + enumerasi HANYA
+            # NFT baru (indeks hit[0]..n-1). Tutup posisi tidak mem-burn NFT di NPM,
+            # jadi balanceOf hanya naik saat mint → "n turun" memicu scan penuh.
+            new_idxs = list(range(n - 1, hit[0] - 1, -1))
+            new_tids = list(ex.map(
+                lambda i: npm.functions.tokenOfOwnerByIndex(account.address, i).call(), new_idxs))
+            tids = [int(t) for t in hit[1]] + new_tids
+        else:
+            # Scan penuh: enumerasi max_positions NFT terakhir.
+            idxs = list(range(n - 1, max(-1, n - 1 - max_positions), -1))
+            tids = list(ex.map(
+                lambda i: npm.functions.tokenOfOwnerByIndex(account.address, i).call(), idxs))
+
+        raws = list(ex.map(lambda t: npm.functions.positions(t).call(), tids))
+        active = [(tid, p) for tid, p in zip(tids, raws) if _is_active(p)]
+        _active_save(ck, n, [tid for tid, _ in active])
         results = list(ex.map(lambda tp: _position_detail(w3, chain_id, npm, factory, account, *tp), active))
     return [r for r in results if r]
 
@@ -2944,12 +2991,12 @@ def parse_pid(pid) -> tuple[int, object]:
 
 
 def list_all_positions(chain_id: int, pk: str, v2_refs: list[str] = (),
-                       v4_refs: list[str] = ()) -> list[dict]:
+                       v4_refs: list[str] = (), full: bool = False) -> list[dict]:
     """Posisi v3 (enumerasi NPM) + v4/v2 (dari registry bot). v3 diberi ver/pid."""
     w3 = get_w3(chain_id)
     account = w3.eth.account.from_key(pk)
     out = []
-    for p in list_positions(chain_id, pk):
+    for p in list_positions(chain_id, pk, full=full):
         p.setdefault("ver", 3)
         p.setdefault("pid", str(p["token_id"]))
         out.append(p)

@@ -14,3 +14,6 @@ __pycache__/
 *.log
 .playwright-mcp/
 *:Zone.Identifier
+
+# cache set posisi aktif (dibangun ulang otomatis)
+.active_positions.json

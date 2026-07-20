@@ -765,10 +765,11 @@ async function loadPositions(fresh) {
       return;
     }
     renderPositions(r);
-    posLive(r.stale ? 'busy' : 'on',
+    const pending = r.pnl_pending || r.stale;
+    posLive(pending ? 'busy' : 'on',
       `Live · ${r.summary.in_range}/${r.summary.open} in range` +
-      (r.stale ? ' · menyegarkan…' : ''));
-    if (r.stale) setTimeout(() => loadPositions(), 5000);   // ambil hasil refresh latar
+      (r.pnl_pending ? ' · menghitung PnL…' : r.stale ? ' · menyegarkan…' : ''));
+    if (pending) setTimeout(() => loadPositions(), 4000);   // ambil PnL / hasil refresh latar
   } catch (e) {
     if (seq !== posSeq) return;
     posLive('off', 'terputus: ' + e.message);
