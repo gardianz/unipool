@@ -347,7 +347,13 @@ def api_candles(q, _b) -> dict:
         except Exception:
             cands = []
             src = "none"
-    return {"candles": cands, "price": now, "tick": cur, "source": src}
+    try:
+        supply = ch.token_supply(ch.get_w3(cid), meme_addr(p))
+    except Exception:
+        supply = 0
+    # volume GeckoTerminal (currency=token) satuannya token quote → ubah ke USD
+    return {"candles": cands, "price": now, "tick": cur, "source": src,
+            "quote_usd": p["quote_usd"], "supply": supply}
 
 
 def api_liquidity(_q, b) -> dict:
@@ -458,11 +464,116 @@ def api_mint(_q, b) -> dict:
             "tick_lower": r.get("tick_lower"), "tick_upper": r.get("tick_upper")}
 
 
+NPM_TOPICS = {
+    "inc": "0x" + Web3.keccak(text="IncreaseLiquidity(uint256,uint128,uint256,uint256)").hex().removeprefix("0x"),
+    "dec": "0x" + Web3.keccak(text="DecreaseLiquidity(uint256,uint128,uint256,uint256)").hex().removeprefix("0x"),
+    "col": "0x" + Web3.keccak(text="Collect(uint256,address,uint256,uint256)").hex().removeprefix("0x"),
+}
+
+
+def _logs(chain_id: int, addr: str, topic0: str, topic1: str) -> list[dict]:
+    """Log terfilter tokenId. fromBlock harus hex — Blockstock/Blockscout menolak
+    integer 0 dengan 'invalid address' yang menyesatkan."""
+    w3 = ch.get_w3(chain_id)
+    try:
+        r = w3.provider.make_request("eth_getLogs", [{
+            "address": Web3.to_checksum_address(addr), "fromBlock": "0x0",
+            "toBlock": "latest", "topics": [topic0, topic1]}])
+        raw = r.get("result")
+        if not isinstance(raw, list):
+            raise RuntimeError(str(r.get("error")))
+    except Exception:
+        # RPC membatasi rentang getLogs → lewat API explorer
+        try:
+            resp = requests.get(f"{ch.CHAINS[chain_id]['explorer']}/api", timeout=30, params={
+                "module": "logs", "action": "getLogs", "fromBlock": 0, "toBlock": "latest",
+                "address": addr, "topic0": topic0, "topic1": topic1, "topic0_1_opr": "and"})
+            raw = resp.json().get("result") or []
+        except Exception:
+            return []
+    out = []
+    for lg in raw:
+        d = str(lg.get("data") or "")
+        b = lg.get("blockNumber")
+        try:
+            bn = int(b, 16) if isinstance(b, str) else int(b)
+        except (TypeError, ValueError):
+            continue
+        out.append({"data": d.removeprefix("0x"), "block": bn})
+    return out
+
+
+def _words(hexdata: str) -> list[int]:
+    return [int(hexdata[i:i + 64], 16) for i in range(0, len(hexdata) - 63, 64)]
+
+
+def cost_basis(chain_id: int, tid: int, _cache={}) -> dict | None:
+    """Modal & hasil tarikan posisi v3 langsung dari event NPM (bukan dari
+    history.json lokal) — supaya PnL tetap benar walau posisinya di-mint di
+    luar bot ini. None kalau RPC tidak mendukung getLogs rentang penuh."""
+    ck = (chain_id, int(tid))
+    hit = _cache.get(ck)
+    if hit and time.time() - hit[1] < 120:
+        return hit[0]
+    npm = ch.CHAINS[chain_id]["npm"]
+    t1 = "0x" + f"{int(tid):064x}"
+    inc = _logs(chain_id, npm, NPM_TOPICS["inc"], t1)
+    if not inc:
+        _cache[ck] = (None, time.time())
+        return None
+    dec = _logs(chain_id, npm, NPM_TOPICS["dec"], t1)
+    col = _logs(chain_id, npm, NPM_TOPICS["col"], t1)
+
+    d0 = d1 = w0 = w1 = c0 = c1 = 0
+    for lg in inc:                     # (liquidity, amount0, amount1)
+        v = _words(lg["data"])
+        if len(v) >= 3:
+            d0 += v[1]; d1 += v[2]
+    for lg in dec:
+        v = _words(lg["data"])
+        if len(v) >= 3:
+            w0 += v[1]; w1 += v[2]
+    for lg in col:                     # (recipient, amount0, amount1)
+        v = _words(lg["data"])
+        if len(v) >= 3:
+            c0 += v[1]; c1 += v[2]
+    # Collect membawa principal hasil decrease + fee; selisihnya = fee terealisasi
+    res = {"dep0": d0, "dep1": d1, "wd0": w0, "wd1": w1,
+           "fee0": max(0, c0 - w0), "fee1": max(0, c1 - w1),
+           "first_block": min(lg["block"] for lg in inc)}
+    _cache[ck] = (res, time.time())
+    return res
+
+
+def _block_ts(chain_id: int, n: int, _cache={}) -> int | None:
+    if n in _cache:
+        return _cache[n]
+    try:
+        _cache[n] = int(ch.get_w3(chain_id).eth.get_block(n)["timestamp"])
+    except Exception:
+        _cache[n] = None
+    return _cache[n]
+
+
 def api_positions(q, _b) -> dict:
     cid = int(q.get("chain", [store.load_settings()["chain"]])[0])
     key = bot.pk()
     addr = bot._addr_of(key)
     pos = ch.list_all_positions(cid, key, store.refs(cid, addr, "v2"), store.refs(cid, addr, "v4"))
+
+    from concurrent.futures import ThreadPoolExecutor
+    v3ids = [str(p.get("pid") or p.get("token_id")) for p in pos
+             if p.get("ver", 3) == 3 and str(p.get("pid") or p.get("token_id")).isdigit()]
+    cbs = {}
+    if v3ids:
+        def safe(pid):
+            try:
+                return cost_basis(cid, int(pid))
+            except Exception:
+                return None
+        with ThreadPoolExecutor(max_workers=5) as ex:
+            cbs = {pid: cb for pid, cb in zip(v3ids, ex.map(safe, v3ids)) if cb}
+
     out = []
     for p in pos:
         pid = str(p.get("pid") or p.get("token_id"))
@@ -471,12 +582,65 @@ def api_positions(q, _b) -> dict:
         fees = store.fees_claimed_usd(cid, tid)
         wd = store.withdrawn_usd(cid, tid)
         cur = p.get("value_usd", 0) + p.get("unclaimed_usd", 0)
-        out.append({**{k: v for k, v in p.items() if isinstance(v, (int, float, str, bool, type(None)))},
-                    "pid": pid, "deposit_usd": dep, "fees_claimed_usd": fees,
-                    "withdrawn_usd": wd, "pnl_usd": (cur + fees + wd - dep) if dep else None,
-                    "age": store.fmt_age(store.mint_ts(cid, pid)),
-                    "link": ch.pos_link_any(cid, pid)})
+        d = {k: v for k, v in p.items() if isinstance(v, (int, float, str, bool, type(None)))}
+
+        # sisi meme vs quote + harga batas range (buat kartu ala UI LP)
+        q_is_t1 = p.get("quote_is_token1", True)
+        d["meme_sym"] = p["sym0"] if q_is_t1 else p["sym1"]
+        d["meme_amount"] = p["amount0"] if q_is_t1 else p["amount1"]
+        d["quote_amount"] = p["amount1"] if q_is_t1 else p["amount0"]
+        d["meme_fees"] = p["fees0"] if q_is_t1 else p["fees1"]
+        d["quote_fees"] = p["fees1"] if q_is_t1 else p["fees0"]
+        if p.get("ver") != 2 and p.get("tick_lower") is not None:
+            mdec = p["dec0"] if q_is_t1 else p["dec1"]
+            qdec = p["dec1"] if q_is_t1 else p["dec0"]
+
+            def pq(t, _m=mdec, _q=qdec, _t1=q_is_t1):
+                raw = ch.tick_to_price(t)
+                return (raw if _t1 else (1 / raw if raw else 0)) * 10 ** (_m - _q)
+            lo, hi = sorted([pq(p["tick_lower"]), pq(p["tick_upper"])])
+            now = pq(p["cur_tick"])
+            d.update(price_lower=lo, price_upper=hi, price_now=now,
+                     to_min_pct=(now / lo - 1) * 100 if lo else None,
+                     to_max_pct=(hi / now - 1) * 100 if now else None)
+        d.update(pid=pid, deposit_usd=dep, fees_claimed_usd=fees, withdrawn_usd=wd,
+                 pnl_usd=(cur + fees + wd - dep) if dep else None,
+                 basis="local" if dep else None,
+                 age=store.fmt_age(store.mint_ts(cid, tid)),
+                 link=ch.pos_link_any(cid, pid))
+        cb = cbs.get(pid)
+        if cb and d.get("price_now") and p.get("quote_sym"):
+            # semua dinilai pada harga SEKARANG → PnL sudah termasuk impermanent loss
+            try:
+                qusd = ch.quote_usd_price(ch.get_w3(cid), cid, p["quote_sym"])
+            except Exception:
+                qusd = 0.0
+            musd = d["price_now"] * qusd                    # USD per 1 meme
+            u0, u1 = (musd, qusd) if q_is_t1 else (qusd, musd)
+            e0, e1 = 10 ** p["dec0"], 10 ** p["dec1"]
+            dep_usd = cb["dep0"] / e0 * u0 + cb["dep1"] / e1 * u1
+            wd_usd = cb["wd0"] / e0 * u0 + cb["wd1"] / e1 * u1
+            fee_usd = cb["fee0"] / e0 * u0 + cb["fee1"] / e1 * u1
+            if dep_usd > 0:
+                d.update(deposit_usd=dep_usd, withdrawn_usd=wd_usd,
+                         fees_claimed_usd=fee_usd, basis="onchain",
+                         pnl_usd=cur + wd_usd + fee_usd - dep_usd)
+                ts = _block_ts(cid, cb["first_block"])
+                if ts:
+                    d["age"] = store.fmt_age(ts)
+        out.append(d)
     summ = store.portfolio_summary(cid, addr)
+    onchain = [p for p in out if p.get("basis") == "onchain"]
+    if onchain:   # ringkasan pakai data on-chain kalau tersedia (lebih lengkap)
+        summ["deposits"] = sum(p["deposit_usd"] for p in onchain)
+        summ["withdrawals"] = sum(p["withdrawn_usd"] for p in onchain)
+        summ["fees_claimed"] = sum(p["fees_claimed_usd"] for p in onchain)
+    summ["total_value"] = sum(p.get("value_usd", 0) for p in out)
+    summ["unclaimed"] = sum(p.get("unclaimed_usd", 0) for p in out)
+    summ["open"] = len(out)
+    summ["in_range"] = sum(1 for p in out if p.get("in_range"))
+    known = [p for p in out if p.get("pnl_usd") is not None]
+    summ["pnl"] = sum(p["pnl_usd"] for p in known) if known else None
     return {"positions": out, "summary": summ}
 
 

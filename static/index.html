@@ -49,30 +49,48 @@
 
       <div class="presets" id="presets"></div>
 
-      <div class="hint" id="dragHint">geser garis <b>MIN</b>/<b>MAX</b> di chart untuk atur range · scroll = zoom</div>
-
       <div class="tfrow">
+        <span class="hint" id="dragHint">geser <b>MIN</b>/<b>MAX</b> untuk atur range</span>
+        <div class="unitsw" id="unitsw">
+          <button data-u="mc" class="on">Market cap</button>
+          <button data-u="price">Price</button>
+        </div>
         <div class="tfs" id="tfs"></div>
-        <div class="srcinfo mono dim" id="srcinfo"></div>
       </div>
 
-      <div class="chartwrap">
-        <div id="chart"></div>
-        <div id="liqbox" class="liqbox"><canvas id="liq"></canvas></div>
+      <div id="chart"></div>
+      <div class="srcinfo mono dim" id="srcinfo"></div>
+
+      <div class="liqrow">
+        <div class="liqhead">
+          <span class="label">LIQUIDITY DISTRIBUTION</span>
+          <span class="dim" id="liqnow"></span>
+        </div>
+        <div id="liqwrap" class="liqwrap"><canvas id="liq"></canvas></div>
       </div>
 
       <div class="ranges" id="ranges">
         <div class="rbox">
-          <div class="rlabel">Min price</div>
+          <div class="rlabel">Min <span class="badge-pct" id="minPct"></span></div>
           <input id="minIn" class="mono" inputmode="decimal">
-          <div class="rpct" id="minPct"></div>
         </div>
         <div class="rbox">
-          <div class="rlabel">Max price</div>
+          <div class="rlabel">Max <span class="badge-pct" id="maxPct"></span></div>
           <input id="maxIn" class="mono" inputmode="decimal">
-          <div class="rpct" id="maxPct"></div>
         </div>
       </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head">
+        <span class="label">POOL ANALYTICS</span>
+        <div class="unitsw" id="anaSw" style="margin-left:auto">
+          <button data-a="liq" class="on">Liquidity</button>
+          <button data-a="vol">Volume</button>
+        </div>
+      </div>
+      <div id="anawrap" class="anawrap"><canvas id="ana"></canvas></div>
+      <div class="analeg dim" id="analeg"></div>
     </div>
 
     <div class="panel">
@@ -93,6 +111,13 @@
 
 <!-- ══════════ VIEW: POSITIONS ══════════ -->
 <main id="view-pos" class="hide">
+  <div class="poshead">
+    <div>
+      <h1>Positions</h1>
+      <div class="dim" id="posSub">Live dari chain — Uniswap v2, v3 & v4.</div>
+    </div>
+    <button id="posRefresh" class="ghost big">⟳ Refresh</button>
+  </div>
   <div class="pnl" id="pnl"></div>
   <div id="poslist" class="poslist"></div>
 </main>

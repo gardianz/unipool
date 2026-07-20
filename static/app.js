@@ -19,32 +19,37 @@ async function api(path, body) {
 // ── format ──
 const nf = (v, d = 2) => (v == null || isNaN(v)) ? '—' :
   Number(v).toLocaleString('en-US', {minimumFractionDigits: d, maximumFractionDigits: d});
+
 function usd(v) {
   if (v == null || isNaN(v)) return '—';
-  const a = Math.abs(v);
-  if (a >= 1e9) return '$' + nf(v / 1e9, 2) + 'B';
-  if (a >= 1e6) return '$' + nf(v / 1e6, 2) + 'M';
-  if (a >= 1e3) return '$' + nf(v / 1e3, 1) + 'K';
-  return '$' + nf(v, a < 1 ? 4 : 2);
+  const a = Math.abs(v), s = v < 0 ? '-$' : '$';
+  if (a >= 1e9) return s + nf(a / 1e9, 2) + 'B';
+  if (a >= 1e6) return s + nf(a / 1e6, 2) + 'M';
+  if (a >= 1e3) return s + nf(a / 1e3, 2) + 'K';
+  return s + nf(a, a < 1 ? 4 : 2);
 }
-function price(v) {
+
+/* Harga meme sering 1e-7 ke bawah. toPrecision() memberi notasi eksponen
+   ("8.26803e-7") yang tidak terbaca — selalu pakai desimal penuh. */
+function price(v, sig = 4) {
   if (v == null || !isFinite(v)) return '—';
   if (v === 0) return '0';
-  if (v >= 1) return nf(v, 4);
-  const s = v.toFixed(20), m = s.match(/^0\.(0*)/);
-  return v.toPrecision(Math.min(6, 3 + (m ? m[1].length : 0))).replace(/0+$/, '');
+  const a = Math.abs(v);
+  if (a >= 1000) return nf(v, 2);
+  if (a >= 1) return nf(v, 4);
+  const zeros = Math.max(0, Math.ceil(-Math.log10(a)) - 1);   // nol setelah koma
+  return v.toFixed(Math.min(18, zeros + sig)).replace(/(\.\d*?[1-9])0+$/, '$1');
 }
+
 function amt(v) {
   if (v == null || !isFinite(v)) return '—';
   if (v === 0) return '0';
   if (Math.abs(v) >= 1000) return nf(v, 2);
   if (Math.abs(v) >= 1) return nf(v, 4);
-  return v.toPrecision(4);
+  return price(v, 4);
 }
-function pctTxt(p) {
-  if (p == null || !isFinite(p)) return '';
-  return (p >= 0 ? '+' : '') + p.toFixed(2) + '%';
-}
+
+const pctTxt = p => (p == null || !isFinite(p)) ? '' : (p >= 0 ? '+' : '') + p.toFixed(2) + '%';
 
 let toastT;
 function toast(html, kind) {
@@ -52,7 +57,7 @@ function toast(html, kind) {
   t.className = 'toast ' + (kind || '');
   t.innerHTML = html;
   clearTimeout(toastT);
-  if (kind !== 'hold') toastT = setTimeout(() => t.classList.add('hide'), kind === 'err' ? 12000 : 8000);
+  if (kind !== 'hold') toastT = setTimeout(() => t.classList.add('hide'), kind === 'err' ? 14000 : 9000);
 }
 const modal = html => { $('#sheet').innerHTML = html; $('#modal').classList.remove('hide'); };
 const closeModal = () => $('#modal').classList.add('hide');
@@ -63,7 +68,18 @@ const S = {
   chain: null, settings: {}, token: null, pools: [], pool: null,
   tf: '15m', candles: [], min: null, max: null, mode: 'lower',
   preview: null, amountPct: 50, amountFixed: null, bars: [], busy: false,
+  unit: 'mc',        // sumbu harga: market cap atau harga quote
+  ana: 'liq',        // panel analytics: liquidity | volume
 };
+
+/* Market cap = harga(quote) × harga USD quote × total supply. Faktornya
+   konstan, jadi persen range identik di kedua satuan — cuma tampilannya
+   yang berubah, angka yang dikirim ke server tetap persen. */
+const mcFactor = () => (S.unit === 'mc' && S.pool && S.pool.supply)
+  ? S.pool.quote_usd * S.pool.supply : 1;
+const toUnit = p => p * mcFactor();
+const fromUnit = u => u / mcFactor();
+const fmtUnit = v => S.unit === 'mc' && mcFactor() !== 1 ? usd(v) : price(v);
 
 // ══════════ chart ══════════
 let chart, series, lineMin, lineMax, overlay, dragging = null;
@@ -73,8 +89,8 @@ let chart, series, lineMin, lineMax, overlay, dragging = null;
 function autoscale(orig) {
   const r = orig();
   if (S.min == null && S.max == null) return r;
-  const lo = Math.min(r ? r.priceRange.minValue : Infinity, S.min ?? Infinity);
-  const hi = Math.max(r ? r.priceRange.maxValue : -Infinity, S.max ?? -Infinity);
+  const lo = Math.min(r ? r.priceRange.minValue : Infinity, toUnit(S.min) ?? Infinity);
+  const hi = Math.max(r ? r.priceRange.maxValue : -Infinity, toUnit(S.max) ?? -Infinity);
   if (!isFinite(lo) || !isFinite(hi) || lo >= hi) return r;
   const pad = (hi - lo) * 0.05;
   return {priceRange: {minValue: lo - pad, maxValue: hi + pad}};
@@ -89,13 +105,13 @@ function initChart() {
     rightPriceScale: {borderColor: '#232a26', scaleMargins: {top: .12, bottom: .12}},
     timeScale: {borderColor: '#232a26', timeVisible: true, secondsVisible: false},
     crosshair: {mode: LightweightCharts.CrosshairMode.Normal},
-    localization: {priceFormatter: price},
+    localization: {priceFormatter: fmtUnit},
     handleScale: {axisPressedMouseMove: {price: false}},
   });
   series = chart.addCandlestickSeries({
     upColor: '#39d98a', downColor: '#ff5c5c', borderVisible: false,
     wickUpColor: '#39d98a', wickDownColor: '#ff5c5c',
-    priceFormat: {type: 'custom', formatter: price, minMove: 1e-8},
+    priceFormat: {type: 'custom', formatter: fmtUnit, minMove: 1e-8},
     autoscaleInfoProvider: autoscale,
   });
 
@@ -107,26 +123,25 @@ function initChart() {
     const h = document.createElement('div');
     h.dataset.k = k;
     Object.assign(h.style, {
-      position: 'absolute', left: '0', right: '0', height: '18px', marginTop: '-9px',
+      position: 'absolute', left: '0', right: '0', height: '20px', marginTop: '-10px',
       cursor: 'ns-resize', pointerEvents: 'auto', display: 'none',
     });
-    h.innerHTML = `<div style="position:absolute;left:0;right:0;top:8px;height:2px;background:#c8ff2e"></div>
-      <div style="position:absolute;right:4px;top:0;background:#c8ff2e;color:#0b0d0c;font:700 10px/18px ui-monospace,monospace;
-        padding:0 7px;border-radius:4px">${k.toUpperCase()}</div>`;
+    h.innerHTML = `<div style="position:absolute;left:0;right:0;top:9px;height:2px;background:#c8ff2e"></div>
+      <div style="position:absolute;left:6px;top:0;background:#c8ff2e;color:#0b0d0c;
+        font:700 10px/20px ui-monospace,monospace;padding:0 8px;border-radius:4px">${k.toUpperCase()}</div>`;
     overlay.appendChild(h);
     h.addEventListener('pointerdown', ev => {
       ev.preventDefault();
-      h.setPointerCapture(ev.pointerId);
+      try { h.setPointerCapture(ev.pointerId); } catch {}
       dragging = k;
     });
   }
   overlay.addEventListener('pointermove', ev => {
     if (!dragging) return;
     const y = ev.clientY - $('#chart').getBoundingClientRect().top;
-    const p = series.coordinateToPrice(y);
-    if (p == null || p <= 0) return;
-    if (dragging === 'min') S.min = Math.min(p, S.max ?? p * 2);
-    else S.max = Math.max(p, S.min ?? p / 2);
+    const u = series.coordinateToPrice(y);
+    if (u == null || u <= 0) return;
+    setBound(dragging, fromUnit(u));
     syncFromDrag(false);
   });
   const stop = () => { if (dragging) { dragging = null; syncFromDrag(true); } };
@@ -136,15 +151,30 @@ function initChart() {
   chart.timeScale().subscribeVisibleTimeRangeChange(drawHandles);
   new ResizeObserver(() => {
     chart.applyOptions({width: el.clientWidth, height: el.clientHeight});
-    drawHandles(); drawLiq();
+    drawHandles();
   }).observe(el);
+}
+
+/* MIN/MAX tidak boleh saling melewati, dan tidak boleh nempel persis di harga
+   sekarang: single-sided butuh jarak minimal 1 tick-spacing dari harga, kalau
+   nempel liquidity-nya 0 dan mint revert. */
+function setBound(which, v) {
+  const now = S.pool.price;
+  const eps = Math.max(now * 0.002, now * (S.pool.tick_spacing || 60) * 1e-4);
+  if (which === 'min') {
+    if (S.max != null && v > S.max - eps) v = S.max - eps;
+    S.min = Math.max(v, now * 1e-6);
+  } else {
+    if (S.min != null && v < S.min + eps) v = S.min + eps;
+    S.max = v;
+  }
 }
 
 function drawHandles() {
   if (!series || !overlay) return;
   for (const h of overlay.children) {
     const v = h.dataset.k === 'min' ? S.min : S.max;
-    const y = v ? series.priceToCoordinate(v) : null;
+    const y = v ? series.priceToCoordinate(toUnit(v)) : null;
     if (y == null) { h.style.display = 'none'; continue; }
     h.style.display = 'block';
     h.style.top = y + 'px';
@@ -156,7 +186,7 @@ function setPriceLines() {
   if (!series) return;
   for (const l of [lineMin, lineMax]) if (l) series.removePriceLine(l);
   const mk = (v, t) => v ? series.createPriceLine({
-    price: v, color: '#c8ff2e', lineWidth: 1,
+    price: toUnit(v), color: '#c8ff2e', lineWidth: 1,
     lineStyle: LightweightCharts.LineStyle.Dashed, axisLabelVisible: true, title: t,
   }) : null;
   lineMin = mk(S.min, 'MIN');
@@ -165,48 +195,184 @@ function setPriceLines() {
   drawHandles();
 }
 
-// histogram likuiditas di kanan chart, sejajar skala harga
+// ══════════ histogram likuiditas horizontal (sumbu-x = harga/MC) ══════════
+let liqDrag = null;
+
+function liqBounds() {
+  const now = S.pool ? S.pool.price : 0;
+  let lo = Math.min(S.min ?? now, now) * 0.55;
+  let hi = Math.max(S.max ?? now, now) * 1.8;
+  for (const b of S.bars) { lo = Math.min(lo, b.p0); hi = Math.max(hi, b.p1); }
+  // batasi ke sekitar harga supaya bar tidak jadi garis rambut
+  lo = Math.max(lo, now / 12);
+  hi = Math.min(hi, now * 12);
+  return [lo, hi];
+}
+
 function drawLiq() {
   const cv = $('#liq');
-  if (!cv || !series) return;
-  const box = $('#liqbox').getBoundingClientRect();
+  if (!cv || !S.pool) return;
+  const box = $('#liqwrap').getBoundingClientRect();
   const dpr = window.devicePixelRatio || 1;
   const W = Math.max(1, box.width), H = Math.max(1, box.height);
   cv.width = W * dpr; cv.height = H * dpr;
   const g = cv.getContext('2d');
   g.setTransform(dpr, 0, 0, dpr, 0, 0);
   g.clearRect(0, 0, W, H);
-  if (!S.bars.length) {
-    g.fillStyle = '#3a463f'; g.font = '10px system-ui'; g.textAlign = 'center';
-    g.fillText('no liq data', W / 2, H / 2);
+  const padB = 20, plotH = H - padB;
+
+  if (S.pool.ver === 2) {
+    g.fillStyle = 'rgba(200,255,46,.30)';
+    g.fillRect(0, 0, W, plotH);
+    g.fillStyle = '#7f8f85'; g.font = '11px system-ui'; g.textAlign = 'center';
+    g.fillText('v2 = likuiditas merata di semua harga (full range)', W / 2, plotH / 2);
     return;
   }
-  const vertical = box.width > box.height;   // desktop: bar horizontal, mobile: dibalik
+  if (!S.bars.length) {
+    g.fillStyle = '#3a463f'; g.font = '11px system-ui'; g.textAlign = 'center';
+    g.fillText('peta likuiditas tidak tersedia', W / 2, plotH / 2);
+    return;
+  }
+
+  const [lo, hi] = liqBounds();
+  const lg = Math.log(lo), rg = Math.log(hi) - lg;      // skala log: sesuai sifat tick
+  const X = p => (Math.log(Math.max(p, 1e-300)) - lg) / rg * W;
   const maxL = Math.max(...S.bars.map(b => b.liq)) || 1;
-  const now = S.pool ? S.pool.price : 0;
+  const now = S.pool.price;
+
   for (const b of S.bars) {
-    const y0 = series.priceToCoordinate(b.p1), y1 = series.priceToCoordinate(b.p0);
-    if (y0 == null || y1 == null) continue;
-    const h = Math.max(1, Math.abs(y1 - y0)), y = Math.min(y0, y1);
-    if (y > H || y + h < 0) continue;
-    const inR = S.min && S.max && b.p1 >= S.min && b.p0 <= S.max;
-    const w = Math.max(1, (b.liq / maxL) * (W - 4));
-    g.fillStyle = inR ? 'rgba(200,255,46,.85)' : 'rgba(120,140,128,.4)';
-    if (vertical) g.fillRect(0, y, w, h);
-    else g.fillRect(0, y, w, h);
+    const x0 = X(b.p0), x1 = X(b.p1);
+    if (x1 < 0 || x0 > W) continue;
+    const h = Math.max(2, (b.liq / maxL) * (plotH - 6));
+    const inR = S.min != null && S.max != null && b.p1 > S.min && b.p0 < S.max;
+    g.fillStyle = inR ? 'rgba(200,255,46,.85)' : 'rgba(120,140,128,.35)';
+    g.fillRect(x0, plotH - h, Math.max(1, x1 - x0 - 0.5), h);
   }
-  const yn = series.priceToCoordinate(now);
-  if (yn != null) {
-    g.strokeStyle = '#e8efe9'; g.lineWidth = 1;
-    g.beginPath(); g.moveTo(0, yn + .5); g.lineTo(W, yn + .5); g.stroke();
+
+  // area range + garis harga sekarang
+  if (S.min != null && S.max != null) {
+    g.strokeStyle = '#c8ff2e'; g.lineWidth = 2;
+    for (const [v, lbl] of [[S.min, 'MIN'], [S.max, 'MAX']]) {
+      const x = Math.max(1, Math.min(W - 1, X(v)));
+      g.beginPath(); g.moveTo(x, 0); g.lineTo(x, plotH); g.stroke();
+      g.fillStyle = '#c8ff2e';
+      g.fillRect(x - 14, 0, 28, 13);
+      g.fillStyle = '#0b0d0c'; g.font = '700 9px ui-monospace,monospace'; g.textAlign = 'center';
+      g.fillText(lbl, x, 10);
+    }
   }
+  const xn = X(now);
+  g.strokeStyle = '#e8efe9'; g.lineWidth = 1;
+  g.setLineDash([3, 3]);
+  g.beginPath(); g.moveTo(xn, 0); g.lineTo(xn, plotH); g.stroke();
+  g.setLineDash([]);
+
+  // sumbu-x
+  g.fillStyle = '#7f8f85'; g.font = '10px ui-monospace,monospace';
+  g.textAlign = 'left'; g.fillText(fmtUnit(toUnit(lo)), 2, H - 6);
+  g.textAlign = 'center'; g.fillText(fmtUnit(toUnit(now)), Math.max(40, Math.min(W - 40, xn)), H - 6);
+  g.textAlign = 'right'; g.fillText(fmtUnit(toUnit(hi)), W - 2, H - 6);
+  $('#liqnow').textContent = 'sekarang ' + fmtUnit(toUnit(now));
+}
+
+function liqPriceAt(clientX) {
+  const box = $('#liqwrap').getBoundingClientRect();
+  const [lo, hi] = liqBounds();
+  const f = Math.max(0, Math.min(1, (clientX - box.left) / box.width));
+  return Math.exp(Math.log(lo) + f * (Math.log(hi) - Math.log(lo)));
+}
+
+function initLiqDrag() {
+  const w = $('#liqwrap');
+  w.addEventListener('pointerdown', ev => {
+    if (!S.pool || S.pool.ver === 2 || S.min == null) return;
+    const p = liqPriceAt(ev.clientX);
+    liqDrag = Math.abs(Math.log(p / S.min)) < Math.abs(Math.log(p / S.max)) ? 'min' : 'max';
+    try { w.setPointerCapture(ev.pointerId); } catch {}
+    setBound(liqDrag, p);
+    syncFromDrag(false);
+  });
+  w.addEventListener('pointermove', ev => {
+    if (!liqDrag) return;
+    setBound(liqDrag, liqPriceAt(ev.clientX));
+    syncFromDrag(false);
+  });
+  const stop = () => { if (liqDrag) { liqDrag = null; syncFromDrag(true); } };
+  w.addEventListener('pointerup', stop);
+  w.addEventListener('pointercancel', stop);
+  new ResizeObserver(drawLiq).observe(w);
+}
+
+// ══════════ analytics: liquidity / volume ══════════
+function drawAna() {
+  const cv = $('#ana');
+  if (!cv || !S.pool) return;
+  const box = $('#anawrap').getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  const W = Math.max(1, box.width), H = Math.max(1, box.height);
+  cv.width = W * dpr; cv.height = H * dpr;
+  const g = cv.getContext('2d');
+  g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  g.clearRect(0, 0, W, H);
+  const padB = 18, plotH = H - padB;
+
+  if (S.ana === 'vol') {
+    const c = S.candles;
+    if (!c.length) { note(g, W, plotH, 'volume tidak tersedia'); return; }
+    const q = S.pool.quote_usd || 0;
+    const vols = c.map(x => x.volume * q);        // GeckoTerminal: volume dalam token quote
+    const mx = Math.max(...vols) || 1;
+    const bw = W / vols.length;
+    vols.forEach((v, i) => {
+      const h = (v / mx) * (plotH - 4);
+      g.fillStyle = c[i].close >= c[i].open ? 'rgba(57,217,138,.75)' : 'rgba(255,92,92,.75)';
+      g.fillRect(i * bw, plotH - h, Math.max(1, bw - 1), h);
+    });
+    const total = vols.reduce((a, b) => a + b, 0);
+    $('#analeg').innerHTML = `${c.length} candle ${S.tf.toUpperCase()} · total ${usd(total)}
+      · puncak ${usd(mx)} · rata-rata ${usd(total / vols.length)}`;
+    g.fillStyle = '#7f8f85'; g.font = '10px ui-monospace,monospace';
+    g.textAlign = 'left'; g.fillText(usd(mx), 2, 10);
+    return;
+  }
+
+  // likuiditas kumulatif per sisi (berapa token nampung di tiap harga)
+  if (!S.bars.length) { note(g, W, plotH, 'peta likuiditas tidak tersedia'); return; }
+  const [lo, hi] = liqBounds();
+  const lg = Math.log(lo), rg = Math.log(hi) - lg;
+  const X = p => (Math.log(Math.max(p, 1e-300)) - lg) / rg * W;
+  const now = S.pool.price;
+  const maxL = Math.max(...S.bars.map(b => b.liq)) || 1;
+  for (const b of S.bars) {
+    const x0 = X(b.p0), x1 = X(b.p1);
+    const h = Math.max(2, (b.liq / maxL) * (plotH - 4));
+    // di bawah harga = sisi quote (nampung beli), di atas = sisi token (jual)
+    g.fillStyle = b.p1 <= now ? 'rgba(90,169,255,.7)' : 'rgba(200,255,46,.7)';
+    g.fillRect(x0, plotH - h, Math.max(1, x1 - x0 - 0.5), h);
+  }
+  const xn = X(now);
+  g.strokeStyle = '#e8efe9'; g.lineWidth = 1;
+  g.beginPath(); g.moveTo(xn, 0); g.lineTo(xn, plotH); g.stroke();
+  g.fillStyle = '#7f8f85'; g.font = '10px ui-monospace,monospace';
+  g.textAlign = 'left'; g.fillText(fmtUnit(toUnit(lo)), 2, H - 5);
+  g.textAlign = 'right'; g.fillText(fmtUnit(toUnit(hi)), W - 2, H - 5);
+  const q = S.pool.quote_sym, t = S.pool.token_sym;
+  $('#analeg').innerHTML = `<span style="color:#5aa9ff">■</span> sisi ${q} (di bawah harga — nampung beli)
+     · <span style="color:#c8ff2e">■</span> sisi ${t} (di atas harga — jual bertahap)
+     · ${S.bars.length} tick-range aktif`;
+}
+
+function note(g, W, H, txt) {
+  g.fillStyle = '#3a463f'; g.font = '11px system-ui'; g.textAlign = 'center';
+  g.fillText(txt, W / 2, H / 2);
+  $('#analeg').textContent = '';
 }
 
 // ══════════ range ⇄ mode ══════════
 function modeFromRange() {
   const now = S.pool.price;
-  if (S.max != null && S.max <= now * 1.0005) return 'lower';   // range di bawah harga
-  if (S.min != null && S.min >= now * 0.9995) return 'upper';   // range di atas harga
+  if (S.max != null && S.max <= now * 1.002) return 'lower';
+  if (S.min != null && S.min >= now * 0.998) return 'upper';
   return 'wide';
 }
 
@@ -220,14 +386,20 @@ function pctsFromRange() {
 
 let prevT;
 function syncFromDrag(final) {
-  $('#minIn').value = price(S.min);
-  $('#maxIn').value = price(S.max);
   const now = S.pool.price;
-  $('#minPct').textContent = pctTxt(((S.min ?? now) / now - 1) * 100);
-  $('#maxPct').textContent = pctTxt(((S.max ?? now) / now - 1) * 100);
+  $('#minIn').value = fmtUnit(toUnit(S.min));
+  $('#maxIn').value = fmtUnit(toUnit(S.max));
+  setPct('#minPct', ((S.min ?? now) / now - 1) * 100);
+  setPct('#maxPct', ((S.max ?? now) / now - 1) * 100);
   setPriceLines();
   clearTimeout(prevT);
-  prevT = setTimeout(refreshPreview, final ? 0 : 350);
+  prevT = setTimeout(refreshPreview, final ? 0 : 400);
+}
+
+function setPct(sel, v) {
+  const el = $(sel);
+  el.textContent = pctTxt(v);
+  el.className = 'badge-pct ' + (v >= 0 ? 'up' : 'down');
 }
 
 function applyPreset(mode, low, up) {
@@ -261,12 +433,14 @@ async function refreshPreview() {
     if (seq !== previewSeq || !S.pool || S.pool.key !== poolKey) return;  // sudah basi
     p.req = {mode: S.mode, low_pct, up_pct};   // dipakai lagi saat mint, biar persis
     S.preview = p;
+    setPrice(p.price);
     if (p.ver !== 2) {
       // snap ke tick asli hasil server (sudah dibulatkan ke tick spacing)
       S.min = p.price_lower; S.max = p.price_upper;
-      $('#minIn').value = price(S.min); $('#maxIn').value = price(S.max);
-      $('#minPct').textContent = pctTxt(p.pct_lower);
-      $('#maxPct').textContent = pctTxt(p.pct_upper);
+      $('#minIn').value = fmtUnit(toUnit(S.min));
+      $('#maxIn').value = fmtUnit(toUnit(S.max));
+      setPct('#minPct', p.pct_lower);
+      setPct('#maxPct', p.pct_upper);
       setPriceLines();
     }
     renderDeposit(p);
@@ -275,6 +449,18 @@ async function refreshPreview() {
     $('#depinfo').innerHTML = '<span class="bad">' + e.message + '</span>';
     $('#mint').disabled = true;
   }
+}
+
+/* Harga bergerak terus. Kalau S.pool.price basi, persen range dihitung
+   terhadap harga lama → preset −30% bisa tampil jadi −66%. Setiap respons
+   server membawa harga terbaru; pakai itu. */
+function setPrice(p) {
+  if (!(p > 0) || !S.pool) return;
+  if (Math.abs(p / S.pool.price - 1) < 1e-9) return;
+  S.pool.price = p;
+  S.pool.price_usd = p * S.pool.quote_usd;
+  renderStats();
+  drawLiq(); drawAna();
 }
 
 const MODE_TXT = {
@@ -289,17 +475,17 @@ function renderDeposit(p) {
   $('#amtSym').textContent = p.dep_sym;
   if (!S.amountFixed) $('#amt').value = amt(p.amount);
   $('#sideNote').innerHTML = p.ver === 2 ? 'v2 = full range 50/50' :
-    (S.mode === 'lower' ? `Range below market, deposits ${p.dep_sym} only` :
-     S.mode === 'upper' ? `Range above market, deposits ${p.dep_sym} only` :
-     'Two-sided range');
+    (S.mode === 'lower' ? `Range di bawah harga · deposit ${p.dep_sym} saja` :
+     S.mode === 'upper' ? `Range di atas harga · deposit ${p.dep_sym} saja` :
+     'Range dua sisi');
   const rows = [];
   if (p.ver === 2) {
     rows.push('LP v2 full range 50/50 — fee 0.3% auto-compound.');
   } else {
     rows.push(MODE_TXT[S.mode]);
-    rows.push(`Range: <b>${price(p.price_lower)}</b> – <b>${price(p.price_upper)}</b> ${t.quote_sym}/${t.token_sym}
+    const unit = S.unit === 'mc' && mcFactor() !== 1 ? 'market cap' : `${t.quote_sym}/${t.token_sym}`;
+    rows.push(`Range (${unit}): <b>${fmtUnit(toUnit(p.price_lower))}</b> – <b>${fmtUnit(toUnit(p.price_upper))}</b>
       <span class="dim">(tick ${p.tick_lower} … ${p.tick_upper})</span>`);
-    if (p.mc_lower) rows.push(`Market cap range: <b>${usd(p.mc_lower)}</b> – <b>${usd(p.mc_upper)}</b>`);
     if (p.comp) rows.push(`Komposisi: <b>${amt(p.comp.quote)}</b> ${t.quote_sym} masuk pool` +
       (p.comp.swap > 0 ? ` · swap <b>${amt(p.comp.swap)}</b> ${t.quote_sym} → ${t.token_sym}` : ' · tanpa swap'));
   }
@@ -309,6 +495,18 @@ function renderDeposit(p) {
   $('#mint').textContent = p.amount > 0 ? `Mint position · ${amt(p.amount)} ${p.dep_sym}` : 'Saldo kosong';
 }
 
+function renderStats() {
+  const p = S.pool;
+  if (!p) return;
+  $('#stats').innerHTML = `
+    <div><small>Price (${p.quote_sym}/${p.token_sym})</small><b>${price(p.price)}</b></div>
+    <div><small>Price USD</small><b>${usd(p.price_usd)}</b></div>
+    <div><small>Market cap</small><b>${usd(p.price * p.quote_usd * (p.supply || 0)) }</b></div>
+    <div><small>TVL</small><b>${usd(p.tvl_usd)}</b></div>
+    <div><small>Volume 24H</small><b>${usd(p.vol24_usd)}</b></div>
+    <div><small>Pool APR</small><b>${p.apr_pct ? nf(p.apr_pct, 1) + '%' : '—'}</b></div>`;
+}
+
 // ══════════ load pool ══════════
 async function loadCandles() {
   $('#srcinfo').textContent = 'memuat chart...';
@@ -316,8 +514,10 @@ async function loadCandles() {
     const r = await api(`/api/candles?key=${encodeURIComponent(S.pool.key)}&tf=${S.tf}` +
                         (TOKEN ? `&t=${encodeURIComponent(TOKEN)}` : ''));
     S.candles = r.candles;
-    series.setData(r.candles);
-    if (r.candles.length) chart.timeScale().fitContent();
+    if (r.quote_usd) S.pool.quote_usd = r.quote_usd;
+    if (r.supply) S.pool.supply = r.supply;
+    setPrice(r.price);
+    applyCandles();
     $('#srcinfo').textContent = r.candles.length
       ? `${r.candles.length} candle · sumber: ${r.source}`
       : 'chart belum tersedia (pool terlalu baru / belum di-index)';
@@ -326,24 +526,25 @@ async function loadCandles() {
     series.setData([]);
     $('#srcinfo').textContent = 'chart gagal: ' + e.message;
   }
-  drawHandles();
+  drawHandles(); drawAna();
+}
+
+function applyCandles() {
+  const f = mcFactor();
+  series.setData(S.candles.map(c => ({
+    time: c.time, open: c.open * f, high: c.high * f, low: c.low * f, close: c.close * f,
+  })));
+  if (S.candles.length) chart.timeScale().fitContent();
+  setPriceLines();
 }
 
 async function loadLiq() {
   try {
     const r = await api('/api/liquidity', {key: S.pool.key});
     S.bars = r.bars || [];
+    setPrice(r.price);
   } catch { S.bars = []; }
-  drawLiq();
-}
-
-// Skala harga meme sering sangat kecil (1e-7 dst). minMove harus 10^-n dengan
-// n ≤ 14 — di bawah itu library gagal ("unexpected base") karena 1/minMove
-// tidak lolos cek pangkat-10 dalam float.
-function tuneScale(px) {
-  const zeros = px > 0 && px < 1 ? Math.ceil(-Math.log10(px)) : 0;
-  const dec = Math.min(14, Math.max(4, zeros + 5));
-  series.applyOptions({priceFormat: {type: 'custom', formatter: price, minMove: Math.pow(10, -dec)}});
+  drawLiq(); drawAna();
 }
 
 async function openPool(key) {
@@ -353,17 +554,10 @@ async function openPool(key) {
   initChart();
   const p = await api('/api/pool', {key});
   S.pool = p;
-  tuneScale(p.price);
   $('#pair').textContent = `${p.token_sym} / ${p.quote_sym}`;
   $('#pairsub').innerHTML = `<span class="badge v${p.ver}">v${p.ver}</span> fee ${p.fee_pct.toFixed(2)}%
-    · <span class="mono">${p.pool.slice(0, 10)}…${p.pool.slice(-6)}</span>`;
-  $('#stats').innerHTML = `
-    <div><small>Price (${p.quote_sym}/${p.token_sym})</small><b>${price(p.price)}</b></div>
-    <div><small>Price USD</small><b>${usd(p.price_usd)}</b></div>
-    <div><small>TVL</small><b>${usd(p.tvl_usd)}</b></div>
-    <div><small>Volume 24H</small><b>${usd(p.vol24_usd)}</b></div>
-    <div><small>Pool APR</small><b>${p.apr_pct ? nf(p.apr_pct, 0) + '%' : '—'}</b></div>
-    <div><small>Market cap</small><b>${usd(p.mc_usd)}</b></div>`;
+    · <span class="mono">${String(p.pool).slice(0, 10)}…${String(p.pool).slice(-6)}</span>`;
+  renderStats();
   buildPresets();
   applyPreset('lower', 30, 30);
   await Promise.all([loadCandles(), loadLiq()]);
@@ -374,7 +568,7 @@ function buildPresets() {
   $('#presets').innerHTML = v2 ? '<span class="dim">v2 selalu full range</span>' : `
     <button data-m="lower" data-l="10">−10% single</button>
     <button data-m="lower" data-l="20">−20% single</button>
-    <button data-m="lower" data-l="30">−30% single</button>
+    <button data-m="lower" data-l="30" class="on">−30% single</button>
     <button data-m="lower" data-l="50">−50% single</button>
     <button data-m="upper" data-u="20">+20% single</button>
     <button data-m="upper" data-u="50">+50% single</button>
@@ -397,7 +591,6 @@ function buildPresets() {
       loadCandles();
     };
   }
-  // v2 = selalu full range: tidak ada MIN/MAX untuk diatur
   $('#presets').classList.toggle('hide', v2);
   $('#ranges').classList.toggle('hide', v2);
   $('#dragHint').classList.toggle('hide', v2);
@@ -423,7 +616,7 @@ async function discover() {
           <div class="dim" style="font-size:11px">fee ${p.fee_pct.toFixed(2)}%</div></div>
         <div class="cell"><small>TVL</small>${usd(p.tvl_usd)}</div>
         <div class="cell"><small>Vol 24H</small>${usd(p.vol24_usd)}</div>
-        <div class="cell"><small>APR</small>${p.apr_pct ? nf(p.apr_pct, 0) + '%' : '—'}</div>
+        <div class="cell"><small>APR</small>${p.apr_pct ? nf(p.apr_pct, 1) + '%' : '—'}</div>
         <div class="cell"><small>Fee tier</small>${p.fee_pct.toFixed(2)}%</div>
       </div>`).join('');
     for (const el of $('#pools').querySelectorAll('.poolrow')) {
@@ -441,8 +634,9 @@ async function discover() {
 async function doMint() {
   if (S.busy || !S.preview) return;
   const p = S.preview, t = S.pool;
+  const unit = S.unit === 'mc' && mcFactor() !== 1 ? 'market cap' : `${t.quote_sym}/${t.token_sym}`;
   const range = p.ver === 2 ? 'full range (v2)' :
-    `${price(p.price_lower)} – ${price(p.price_upper)} ${t.quote_sym}/${t.token_sym}`;
+    `${fmtUnit(toUnit(p.price_lower))} – ${fmtUnit(toUnit(p.price_upper))} (${unit})`;
   modal(`<h3>Konfirmasi mint</h3>
     <div class="dim" style="font-size:13px;line-height:1.8">
       Pool <b class="mono">${t.token_sym}/${t.quote_sym}</b> v${t.ver} · fee ${t.fee_pct.toFixed(2)}%<br>
@@ -460,7 +654,6 @@ async function doMint() {
     $('#mint').disabled = true;
     toast('<span class="spin"></span> Minting... jangan tutup halaman.', 'hold');
     try {
-      // pakai persen yang persis menghasilkan preview yang dikonfirmasi user
       const req = p.req || {mode: S.mode, ...pctsFromRange()};
       const r = await api('/api/mint', {
         key: t.key, ...req,
@@ -486,10 +679,13 @@ async function loadPositions() {
     const s = r.summary;
     const net = s.withdrawals + s.fees_claimed - s.deposits;
     $('#pnl').innerHTML = `
-      <div><small>Deposit</small><b>${usd(s.deposits)}</b></div>
-      <div><small>Withdrawn</small><b>${usd(s.withdrawals)}</b></div>
-      <div><small>Fee terklaim</small><b class="ok">${usd(s.fees_claimed)}</b></div>
-      <div><small>Realized</small><b class="${net >= 0 ? 'ok' : 'bad'}">${usd(net)}</b></div>`;
+      <div><small>Total value</small><b>${usd(s.total_value)}</b></div>
+      <div><small>PnL tercatat</small><b class="${(s.pnl ?? 0) >= 0 ? 'ok' : 'bad'}">${s.pnl == null ? '—' : usd(s.pnl)}</b></div>
+      <div><small>Fee unclaimed</small><b class="ok">${usd(s.unclaimed)}</b></div>
+      <div><small>Fee terklaim</small><b>${usd(s.fees_claimed)}</b></div>
+      <div><small>Posisi terbuka</small><b>${s.open}</b></div>
+      <div><small>In range</small><b>${s.in_range} / ${s.open}</b></div>`;
+    $('#posSub').innerHTML = `Live dari chain · realized ${usd(net)} (deposit ${usd(s.deposits)}, withdraw ${usd(s.withdrawals)})`;
     if (!r.positions.length) {
       $('#poslist').innerHTML = '<div class="empty">Belum ada posisi aktif.</div>';
       return;
@@ -503,35 +699,70 @@ async function loadPositions() {
   }
 }
 
+/* Bar range ala UI LP: kotak-kotak dari MIN ke MAX, penanda harga sekarang.
+   Bagian yang "terpakai" (sisi token yang masih dipegang) diwarnai. */
+function rangeBar(p) {
+  if (p.ver === 2 || p.price_lower == null) {
+    return `<div class="rbar full"><i style="left:0;right:0"></i></div>
+      <div class="rbar-lbl dim"><span>0</span><span>full range (v2)</span><span>∞</span></div>`;
+  }
+  const lo = Math.log(p.price_lower), hi = Math.log(p.price_upper);
+  const at = Math.max(0, Math.min(1, (Math.log(p.price_now) - lo) / (hi - lo || 1)));
+  let cells = '';
+  for (let i = 0; i < 34; i++) {
+    const f = (i + .5) / 34;
+    cells += `<u class="${f <= at ? 'a' : 'b'}"></u>`;
+  }
+  return `<div class="rbar">${cells}<b style="left:${at * 100}%"></b></div>
+    <div class="rbar-lbl">
+      <span class="mono">${price(p.price_lower)}</span>
+      <span class="dim">${p.quote_sym}/${p.meme_sym}</span>
+      <span class="mono">${price(p.price_upper)}</span>
+    </div>`;
+}
+
 function posCard(p) {
   const ver = p.ver || (String(p.pid).startsWith('v4') ? 4 : String(p.pid).startsWith('v2') ? 2 : 3);
-  const inR = p.in_range;
-  const lo = Math.min(p.tick_lower, p.tick_upper), hi = Math.max(p.tick_lower, p.tick_upper);
-  const span = hi - lo || 1;
-  const at = Math.max(0, Math.min(1, (p.cur_tick - lo) / span)) * 100;
   const pnl = p.pnl_usd;
+  const pnlPct = (pnl != null && p.deposit_usd) ? (pnl / p.deposit_usd * 100) : null;
+  const dist = p.ver === 2 || p.price_lower == null ? 'full range' :
+    p.in_range
+      ? `in range · ${nf(p.to_min_pct, 1)}% ke min · ${nf(p.to_max_pct, 1)}% ke max`
+      : (p.price_now > p.price_upper
+          ? `out of range · harga ${nf((p.price_now / p.price_upper - 1) * 100, 1)}% di atas range`
+          : `out of range · harga ${nf((1 - p.price_now / p.price_lower) * 100, 1)}% di bawah range`);
   return `<div class="pos">
     <div class="top">
+      <span class="name">${p.quote_sym || p.sym1} / ${p.meme_sym || p.sym0}</span>
       <span class="badge v${ver}">v${ver}</span>
-      <span class="name">${p.sym1 || ''} / ${p.sym0 || ''}</span>
-      <span class="dim mono">${p.pid}</span>
-      <span class="${inR ? 'ok' : 'bad'}">${inR ? '● in range' : '○ out of range'}</span>
+      <span class="chip">${(p.fee / 10000).toFixed(2)}%</span>
+      <span class="chip mono">${p.pid}</span>
       <span class="dim" style="margin-left:auto">${p.age || ''}</span>
     </div>
-    <div class="bar"><i style="left:0;right:0"></i><u style="left:${at}%"></u></div>
-    <div class="grid">
-      <div><small>Value</small><span>${usd(p.value_usd)}</span></div>
-      <div><small>Fee unclaimed</small><span class="ok">${usd(p.unclaimed_usd)}</span></div>
-      <div><small>Deposit</small><span>${usd(p.deposit_usd)}</span></div>
-      <div><small>PnL</small><span class="${pnl == null ? '' : pnl >= 0 ? 'ok' : 'bad'}">${pnl == null ? '—' : usd(pnl)}</span></div>
+    <div class="tags">
+      ${pnl == null ? '<span class="tag neutral">PnL belum tercatat</span>' :
+        `<span class="tag ${pnl >= 0 ? 'up' : 'down'}" title="${p.basis === 'onchain'
+          ? 'modal dibaca dari event on-chain, dinilai pada harga sekarang (sudah termasuk impermanent loss)'
+          : 'dari riwayat lokal bot'}">${pnl >= 0 ? '▲' : '▼'} ${usd(pnl)}${pnlPct == null ? '' : ` (${pctTxt(pnlPct)})`}</span>`}
+      <span class="tag ${p.in_range ? 'in' : 'out'}">${p.in_range ? '● in range' : '○ out of range'}</span>
+    </div>
+    ${rangeBar(p)}
+    <div class="posnote dim">${dist}</div>
+    <div class="kv">
+      <div><span>Value</span><b>${usd(p.value_usd)}</b></div>
+      <div><span>Deposited</span><b>${p.deposit_usd ? usd(p.deposit_usd) : '—'}</b></div>
+      <div><span>Fee unclaimed</span><b class="ok">${usd(p.unclaimed_usd)}</b></div>
+      <div><span>Fee terklaim</span><b>${usd(p.fees_claimed_usd)}</b></div>
+      <div><span>${p.quote_sym || 'quote'}</span><b class="mono">${amt(p.quote_amount)}</b></div>
+      <div><span>${p.meme_sym || 'token'}</span><b class="mono">${amt(p.meme_amount)}</b></div>
     </div>
     <div class="acts">
+      ${ver === 2 ? '' : `<button class="primary sm" data-act="rebalance" data-pid="${p.pid}" data-ver="${ver}">⚖️ Rebalance</button>
+      <button data-act="collect" data-pid="${p.pid}" data-ver="${ver}">💰 Collect fees</button>`}
       <button data-act="add" data-pid="${p.pid}" data-ver="${ver}">➕ Add</button>
       <button data-act="reduce" data-pid="${p.pid}" data-ver="${ver}">➖ Reduce</button>
-      ${ver === 2 ? '' : `<button data-act="collect" data-pid="${p.pid}" data-ver="${ver}">💰 Fee</button>
-      <button data-act="rebalance" data-pid="${p.pid}" data-ver="${ver}">⚖️ Rebalance</button>`}
-      <button class="danger" data-act="close" data-pid="${p.pid}" data-ver="${ver}">🗑 Close</button>
-      ${p.link ? `<a href="${p.link}" target="_blank" rel="noopener" style="align-self:center;font-size:12px">↗ Uniswap</a>` : ''}
+      <button class="danger" data-act="close" data-pid="${p.pid}" data-ver="${ver}">Close</button>
+      ${p.link ? `<a class="btnlink" href="${p.link}" target="_blank" rel="noopener">↗ Uniswap</a>` : ''}
     </div>
   </div>`;
 }
@@ -580,10 +811,10 @@ function posAction(pid, act, ver) {
   } else if (act === 'close') {
     modal(`<h3>Close ${pid}?</h3><div class="dim" style="font-size:13px">
       Tarik semua liquidity + fee. ${ver == 2 ? '' : 'Sisa token bisa di-swap otomatis ke wrapped native.'}</div>
-      ${btns(`<button class="danger" id="ca">Close + auto-swap</button>
-              <button id="cn">Close saja</button>`)}`);
-    $('#ca').onclick = () => run({autoswap: true});
-    $('#cn').onclick = () => run({autoswap: false});
+      ${btns(`<button class="danger" id="cga">Close + auto-swap</button>
+              <button id="cgn">Close saja</button>`)}`);
+    $('#cga').onclick = () => run({autoswap: true});
+    $('#cgn').onclick = () => run({autoswap: false});
   }
 }
 
@@ -613,20 +844,34 @@ async function loadState() {
 $('#go').onclick = discover;
 $('#ca').onkeydown = e => { if (e.key === 'Enter') discover(); };
 $('#mint').onclick = doMint;
+$('#posRefresh').onclick = loadPositions;
 $('#closeEditor').onclick = () => { $('#editor').classList.add('hide'); S.pool = null; };
 $('#amt').oninput = () => {
   const v = parseFloat($('#amt').value);
   S.amountFixed = v > 0 ? v : null;
   for (const x of $('#amtPcts').querySelectorAll('button')) x.classList.remove('on');
-  clearTimeout(prevT); prevT = setTimeout(refreshPreview, 400);
+  clearTimeout(prevT); prevT = setTimeout(refreshPreview, 450);
 };
 for (const id of ['#minIn', '#maxIn']) {
   $(id).onchange = () => {
-    const v = parseFloat($(id).value);
+    const v = parseFloat(String($(id).value).replace(/[$,KMB\s]/gi, ''));
     if (!(v > 0)) return;
-    if (id === '#minIn') S.min = v; else S.max = v;
-    if (S.min > S.max) [S.min, S.max] = [S.max, S.min];
+    setBound(id === '#minIn' ? 'min' : 'max', fromUnit(v));
     syncFromDrag(true);
+  };
+}
+for (const b of $('#unitsw').querySelectorAll('button')) {
+  b.onclick = () => {
+    S.unit = b.dataset.u;
+    for (const x of $('#unitsw').querySelectorAll('button')) x.classList.toggle('on', x === b);
+    if (S.pool) { applyCandles(); syncFromDrag(true); drawAna(); }
+  };
+}
+for (const b of $('#anaSw').querySelectorAll('button')) {
+  b.onclick = () => {
+    S.ana = b.dataset.a;
+    for (const x of $('#anaSw').querySelectorAll('button')) x.classList.toggle('on', x === b);
+    drawAna();
   };
 }
 for (const t of document.querySelectorAll('.tab')) {
@@ -648,7 +893,9 @@ $('#wallet').onchange = async e => {
 };
 window.closeModal = closeModal;
 
+initLiqDrag();
+new ResizeObserver(drawAna).observe($('#anawrap'));
 loadState().catch(e => toast('Gagal konek server: ' + e.message, 'err'));
 setInterval(() => {
-  if (S.pool && !S.busy && !dragging && !document.hidden) loadCandles();
+  if (S.pool && !S.busy && !dragging && !liqDrag && !document.hidden) loadCandles();
 }, 30000);
