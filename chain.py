@@ -30,14 +30,11 @@ CHAINS = {
         "dexscreener": "robinhood",
         "gecko": "robinhood",
         "gmgn": "robinhood",
-        # Indexer alps (read-only) — daftar POOL Robinhood instan untuk discovery.
-        # Cuma dibaca untuk TAMPILAN; tidak pernah dipakai untuk transaksi (semua tx
-        # tetap langsung ke kontrak lewat RPC + key sendiri). Dict pool dari sini
-        # tetap diverifikasi on-chain (assert_pool_orientation) sebelum mint.
-        # Fallback ke scan RPC kalau mati / token tak ke-index.
-        # (Daftar POSISI tidak lagi dari alps — alps sempat kurang lapor & salah
-        # label range; sekarang pakai API resmi Uniswap, lihat _uniswap_positions_raw.)
-        "pools_api": "https://alps.farm/api/pools",
+        # Daftar posisi & pool diambil dari API resmi Uniswap (read-only, tanpa key/
+        # tx) — sama seperti app.uniswap.org, jadi konsisten & lengkap. Lihat
+        # uniswap_v3_token_ids (posisi) dan _uni_discover (pool) di web.py. Dict pool
+        # dari indexer tetap diverifikasi on-chain (assert_pool_orientation) sebelum
+        # mint. Fallback ke scan RPC kalau API mati. (Indexer alps sudah tidak dipakai.)
         "v2_factory": "0x8bceaa40b9acdfaedf85adf4ff01f5ad6517937f",
         # rpc.mainnet.chain.robinhood.com sering diblokir DNS ISP Indonesia
         # (redirect ke internetpositif.id) → fallback Blockscout eth-rpc
@@ -1233,7 +1230,7 @@ def assert_pool_orientation(w3: Web3, pool_info: dict) -> None:
     """Pagar keamanan dana: verifikasi identitas pool di dict cocok dengan
     kebenaran on-chain SEBELUM membangun transaksi.
 
-    Dict pool bisa berasal dari indexer luar (alps) yang cepat tapi tidak boleh
+    Dict pool bisa berasal dari indexer luar (API Uniswap) yang cepat tapi tidak boleh
     dipercaya untuk membangun tx. Kalau orientasi quote/meme, fee, atau PoolKey
     salah, mint bisa menaruh dana di sisi/pool yang keliru.
 
@@ -1290,7 +1287,7 @@ def mint_position(chain_id: int, pk: str, pool_info: dict, budget: float,
     mdec = token_info(w3, meme)["decimals"]
 
     pool = w3.eth.contract(address=Web3.to_checksum_address(pool_info["pool"]), abi=POOL_ABI)
-    # dict pool bisa datang dari indexer (alps) → verifikasi orientasi on-chain
+    # dict pool bisa datang dari indexer (API Uniswap) → verifikasi orientasi on-chain
     # dulu; kalau tak cocok, batal sebelum dana bergerak.
     assert_pool_orientation(w3, pool_info)
     steps = []
@@ -2645,7 +2642,7 @@ def mint_v4(chain_id: int, pk: str, pool_info: dict, budget: float,
     cfg = CHAINS[chain_id]
     if not verify_v4(w3, chain_id):
         raise RuntimeError("Kontrak V4 gagal verifikasi on-chain — batal.")
-    # dict pool bisa datang dari indexer (alps) → pastikan PoolKey autentik
+    # dict pool bisa datang dari indexer (API Uniswap) → pastikan PoolKey autentik
     # (hash == poolId) dan tanpa hooks sebelum dana bergerak.
     assert_pool_orientation(w3, pool_info)
     account = w3.eth.account.from_key(pk)
