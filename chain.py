@@ -1229,15 +1229,35 @@ def plan_two_sided(sqrtp_x96: int, tick_lower: int, tick_upper: int,
 
 
 def assert_pool_orientation(w3: Web3, pool_info: dict) -> None:
-    """Pagar keamanan dana: verifikasi token0/token1/fee di dict pool cocok
-    dengan kontrak on-chain SEBELUM membangun transaksi.
+    """Pagar keamanan dana: verifikasi identitas pool di dict cocok dengan
+    kebenaran on-chain SEBELUM membangun transaksi.
 
     Dict pool bisa berasal dari indexer luar (alps) yang cepat tapi tidak boleh
-    dipercaya untuk membangun tx. Kalau orientasi quote/meme atau fee tier salah,
-    mint bisa menaruh dana di sisi token yang keliru. Fungsi ini membaca langsung
-    token0()/token1()/fee() dari kontrak pool dan membatalkan transaksi kalau
-    tidak cocok. Hanya berlaku untuk pool v3 (yang punya fungsi tersebut)."""
-    if pool_info.get("ver", 3) != 3:
+    dipercaya untuk membangun tx. Kalau orientasi quote/meme, fee, atau PoolKey
+    salah, mint bisa menaruh dana di sisi/pool yang keliru.
+
+    v3: baca token0()/token1()/fee() langsung dari kontrak pool, batalkan kalau
+        tidak cocok.
+    v4: poolId ADALAH hash dari PoolKey, jadi recompute v4_pool_id(key) dan
+        pastikan == pool_id (mustahil memalsukan PoolKey untuk poolId tertentu),
+        plus tolak pool ber-hooks (bot cuma dukung vanilla)."""
+    ver = pool_info.get("ver", 3)
+    if ver == 4:
+        key = pool_info.get("key")
+        pid = pool_info.get("pool_id")
+        if not key or pid is None:
+            raise RuntimeError("Data pool v4 tidak lengkap — cari ulang tokennya.")
+        pid_b = pid if isinstance(pid, (bytes, bytearray)) else bytes.fromhex(str(pid).removeprefix("0x"))
+        if Web3.to_checksum_address(key[4]) != Web3.to_checksum_address(V4_NATIVE):
+            raise RuntimeError(
+                "Pool v4 memakai hooks — tidak didukung. Transaksi dibatalkan demi "
+                "keamanan dana.")
+        if v4_pool_id(tuple(key)) != pid_b:
+            raise RuntimeError(
+                "Verifikasi pool v4 gagal: PoolKey tidak menghasilkan poolId yang "
+                "sama. Transaksi dibatalkan demi keamanan dana — cari ulang tokennya.")
+        return
+    if ver != 3:
         return
     pc = w3.eth.contract(address=Web3.to_checksum_address(pool_info["pool"]), abi=POOL_ABI)
     on0 = pc.functions.token0().call()
@@ -2557,6 +2577,9 @@ def mint_v4(chain_id: int, pk: str, pool_info: dict, budget: float,
     cfg = CHAINS[chain_id]
     if not verify_v4(w3, chain_id):
         raise RuntimeError("Kontrak V4 gagal verifikasi on-chain — batal.")
+    # dict pool bisa datang dari indexer (alps) → pastikan PoolKey autentik
+    # (hash == poolId) dan tanpa hooks sebelum dana bergerak.
+    assert_pool_orientation(w3, pool_info)
     account = w3.eth.account.from_key(pk)
     posm_addr = Web3.to_checksum_address(cfg["v4_posm"])
     posm = _v4c(w3, chain_id, "v4_posm", V4_POSM_ABI)

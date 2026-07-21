@@ -737,11 +737,76 @@ def _alps_pools_all(cid: int, ttl: int = 60) -> list | None:
         return hit[1] if hit else None
 
 
+def _alps_v3_pool(cid: int, w3, ap: dict, tl: str, quotes_lc: dict) -> tuple[dict, str] | None:
+    """Petakan satu entri pool v3 alps → dict pool bot. (dict, meme_sym) atau None."""
+    t0, t1 = ap.get("token0") or {}, ap.get("token1") or {}
+    a0 = str(t0.get("address") or "").lower()
+    a1 = str(t1.get("address") or "").lower()
+    if tl not in (a0, a1):
+        return None
+    # sisi lawan token HARUS quote yang dikenal (WETH/USDG/…)
+    if a0 == tl and a1 in quotes_lc:
+        qaddr_lc, qsym, q_is_t1, meme_sym = a1, quotes_lc[a1], True, t0.get("symbol")
+    elif a1 == tl and a0 in quotes_lc:
+        qaddr_lc, qsym, q_is_t1, meme_sym = a0, quotes_lc[a0], False, t1.get("symbol")
+    else:
+        return None
+    fee = int(ap.get("feeBps"))
+    qaddr = Web3.to_checksum_address(qaddr_lc)
+    p = {
+        "ver": 3, "pool": Web3.to_checksum_address(str(ap.get("id"))), "fee": fee,
+        "quote_sym": qsym, "quote_addr": qaddr,
+        "quote_decimals": ch.token_info(w3, qaddr)["decimals"],
+        "quote_usd": ch.quote_usd_price(w3, cid, qsym), "quote_is_token1": q_is_t1,
+        "token0": Web3.to_checksum_address(t0.get("address")),
+        "token1": Web3.to_checksum_address(t1.get("address")),
+        "tick_spacing": ch.TICK_SPACING.get(fee), "basis": "alps",
+    }
+    return p, meme_sym
+
+
+def _alps_v4_pool(cid: int, w3, ap: dict, tl: str) -> tuple[dict, str] | None:
+    """Petakan satu entri pool v4 alps → dict pool bot, HANYA yang bisa dipakai bot:
+    vanilla (hooks=0), salah satu sisi quote dikenal, dan PoolKey autentik
+    (hash == poolId). Native ETH (currency 0x0) dihitung quote. (dict, meme_sym)
+    atau None. Pool ber-hooks di-skip karena mint bot tak mendukungnya."""
+    pk = ap.get("poolKey") or {}
+    c0, c1 = str(pk.get("currency0") or ""), str(pk.get("currency1") or "")
+    hooks = str(pk.get("hooks") or ch.V4_NATIVE)
+    if not c0 or not c1 or int(hooks, 16) != 0:
+        return None
+    # token yang dicari harus salah satu currency (native 0x0 tak akan == token)
+    if tl not in (c0.lower(), c1.lower()):
+        return None
+    c0 = Web3.to_checksum_address(c0)
+    c1 = Web3.to_checksum_address(c1)
+    qsym, q_is_c1 = ch._v4_quote_side(cid, c0, c1)
+    if qsym is None:
+        return None
+    fee, spacing = int(pk.get("fee")), int(pk.get("tickSpacing"))
+    key = (c0, c1, fee, spacing, Web3.to_checksum_address(hooks))
+    pid = ch.v4_pool_id(key)
+    if "0x" + pid.hex() != str(ap.get("id")).lower():   # PoolKey harus menghasilkan poolId ini
+        return None
+    qaddr = c1 if q_is_c1 else c0
+    meme = c0 if q_is_c1 else c1
+    meme_sym = ap["token0"]["symbol"] if meme.lower() == str(ap["token0"]["address"]).lower() \
+        else ap["token1"]["symbol"]
+    p = {
+        "ver": 4, "pool": "0x" + pid.hex(), "pool_id": pid, "key": key,
+        "fee": fee, "tick_spacing": spacing, "quote_sym": qsym, "quote_addr": qaddr,
+        "quote_decimals": ch._v4_currency_info(w3, cid, qaddr)["decimals"],
+        "quote_usd": ch.quote_usd_price(w3, cid, qsym), "quote_is_token1": q_is_c1,
+        "token0": c0, "token1": c1, "basis": "alps",
+    }
+    return p, meme_sym
+
+
 def _alps_discover(cid: int, token: str) -> dict | None:
     """Pool discovery cepat: filter daftar pool pra-indeks alps untuk `token`.
-    Hanya v3 yang salah satu sisinya = quote yang dikenal bot (biar bisa deposit
-    single-side). Bentuk balikan sama dengan ch.discover_pools. None kalau alps
-    mati / token tak ke-index → caller fallback ke scan RPC.
+    v3 dan v4 vanilla yang salah satu sisinya = quote yang dikenal bot (biar bisa
+    deposit single-side). Bentuk balikan sama dengan ch.discover_pools. None kalau
+    alps mati / token tak ke-index → caller fallback ke scan RPC.
 
     Dict pool yang dihasilkan tetap diverifikasi on-chain di mint builder
     (assert_pool_orientation) sebelum dana bergerak — indexer cuma untuk kecepatan
@@ -756,39 +821,25 @@ def _alps_discover(cid: int, token: str) -> dict | None:
     out, meme_sym = [], None
     for ap in pools:
         try:
-            if str(ap.get("protocol")) != "v3":
-                continue
-            t0, t1 = ap.get("token0") or {}, ap.get("token1") or {}
-            a0 = str(t0.get("address") or "").lower()
-            a1 = str(t1.get("address") or "").lower()
-            if tl not in (a0, a1):
-                continue
-            # sisi lawan token HARUS quote yang dikenal (WETH/USDG/…)
-            if a0 == tl and a1 in quotes_lc:
-                qaddr_lc, qsym, q_is_t1 = a1, quotes_lc[a1], True
-                meme_sym = meme_sym or t0.get("symbol")
-            elif a1 == tl and a0 in quotes_lc:
-                qaddr_lc, qsym, q_is_t1 = a0, quotes_lc[a0], False
-                meme_sym = meme_sym or t1.get("symbol")
+            proto = str(ap.get("protocol"))
+            if proto == "v3":
+                got = _alps_v3_pool(cid, w3, ap, tl, quotes_lc)
+            elif proto == "v4":
+                got = _alps_v4_pool(cid, w3, ap, tl)
             else:
                 continue
-            fee = int(ap.get("feeBps"))
-            qaddr = Web3.to_checksum_address(qaddr_lc)
-            qdec = ch.token_info(w3, qaddr)["decimals"]
-            qusd = ch.quote_usd_price(w3, cid, qsym)
+            if not got:
+                continue
+            p, msym = got
+            meme_sym = meme_sym or msym
+            fee = p["fee"]
             tvl = float(ap.get("tvlUsd") or 0)
             vol = ap.get("volume24hUsd")
             vol = float(vol) if vol is not None else None
-            apr = (vol * fee / 1e6 / tvl * 365 * 100) if (vol and tvl) else None
-            out.append({
-                "ver": 3, "pool": Web3.to_checksum_address(str(ap.get("id"))),
-                "fee": fee, "quote_sym": qsym, "quote_addr": qaddr,
-                "quote_decimals": qdec, "quote_usd": qusd, "quote_is_token1": q_is_t1,
-                "token0": Web3.to_checksum_address(t0.get("address")),
-                "token1": Web3.to_checksum_address(t1.get("address")),
-                "tvl_usd": tvl, "vol24_usd": vol, "apr_pct": apr,
-                "tick_spacing": ch.TICK_SPACING.get(fee), "basis": "alps",
-            })
+            p["tvl_usd"] = tvl
+            p["vol24_usd"] = vol
+            p["apr_pct"] = (vol * fee / 1e6 / tvl * 365 * 100) if (vol and tvl) else None
+            out.append(p)
         except Exception:
             continue
     if not out:
