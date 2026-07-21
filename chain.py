@@ -30,12 +30,13 @@ CHAINS = {
         "dexscreener": "robinhood",
         "gecko": "robinhood",
         "gmgn": "robinhood",
-        # Indexer alps (read-only) — daftar posisi & pool Robinhood instan. Cuma
-        # dibaca untuk TAMPILAN; tidak pernah dipakai untuk transaksi (semua tx
+        # Indexer alps (read-only) — daftar POOL Robinhood instan untuk discovery.
+        # Cuma dibaca untuk TAMPILAN; tidak pernah dipakai untuk transaksi (semua tx
         # tetap langsung ke kontrak lewat RPC + key sendiri). Dict pool dari sini
         # tetap diverifikasi on-chain (assert_pool_orientation) sebelum mint.
         # Fallback ke scan RPC kalau mati / token tak ke-index.
-        "positions_api": "https://alps.farm/api/positions?owner=",
+        # (Daftar POSISI tidak lagi dari alps — alps sempat kurang lapor & salah
+        # label range; sekarang pakai API resmi Uniswap, lihat _uniswap_positions_raw.)
         "pools_api": "https://alps.farm/api/pools",
         "v2_factory": "0x8bceaa40b9acdfaedf85adf4ff01f5ad6517937f",
         # rpc.mainnet.chain.robinhood.com sering diblokir DNS ISP Indonesia

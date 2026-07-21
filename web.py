@@ -634,83 +634,88 @@ def _positions_refresh(cid: int, ck, full: bool = False, cold: bool = False):
         _POS_REFRESHING[ck] = False
 
 
-def _alps_positions(cid: int, addr: str) -> dict | None:
-    """Daftar posisi dari indexer alps (read-only). Hanya untuk TAMPILAN — tidak
-    pernah menyentuh key/tx. Kembalikan None kalau gagal supaya jatuh ke RPC.
+# API resmi Uniswap (sama persis dengan app.uniswap.org). Read-only: body cuma
+# alamat wallet publik — tak ada key/tanda tangan/tx. Tanpa API key. Cover semua
+# chain termasuk Robinhood (4663) & BSC (56), v3 & v4.
+_UNI_POS_API = "https://interface.gateway.uniswap.org/v2/data.v1.DataApiService/ListPositions"
+_UNI_HDR = {
+    "content-type": "application/json",
+    "connect-protocol-version": "1",
+    "x-request-source": "uniswap-web",
+    "origin": "https://app.uniswap.org",
+    "referer": "https://app.uniswap.org/",
+    "user-agent": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"),
+}
 
-    Keamanan: cuma GET dengan alamat wallet (sudah publik on-chain). Tak ada key,
-    tanda tangan, atau transaksi — mustahil menguras dana lewat endpoint baca."""
-    api = ch.CHAINS[cid].get("positions_api")
-    if not api:
-        return None
+
+def _uniswap_positions_raw(cid: int, addr: str, full: bool = False) -> list | None:
+    """Daftar posisi dari API resmi Uniswap (data.v1.DataApiService/ListPositions)
+    — sumber yang SAMA PERSIS dengan app.uniswap.org, jadi status in/out-range,
+    nilai, dan fee-nya kanonik dan lengkap (alps sempat kurang lapor & salah label).
+
+    Read-only & aman: POST cuma berisi alamat wallet (sudah publik on-chain). Tak
+    ada key, tanda tangan, atau transaksi — mustahil menguras dana lewat endpoint
+    baca. Semua tx tetap dibangun sendiri lewat RPC + key (lihat api_action →
+    _snapshot yang tetap pakai enumerasi on-chain).
+
+    Balikannya berbentuk sama dengan item _position_detail (chain.py) supaya seluruh
+    mesin PnL/harga/summary di _positions_build dipakai apa adanya. None kalau gagal
+    → caller fallback ke enumerasi RPC (tetap akurat, cuma lebih lambat)."""
+    cfg = ch.CHAINS[cid]
+    statuses = ["POSITION_STATUS_IN_RANGE", "POSITION_STATUS_OUT_OF_RANGE"]
+    if full:
+        statuses.append("POSITION_STATUS_CLOSED")
+    body = {
+        "address": Web3.to_checksum_address(addr), "chainIds": [cid],
+        "protocolVersions": ["PROTOCOL_VERSION_V4", "PROTOCOL_VERSION_V3"],
+        "positionStatuses": statuses, "pageSize": 100, "includeHidden": True,
+    }
     try:
-        r = requests.get(api + addr, timeout=12,
-                         headers={"accept": "application/json"})
+        r = requests.post(_UNI_POS_API, headers=_UNI_HDR, json=body, timeout=12)
         raw = r.json().get("positions")
         if not isinstance(raw, list):
             return None
     except Exception:
         return None
 
-    cfg = ch.CHAINS[cid]
     quote_addrs = {cfg["wrapped"].lower()} | {cfg["quotes"][s].lower() for s in cfg["stable_syms"]}
     out = []
     for p in raw:
         try:
-            if p.get("protocol") != "v3":       # alps Robinhood = v3 saja
+            is_v4 = p.get("protocolVersion") == "PROTOCOL_VERSION_V4"
+            d = p.get("v4Position") if is_v4 else p.get("v3Position")
+            if not d:
                 continue
-            t0, t1 = p["token0"], p["token1"]
-            a0, a1 = t0["address"].lower(), t1["address"].lower()
+            t0, t1 = d["token0"], d["token1"]
+            a0, a1 = str(t0["address"]).lower(), str(t1["address"]).lower()
             q_is_t1 = a1 in quote_addrs or a0 not in quote_addrs   # quote condong ke token1
-            d0, d1 = int(t0["decimals"]), int(t1["decimals"])
-            amt0 = int(p["amount0"]) / 10 ** d0
-            amt1 = int(p["amount1"]) / 10 ** d1
-            fee0 = int(p["fees0"]) / 10 ** d0
-            fee1 = int(p["fees1"]) / 10 ** d1
-            mdec, qdec = (d0, d1) if q_is_t1 else (d1, d0)
-
-            def pq(t, _m=mdec, _q=qdec, _t1=q_is_t1):
-                raw_ = ch.tick_to_price(t)
-                return (raw_ if _t1 else (1 / raw_ if raw_ else 0)) * 10 ** (_m - _q)
-            lo, hi = sorted([pq(int(p["tickLower"])), pq(int(p["tickUpper"]))])
-            now = pq(int(p["currentTick"]))
-            pid = str(p["tokenId"])
+            dec0, dec1 = int(t0["decimals"]), int(t1["decimals"])
+            tid = str(d["tokenId"])
             out.append({
-                "ver": 3, "pid": pid, "fee": int(p["feeBps"]),
-                "sym0": t0["symbol"], "sym1": t1["symbol"], "dec0": d0, "dec1": d1,
-                "amount0": amt0, "amount1": amt1,
+                "ver": 4 if is_v4 else 3,
+                "token_id": int(tid) if tid.isdigit() else tid,
+                "pid": f"v4:{tid}" if is_v4 else tid,
+                "token0": Web3.to_checksum_address(t0["address"]),
+                "token1": Web3.to_checksum_address(t1["address"]),
+                "sym0": t0["symbol"], "sym1": t1["symbol"], "dec0": dec0, "dec1": dec1,
+                "fee": int(d["feeTier"]),
+                "tick_lower": int(d["tickLower"]), "tick_upper": int(d["tickUpper"]),
+                "cur_tick": int(d["currentTick"]),
+                "amount0": int(d.get("amount0") or 0) / 10 ** dec0,
+                "amount1": int(d.get("amount1") or 0) / 10 ** dec1,
+                "fees0": int(d.get("token0UncollectedFees") or 0) / 10 ** dec0,
+                "fees1": int(d.get("token1UncollectedFees") or 0) / 10 ** dec1,
+                # status dari Uniswap = kanonik (bukan diterka dari tick lokal)
+                "in_range": p.get("status") == "POSITION_STATUS_IN_RANGE",
+                "value_usd": float(p.get("valueUsd") or 0),
+                "unclaimed_usd": float(p.get("uncollectedFeesUsd") or 0),
                 "quote_sym": t1["symbol"] if q_is_t1 else t0["symbol"],
-                "meme_sym": t0["symbol"] if q_is_t1 else t1["symbol"],
-                "quote_amount": amt1 if q_is_t1 else amt0,
-                "meme_amount": amt0 if q_is_t1 else amt1,
-                "quote_fees": fee1 if q_is_t1 else fee0,
-                "meme_fees": fee0 if q_is_t1 else fee1,
                 "quote_is_token1": q_is_t1,
-                "tick_lower": int(p["tickLower"]), "tick_upper": int(p["tickUpper"]),
-                "cur_tick": int(p["currentTick"]),
-                "price_lower": lo, "price_upper": hi, "price_now": now,
-                "to_min_pct": (now / lo - 1) * 100 if lo else None,
-                "to_max_pct": (hi / now - 1) * 100 if now else None,
-                "in_range": bool(p["inRange"]),
-                "value_usd": float(p["valueUsd"]), "unclaimed_usd": float(p["feesUsd"]),
-                "deposit_usd": float(p["depositsUsd"]), "fees_claimed_usd": float(p["claimedFeesUsd"]),
-                "pnl_usd": float(p["pnlUsd"]), "basis": "alps",
-                "age": store.fmt_age(store.mint_ts(cid, ev_id(pid))),
-                "link": ch.pos_link_any(cid, pid),
             })
         except Exception:
             continue
-
-    summ = {
-        "total_value": sum(p["value_usd"] for p in out),
-        "unclaimed": sum(p["unclaimed_usd"] for p in out),
-        "fees_claimed": sum(p["fees_claimed_usd"] for p in out),
-        "deposits": sum(p["deposit_usd"] for p in out),
-        "withdrawals": 0.0,
-        "open": len(out), "in_range": sum(1 for p in out if p["in_range"]),
-        "pnl": sum(p["pnl_usd"] for p in out) if out else None,
-    }
-    return {"positions": out, "summary": summ, "ts": int(time.time()), "source": "alps"}
+    return out or None
 
 
 _ALPS_POOLS: dict[int, tuple[float, list]] = {}   # cid -> (ts, daftar pool mentah)
@@ -860,14 +865,16 @@ def _positions_build(cid: int, full: bool = False, with_basis: bool = True) -> d
     key = bot.pk()
     addr = bot._addr_of(key)
 
-    # Fast-path: indexer alps (Robinhood) — instan, PnL sudah dihitung. Read-only,
-    # tak menyentuh key/tx. Gagal/timeout → jatuh mulus ke enumerasi RPC di bawah.
-    alps = _alps_positions(cid, addr)
-    if alps is not None and alps["positions"]:
-        return alps
-
-    pos = ch.list_all_positions(cid, key, store.refs(cid, addr, "v2"),
-                                store.refs(cid, addr, "v4"), full=full)
+    # Fast-path: API resmi Uniswap (Robinhood + BSC, v3/v4) — daftar posisi kanonik,
+    # akurat, dan lengkap seperti app.uniswap.org, instan. Read-only, tak menyentuh
+    # key/tx. Gagal/timeout → jatuh mulus ke enumerasi RPC (tetap akurat, lebih lambat).
+    # PnL diisi belakangan oleh cost_basis (getLogs) sama seperti jalur RPC.
+    src = "uniswap"
+    pos = _uniswap_positions_raw(cid, addr, full=full)
+    if not pos:
+        src = "chain"
+        pos = ch.list_all_positions(cid, key, store.refs(cid, addr, "v2"),
+                                    store.refs(cid, addr, "v4"), full=full)
 
     from concurrent.futures import ThreadPoolExecutor
     v3ids = [str(p.get("pid") or p.get("token_id")) for p in pos
@@ -958,7 +965,7 @@ def _positions_build(cid: int, full: bool = False, with_basis: bool = True) -> d
     summ["in_range"] = sum(1 for p in out if p.get("in_range"))
     known = [p for p in out if p.get("pnl_usd") is not None]
     summ["pnl"] = sum(p["pnl_usd"] for p in known) if known else None
-    return {"positions": out, "summary": summ, "ts": int(time.time()), "source": "chain"}
+    return {"positions": out, "summary": summ, "ts": int(time.time()), "source": src}
 
 
 def ev_id(pid):
