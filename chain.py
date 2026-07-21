@@ -1495,40 +1495,107 @@ def _is_active(p) -> bool:
     return not (p[7] == 0 and p[10] == 0 and p[11] == 0)   # liq==0 & owed0==0 & owed1==0
 
 
+# API resmi Uniswap (sama persis dengan app.uniswap.org). Read-only: body cuma
+# alamat wallet publik — tanpa key/tanda tangan/tx, tanpa API key.
+_UNI_POS_API = "https://interface.gateway.uniswap.org/v2/data.v1.DataApiService/ListPositions"
+_UNI_HDR = {
+    "content-type": "application/json",
+    "connect-protocol-version": "1",
+    "x-request-source": "uniswap-web",
+    "origin": "https://app.uniswap.org",
+    "referer": "https://app.uniswap.org/",
+    "user-agent": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"),
+}
+
+
+def uniswap_v3_token_ids(chain_id: int, address: str, _cache={}, ttl: int = 20) -> list[int] | None:
+    """Set tokenId posisi v3 aktif dari API resmi Uniswap (sama seperti
+    app.uniswap.org). Dipakai HANYA sebagai daftar kandidat yang lengkap — detail
+    tiap posisi (nilai, fee, tick sekarang, in/out-range) tetap dibaca on-chain
+    lewat RPC-mu, jadi otoritatif dan segar.
+
+    Kenapa perlu: wallet lama bisa punya ratusan NFT NPM (tutup posisi tidak
+    mem-burn NFT), dan posisi yang di-mint langsung di app.uniswap.org tidak ada di
+    cache bot. Enumerasi indeks yang cuma memindai N NFT terakhir bisa MELEWATKAN
+    posisi aktif yang indeksnya lama — API Uniswap tidak. Read-only & aman (cuma
+    alamat publik). None kalau gagal → caller fallback ke scan indeks."""
+    key = (chain_id, address.lower())
+    hit = _cache.get(key)
+    if hit and time.time() - hit[1] < ttl:
+        return hit[0]
+    body = {"address": Web3.to_checksum_address(address), "chainIds": [chain_id],
+            "protocolVersions": ["PROTOCOL_VERSION_V3"],
+            "positionStatuses": ["POSITION_STATUS_IN_RANGE", "POSITION_STATUS_OUT_OF_RANGE"],
+            "pageSize": 100, "includeHidden": True}
+    try:
+        r = requests.post(_UNI_POS_API, headers=_UNI_HDR, json=body, timeout=10)
+        raw = r.json().get("positions")
+        if not isinstance(raw, list):
+            return None
+        ids = []
+        for p in raw:
+            d = p.get("v3Position")
+            if d and str(d.get("tokenId", "")).isdigit():
+                ids.append(int(d["tokenId"]))
+        _cache[key] = (ids, time.time())
+        return ids
+    except Exception:
+        return None
+
+
 def list_positions(chain_id: int, pk: str, max_positions: int = 40,
                    full: bool = False) -> list[dict]:
-    """Posisi v3 aktif. Wallet lama bisa punya ratusan NFT tertutup — men-scan
-    semuanya tiap refresh mahal. Jadi: set tokenId aktif disimpan; refresh cuma
-    mengecek yang aktif + NFT yang baru di-mint (balanceOf naik). Scan penuh
-    hanya saat pertama, saat jumlah turun (ada yang di-burn), atau full=True."""
+    """Posisi v3 aktif. Daftar tokenId kandidat diambil dari API Uniswap (LENGKAP —
+    termasuk posisi lama & yang di-mint di luar bot), lalu detail tiap posisi dibaca
+    on-chain (otoritatif & segar). Kalau API Uniswap mati, fallback ke enumerasi
+    indeks NPM: set tokenId aktif disimpan; refresh cuma cek yang aktif + NFT baru
+    (balanceOf naik). Scan indeks penuh saat pertama / jumlah turun / full=True.
+
+    Catatan: scan indeks hanya memindai max_positions NFT TERAKHIR, jadi bisa
+    melewatkan posisi aktif ber-indeks lama pada wallet dengan ratusan NFT — sebab
+    itu jalur Uniswap diutamakan."""
     w3 = get_w3(chain_id)
     cfg = CHAINS[chain_id]
     account = w3.eth.account.from_key(pk)
     npm = w3.eth.contract(address=Web3.to_checksum_address(cfg["npm"]), abi=NPM_ABI)
     factory = w3.eth.contract(address=Web3.to_checksum_address(cfg["factory"]), abi=FACTORY_ABI)
 
-    n = npm.functions.balanceOf(account.address).call()
     ck = f"{chain_id}:{account.address.lower()}"
     hit = _active_load().get(ck)
+    uni_ids = uniswap_v3_token_ids(chain_id, account.address)
 
     with ThreadPoolExecutor(max_workers=8) as ex:
-        if hit and not full and n >= hit[0]:
-            # Jalur cepat: cek ulang tokenId yang tadinya aktif + enumerasi HANYA
-            # NFT baru (indeks hit[0]..n-1). Tutup posisi tidak mem-burn NFT di NPM,
-            # jadi balanceOf hanya naik saat mint → "n turun" memicu scan penuh.
-            new_idxs = list(range(n - 1, hit[0] - 1, -1))
-            new_tids = list(ex.map(
-                lambda i: npm.functions.tokenOfOwnerByIndex(account.address, i).call(), new_idxs))
-            tids = [int(t) for t in hit[1]] + new_tids
+        n = None
+        if uni_ids is not None:
+            # Daftar kandidat lengkap dari Uniswap, di-union dengan tokenId aktif yang
+            # tercatat (menangkap posisi liq=0 tapi fee belum diklaim, yang oleh
+            # Uniswap dianggap "closed"). _is_active on-chain menyaring yang benar mati.
+            cached = [int(t) for t in hit[1]] if hit else []
+            tids = list(dict.fromkeys([*uni_ids, *cached]))
         else:
-            # Scan penuh: enumerasi max_positions NFT terakhir.
-            idxs = list(range(n - 1, max(-1, n - 1 - max_positions), -1))
-            tids = list(ex.map(
-                lambda i: npm.functions.tokenOfOwnerByIndex(account.address, i).call(), idxs))
+            n = npm.functions.balanceOf(account.address).call()
+            if hit and not full and n >= hit[0]:
+                # Jalur cepat cadangan: cek ulang tokenId aktif + enumerasi HANYA NFT
+                # baru (indeks hit[0]..n-1). Tutup posisi tidak mem-burn NFT → balanceOf
+                # cuma naik saat mint, jadi "n turun" memicu scan penuh.
+                new_idxs = list(range(n - 1, hit[0] - 1, -1))
+                new_tids = list(ex.map(
+                    lambda i: npm.functions.tokenOfOwnerByIndex(account.address, i).call(), new_idxs))
+                tids = [int(t) for t in hit[1]] + new_tids
+            else:
+                idxs = list(range(n - 1, max(-1, n - 1 - max_positions), -1))
+                tids = list(ex.map(
+                    lambda i: npm.functions.tokenOfOwnerByIndex(account.address, i).call(), idxs))
 
         raws = list(ex.map(lambda t: npm.functions.positions(t).call(), tids))
         active = [(tid, p) for tid, p in zip(tids, raws) if _is_active(p)]
-        _active_save(ck, n, [tid for tid, _ in active])
+        try:
+            if n is None:
+                n = npm.functions.balanceOf(account.address).call()
+            _active_save(ck, n, [tid for tid, _ in active])
+        except Exception:
+            pass
         results = list(ex.map(lambda tp: _position_detail(w3, chain_id, npm, factory, account, *tp), active))
     return [r for r in results if r]
 

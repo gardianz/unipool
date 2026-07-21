@@ -799,9 +799,7 @@ function renderPositions(r) {
       <div><small>In range</small><b data-f="inrange">${s.in_range} / ${s.open}</b></div>`;
   }
   const upd = `diperbarui ${new Date((r.ts || Date.now() / 1000) * 1000).toLocaleTimeString('id-ID')}`;
-  const srcTag = r.source === 'uniswap'
-    ? `<span title="daftar posisi dari API resmi Uniswap (sama seperti app.uniswap.org; read-only, tanpa key/tx). Transaksi tetap langsung ke kontrak lewat RPC-mu.">sumber: Uniswap</span>`
-    : `<span title="dibaca langsung dari chain via RPC-mu">sumber: chain</span>`;
+  const srcTag = `<span title="daftar posisi lengkap dari API Uniswap (menangkap posisi lama & mint di luar bot), detail + in/out-range dibaca langsung dari chain via RPC-mu. Bot Telegram pakai sumber yang sama.">sumber: chain (daftar via Uniswap)</span>`;
   $('#posSub').innerHTML = srcTag
     + ` · realized ${usd(net)} (deposit ${usd(s.deposits)}, withdraw ${usd(s.withdrawals)}) · ${upd}`;
 
