@@ -30,10 +30,13 @@ CHAINS = {
         "dexscreener": "robinhood",
         "gecko": "robinhood",
         "gmgn": "robinhood",
-        # Indexer alps (read-only) — daftar posisi Robinhood instan. Cuma dibaca
-        # untuk TAMPILAN; tidak pernah dipakai untuk transaksi (semua tx tetap
-        # langsung ke kontrak lewat RPC + key sendiri). Fallback ke RPC kalau mati.
+        # Indexer alps (read-only) — daftar posisi & pool Robinhood instan. Cuma
+        # dibaca untuk TAMPILAN; tidak pernah dipakai untuk transaksi (semua tx
+        # tetap langsung ke kontrak lewat RPC + key sendiri). Dict pool dari sini
+        # tetap diverifikasi on-chain (assert_pool_orientation) sebelum mint.
+        # Fallback ke scan RPC kalau mati / token tak ke-index.
         "positions_api": "https://alps.farm/api/positions?owner=",
+        "pools_api": "https://alps.farm/api/pools",
         "v2_factory": "0x8bceaa40b9acdfaedf85adf4ff01f5ad6517937f",
         # rpc.mainnet.chain.robinhood.com sering diblokir DNS ISP Indonesia
         # (redirect ke internetpositif.id) → fallback Blockscout eth-rpc
@@ -1225,6 +1228,29 @@ def plan_two_sided(sqrtp_x96: int, tick_lower: int, tick_upper: int,
     return budget_quote_wei - swap_wei, swap_wei
 
 
+def assert_pool_orientation(w3: Web3, pool_info: dict) -> None:
+    """Pagar keamanan dana: verifikasi token0/token1/fee di dict pool cocok
+    dengan kontrak on-chain SEBELUM membangun transaksi.
+
+    Dict pool bisa berasal dari indexer luar (alps) yang cepat tapi tidak boleh
+    dipercaya untuk membangun tx. Kalau orientasi quote/meme atau fee tier salah,
+    mint bisa menaruh dana di sisi token yang keliru. Fungsi ini membaca langsung
+    token0()/token1()/fee() dari kontrak pool dan membatalkan transaksi kalau
+    tidak cocok. Hanya berlaku untuk pool v3 (yang punya fungsi tersebut)."""
+    if pool_info.get("ver", 3) != 3:
+        return
+    pc = w3.eth.contract(address=Web3.to_checksum_address(pool_info["pool"]), abi=POOL_ABI)
+    on0 = pc.functions.token0().call()
+    on1 = pc.functions.token1().call()
+    on_fee = pc.functions.fee().call()
+    if (on0.lower() != str(pool_info["token0"]).lower()
+            or on1.lower() != str(pool_info["token1"]).lower()
+            or int(on_fee) != int(pool_info["fee"])):
+        raise RuntimeError(
+            "Verifikasi pool gagal: token0/token1/fee tidak cocok dengan kontrak "
+            "on-chain. Transaksi dibatalkan demi keamanan dana — cari ulang tokennya.")
+
+
 def mint_position(chain_id: int, pk: str, pool_info: dict, budget: float,
                   strategy: dict, slippage_pct: float) -> dict:
     """Mint LP sesuai strategi.
@@ -1243,6 +1269,9 @@ def mint_position(chain_id: int, pk: str, pool_info: dict, budget: float,
     mdec = token_info(w3, meme)["decimals"]
 
     pool = w3.eth.contract(address=Web3.to_checksum_address(pool_info["pool"]), abi=POOL_ABI)
+    # dict pool bisa datang dari indexer (alps) → verifikasi orientasi on-chain
+    # dulu; kalau tak cocok, batal sebelum dana bergerak.
+    assert_pool_orientation(w3, pool_info)
     steps = []
     slip = (100 - slippage_pct) / 100
 

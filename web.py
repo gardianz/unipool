@@ -273,7 +273,11 @@ def api_settings(_q, b) -> dict:
 def api_discover(_q, b) -> dict:
     cid = int(b["chain"])
     token = Web3.to_checksum_address(str(b["token"]).strip())
-    res = ch.discover_pools(cid, token)
+    # Fast-path: indexer alps (Robinhood) — daftar pool instan, pra-indeks. Read-only.
+    # Kosong / token tak ke-index / bukan Robinhood → jatuh ke scan RPC penuh (v2/v3/v4).
+    res = _alps_discover(cid, token)
+    if not res or not res["pools"]:
+        res = ch.discover_pools(cid, token)
     if not res["pools"]:
         raise RuntimeError("Tidak ada pool Uniswap (v2/v3/v4) untuk token ini.")
     _TOKENS[f"{cid}:{token.lower()}"] = res["token"]
@@ -707,6 +711,98 @@ def _alps_positions(cid: int, addr: str) -> dict | None:
         "pnl": sum(p["pnl_usd"] for p in out) if out else None,
     }
     return {"positions": out, "summary": summ, "ts": int(time.time()), "source": "alps"}
+
+
+_ALPS_POOLS: dict[int, tuple[float, list]] = {}   # cid -> (ts, daftar pool mentah)
+
+
+def _alps_pools_all(cid: int, ttl: int = 60) -> list | None:
+    """SEMUA pool Robinhood dari indexer alps dalam 1 request (pra-indeks TVL/
+    volume/harga). Cache pendek. Read-only — tak pernah untuk tx. None kalau gagal."""
+    api = ch.CHAINS[cid].get("pools_api")
+    if not api:
+        return None
+    hit = _ALPS_POOLS.get(cid)
+    if hit and time.time() - hit[0] < ttl:
+        return hit[1]
+    try:
+        r = requests.get(api, timeout=10, headers={"accept": "application/json"})
+        j = r.json()
+        pools = j.get("pools") if isinstance(j, dict) else j
+        if not isinstance(pools, list):
+            return hit[1] if hit else None
+        _ALPS_POOLS[cid] = (time.time(), pools)
+        return pools
+    except Exception:
+        return hit[1] if hit else None
+
+
+def _alps_discover(cid: int, token: str) -> dict | None:
+    """Pool discovery cepat: filter daftar pool pra-indeks alps untuk `token`.
+    Hanya v3 yang salah satu sisinya = quote yang dikenal bot (biar bisa deposit
+    single-side). Bentuk balikan sama dengan ch.discover_pools. None kalau alps
+    mati / token tak ke-index → caller fallback ke scan RPC.
+
+    Dict pool yang dihasilkan tetap diverifikasi on-chain di mint builder
+    (assert_pool_orientation) sebelum dana bergerak — indexer cuma untuk kecepatan
+    tampilan, bukan sumber tepercaya untuk transaksi."""
+    pools = _alps_pools_all(cid)
+    if not pools:
+        return None
+    cfg = ch.CHAINS[cid]
+    w3 = ch.get_w3(cid)
+    tl = token.lower()
+    quotes_lc = {a.lower(): s for s, a in cfg["quotes"].items()}
+    out, meme_sym = [], None
+    for ap in pools:
+        try:
+            if str(ap.get("protocol")) != "v3":
+                continue
+            t0, t1 = ap.get("token0") or {}, ap.get("token1") or {}
+            a0 = str(t0.get("address") or "").lower()
+            a1 = str(t1.get("address") or "").lower()
+            if tl not in (a0, a1):
+                continue
+            # sisi lawan token HARUS quote yang dikenal (WETH/USDG/…)
+            if a0 == tl and a1 in quotes_lc:
+                qaddr_lc, qsym, q_is_t1 = a1, quotes_lc[a1], True
+                meme_sym = meme_sym or t0.get("symbol")
+            elif a1 == tl and a0 in quotes_lc:
+                qaddr_lc, qsym, q_is_t1 = a0, quotes_lc[a0], False
+                meme_sym = meme_sym or t1.get("symbol")
+            else:
+                continue
+            fee = int(ap.get("feeBps"))
+            qaddr = Web3.to_checksum_address(qaddr_lc)
+            qdec = ch.token_info(w3, qaddr)["decimals"]
+            qusd = ch.quote_usd_price(w3, cid, qsym)
+            tvl = float(ap.get("tvlUsd") or 0)
+            vol = ap.get("volume24hUsd")
+            vol = float(vol) if vol is not None else None
+            apr = (vol * fee / 1e6 / tvl * 365 * 100) if (vol and tvl) else None
+            out.append({
+                "ver": 3, "pool": Web3.to_checksum_address(str(ap.get("id"))),
+                "fee": fee, "quote_sym": qsym, "quote_addr": qaddr,
+                "quote_decimals": qdec, "quote_usd": qusd, "quote_is_token1": q_is_t1,
+                "token0": Web3.to_checksum_address(t0.get("address")),
+                "token1": Web3.to_checksum_address(t1.get("address")),
+                "tvl_usd": tvl, "vol24_usd": vol, "apr_pct": apr,
+                "tick_spacing": ch.TICK_SPACING.get(fee), "basis": "alps",
+            })
+        except Exception:
+            continue
+    if not out:
+        return None
+    out.sort(key=lambda p: p["tvl_usd"], reverse=True)
+    # info token meme: decimals dari on-chain (butuh utk matematika harga), simbol
+    # ambil dari alps kalau ada supaya tak perlu round-trip tambahan.
+    try:
+        tinfo = ch.token_info(w3, Web3.to_checksum_address(token))
+    except Exception:
+        tinfo = {"symbol": meme_sym or "?", "decimals": 18, "name": meme_sym or ""}
+    if meme_sym and not tinfo.get("symbol"):
+        tinfo["symbol"] = meme_sym
+    return {"token": tinfo, "pools": out}
 
 
 def _positions_build(cid: int, full: bool = False, with_basis: bool = True) -> dict:
