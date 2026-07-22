@@ -1587,16 +1587,19 @@ def list_positions(chain_id: int, pk: str, max_positions: int = 40,
             # Uniswap dianggap "closed"). _is_active on-chain menyaring yang benar mati.
             cached = [int(t) for t in hit[1]] if hit else []
             tids = list(dict.fromkeys([*uni_ids, *cached]))
-            # Indexer Uniswap TELAT untuk mint baru → cek balanceOf on-chain; kalau
-            # naik sejak snapshot terakhir, enumerasi NFT baru saja (indeks paling
-            # akhir) dan ikutkan. Menangkap juga mint dari luar bot yang belum
-            # terindeks. Dibatasi 20 NFT terbaru biar cache basi tak memicu scan besar.
+            # Indexer Uniswap bisa TELAT BERJAM-JAM untuk mint baru (terbukti di
+            # Robinhood chain) → SELALU enumerasi NFT terbaru on-chain dan union.
+            # Stateless: tidak bergantung snapshot (snapshot bisa terlanjur menyerap
+            # balanceOf tanpa sempat enumerasi NFT-nya). 10 terbaru cukup untuk
+            # mint beruntun; melebar (maks 20) kalau snapshot bilang lebih banyak.
             n = npm.functions.balanceOf(account.address).call()
+            lookback = 10
             if hit and n > hit[0]:
-                new_idxs = list(range(max(hit[0], n - 20), n))
-                new_tids = ex.map(
-                    lambda i: npm.functions.tokenOfOwnerByIndex(account.address, i).call(), new_idxs)
-                tids = list(dict.fromkeys([*tids, *map(int, new_tids)]))
+                lookback = min(max(lookback, n - hit[0]), 20)
+            new_idxs = list(range(max(0, n - lookback), n))
+            new_tids = ex.map(
+                lambda i: npm.functions.tokenOfOwnerByIndex(account.address, i).call(), new_idxs)
+            tids = list(dict.fromkeys([*tids, *map(int, new_tids)]))
         else:
             n = npm.functions.balanceOf(account.address).call()
             if hit and not full and n >= hit[0]:
