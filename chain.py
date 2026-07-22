@@ -1414,6 +1414,9 @@ def mint_position(chain_id: int, pk: str, pool_info: dict, budget: float,
                 and log.topics[0].hex().removeprefix("0x") == ERC721_TRANSFER_TOPIC.removeprefix("0x")):
             token_id = int(log.topics[3].hex(), 16)
             break
+    if token_id is not None:
+        # tampil di /list SEKARANG juga — jangan nunggu indexer Uniswap (telat menit-an)
+        _active_add(chain_id, account.address, token_id)
 
     if mode in ("wide", "stable"):
         # USD dari jumlah AKTUAL yang masuk posisi (termasuk meme dari wallet)
@@ -1486,6 +1489,20 @@ def _active_save(key: str, n: int, tids: list):
         _os.replace(tmp, _ACTIVE_FILE)
     except Exception:
         pass
+
+
+def _active_add(chain_id: int, addr: str, tid: int):
+    """Daftarkan tokenId BARU ke cache aktif langsung saat mint sukses.
+    Indexer Uniswap telat beberapa menit untuk posisi baru — tanpa ini posisi
+    fresh-mint tidak muncul di /list sampai terindeks."""
+    key = f"{chain_id}:{addr.lower()}"
+    hit = _active_load().get(key)
+    if not hit:
+        return  # belum pernah list → refresh berikutnya scan sendiri
+    n, tids = hit[0] + 1, list(hit[1])  # mint = balanceOf +1
+    if tid not in tids:
+        tids.append(tid)
+    _active_save(key, n, tids)
 
 
 def _is_active(p) -> bool:
@@ -1570,6 +1587,16 @@ def list_positions(chain_id: int, pk: str, max_positions: int = 40,
             # Uniswap dianggap "closed"). _is_active on-chain menyaring yang benar mati.
             cached = [int(t) for t in hit[1]] if hit else []
             tids = list(dict.fromkeys([*uni_ids, *cached]))
+            # Indexer Uniswap TELAT untuk mint baru → cek balanceOf on-chain; kalau
+            # naik sejak snapshot terakhir, enumerasi NFT baru saja (indeks paling
+            # akhir) dan ikutkan. Menangkap juga mint dari luar bot yang belum
+            # terindeks. Dibatasi 20 NFT terbaru biar cache basi tak memicu scan besar.
+            n = npm.functions.balanceOf(account.address).call()
+            if hit and n > hit[0]:
+                new_idxs = list(range(max(hit[0], n - 20), n))
+                new_tids = ex.map(
+                    lambda i: npm.functions.tokenOfOwnerByIndex(account.address, i).call(), new_idxs)
+                tids = list(dict.fromkeys([*tids, *map(int, new_tids)]))
         else:
             n = npm.functions.balanceOf(account.address).call()
             if hit and not full and n >= hit[0]:
