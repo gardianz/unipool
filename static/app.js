@@ -803,6 +803,8 @@ function renderPositions(r) {
   $('#posSub').innerHTML = srcTag
     + ` · realized ${usd(net)} (deposit ${usd(s.deposits)}, withdraw ${usd(s.withdrawals)}) · ${upd}`;
 
+  S.lastPositions = r.positions;
+  loadOrders();
   if (!r.positions.length) {
     $('#poslist').innerHTML = '<div class="empty">Belum ada posisi aktif.</div>';
     return;
@@ -933,7 +935,8 @@ function posCard(p) {
     </div>
     <div class="acts">
       ${ver === 2 ? '' : `<button class="primary sm" data-act="rebalance" data-pid="${p.pid}" data-ver="${ver}">⚖️ Rebalance</button>
-      <button data-act="collect" data-pid="${p.pid}" data-ver="${ver}">💰 Collect fees</button>`}
+      <button data-act="collect" data-pid="${p.pid}" data-ver="${ver}">💰 Collect fees</button>
+      <button data-act="tpsl" data-pid="${p.pid}" data-ver="${ver}">🎯 TP/SL</button>`}
       <button data-act="add" data-pid="${p.pid}" data-ver="${ver}">➕ Add</button>
       <button data-act="reduce" data-pid="${p.pid}" data-ver="${ver}">➖ Reduce</button>
       <button class="danger" data-act="close" data-pid="${p.pid}" data-ver="${ver}">Close</button>
@@ -990,7 +993,78 @@ function posAction(pid, act, ver) {
               <button id="cgn">Close saja</button>`)}`);
     $('#cga').onclick = () => run({autoswap: true});
     $('#cgn').onclick = () => run({autoswap: false});
+  } else if (act === 'tpsl') {
+    const p = (S.lastPositions || []).find(x => String(x.pid) === String(pid));
+    const mc = (p && p.mc_now) ? p.mc_now : 0;
+    const swOn = !!(S.settings && S.settings.autoswap);
+    modal(`<h3>TP/SL ${pid}</h3>
+      <div class="dim" style="font-size:13px">Auto-close posisi saat <b>market cap</b> sentuh batas.
+        ${mc ? `MC sekarang <b>${usd(mc)}</b>.` : ''} Kosongkan sisi yang tak dipakai.
+        Eksekusi dijalankan bot (harus aktif).</div>
+      <div style="margin-top:12px;display:grid;gap:10px">
+        <label class="ordf">TP · close saat MC ≥ <input id="tpv" class="mono" inputmode="decimal" placeholder="mis. 800k"></label>
+        <label class="ordf">SL · close saat MC ≤ <input id="slv" class="mono" inputmode="decimal" placeholder="mis. 200k"></label>
+        <label class="ordsw"><input type="checkbox" id="swv"${swOn ? ' checked' : ''}> auto-swap hasil ke wrapped native saat trigger</label>
+      </div>
+      ${btns('<button class="primary" id="ok">Buat pesanan</button>')}`);
+    $('#ok').onclick = () => {
+      const tp = parseHuman($('#tpv').value), sl = parseHuman($('#slv').value);
+      if (tp == null && sl == null) return toast('Isi minimal TP atau SL.', 'err');
+      if (mc > 0 && tp != null && tp <= mc) return toast('TP harus > MC sekarang.', 'err');
+      if (mc > 0 && sl != null && sl >= mc) return toast('SL harus < MC sekarang.', 'err');
+      if (tp != null && sl != null && sl >= tp) return toast('SL harus < TP.', 'err');
+      closeModal();
+      S.busy = true;
+      toast('<span class="spin"></span> buat pesanan...', 'hold');
+      api('/api/order', {chain: S.chain, action: 'add', pid, tp_mc: tp, sl_mc: sl, autoswap: $('#swv').checked})
+        .then(r => { toast(`✅ Pesanan <b>${r.id}</b> dibuat`, 'ok'); loadOrders(); })
+        .catch(e => toast('❌ ' + e.message, 'err'))
+        .finally(() => { S.busy = false; });
+    };
   }
+}
+
+// ── Pesanan TP/SL (eksekusi oleh bot; web hanya buat/batal + tampil) ──
+function parseHuman(s) {
+  s = (s || '').trim().toLowerCase().replace(/[$,\s]/g, '');
+  if (!s || s === '-') return null;
+  const mult = {k: 1e3, m: 1e6, b: 1e9}[s.slice(-1)];
+  const v = parseFloat(mult ? s.slice(0, -1) : s);
+  return isFinite(v) ? v * (mult || 1) : null;
+}
+
+async function loadOrders() {
+  try {
+    renderOrders(await api('/api/orders?chain=' + S.chain));
+  } catch (e) { /* panel opsional — diamkan */ }
+}
+
+function renderOrders(r) {
+  const panel = $('#ordersPanel');
+  const active = (r && r.active) || [];
+  if (!active.length) { panel.classList.add('hide'); panel.innerHTML = ''; return; }
+  panel.classList.remove('hide');
+  panel.innerHTML = `<div class="orders-head">🎯 Pesanan TP/SL aktif · ${active.length}</div>` +
+    active.map(o => `<div class="order">
+      <span class="chip mono">${o.id}</span>
+      <span class="oname">${o.meme_sym || ''} <span class="mono dim">${o.pid}</span></span>
+      <span class="tag up">TP ${o.tp_mc ? usd(o.tp_mc) : '—'}</span>
+      <span class="tag down">SL ${o.sl_mc ? usd(o.sl_mc) : '—'}</span>
+      <span class="dim">${o.autoswap ? 'swap' : 'tahan'}</span>
+      <button class="danger sm" data-cancel="${o.id}" title="batal">✖</button>
+    </div>`).join('');
+  for (const b of panel.querySelectorAll('button[data-cancel]')) {
+    b.onclick = () => cancelOrder(b.dataset.cancel);
+  }
+}
+
+function cancelOrder(id) {
+  S.busy = true;
+  toast('<span class="spin"></span> batal ' + id + '...', 'hold');
+  api('/api/order', {chain: S.chain, action: 'cancel', id})
+    .then(() => { toast('Pesanan ' + id + ' dibatalkan', 'ok'); loadOrders(); })
+    .catch(e => toast('❌ ' + e.message, 'err'))
+    .finally(() => { S.busy = false; });
 }
 
 // ══════════ state global ══════════

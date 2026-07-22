@@ -958,11 +958,70 @@ def api_action(_q, b) -> dict:
                if k != "steps" and isinstance(v, (int, float, str, bool, type(None)))}}
 
 
-ROUTES_GET = {"/api/state": api_state, "/api/candles": api_candles, "/api/positions": api_positions}
+def api_orders(q, _b) -> dict:
+    """Daftar pesanan TP/SL wallet aktif di chain terpilih. Read-only.
+    EKSEKUSI dilakukan bot.py (monitor_loop), bukan web — di sini cuma display."""
+    s = store.load_settings()
+    cid = int(q.get("chain", [s["chain"]])[0])
+    addr = bot._addr_of(bot.pk())
+    active = store.orders(cid, addr, status="active")
+    hist = [o for o in store.orders(cid, addr)
+            if o.get("status") in ("done", "error", "cancelled")]
+    hist.sort(key=lambda o: o.get("triggered") or o.get("created") or 0, reverse=True)
+    return {"active": active, "history": hist[:10], "wallet": addr, "chain": cid}
+
+
+def api_order(_q, b) -> dict:
+    """Buat/batal pesanan TP/SL. add: butuh pid + tp_mc dan/atau sl_mc (USD).
+    Hanya MENULIS order ke store — bot.py yang meng-close saat trigger."""
+    s = store.load_settings()
+    cid = int(b.get("chain", s["chain"]))
+    act = str(b.get("action", "add"))
+    addr = bot._addr_of(bot.pk())
+    if act == "cancel":
+        oid = str(b["id"])
+        if not store.get_order(cid, oid):
+            raise RuntimeError("order tidak ditemukan")
+        store.update_order(cid, oid, status="cancelled", reason="dibatalkan (web)")
+        return {"ok": True, "id": oid}
+    if act != "add":
+        raise RuntimeError(f"aksi tidak dikenal: {act}")
+    pid = str(b["pid"])
+
+    def _mc(v):
+        return float(v) if v not in (None, "", "-") else None
+
+    tp, sl = _mc(b.get("tp_mc")), _mc(b.get("sl_mc"))
+    if tp is None and sl is None:
+        raise RuntimeError("isi minimal satu batas TP atau SL")
+    pos = _snapshot(cid, pid)
+    if not pos:
+        raise RuntimeError("posisi tidak ditemukan")
+    if pos.get("ver") == 2:
+        raise RuntimeError("posisi v2 full-range — TP/SL market cap tidak berlaku")
+    mc = pos.get("mc_now") or 0.0
+    if mc > 0:
+        if tp is not None and tp <= mc:
+            raise RuntimeError(f"TP harus > MC sekarang ({ch.fmt_usd(mc)})")
+        if sl is not None and sl >= mc:
+            raise RuntimeError(f"SL harus < MC sekarang ({ch.fmt_usd(mc)})")
+    if tp is not None and sl is not None and sl >= tp:
+        raise RuntimeError("SL harus < TP")
+    meme_sym = pos["sym0"] if pos.get("quote_is_token1", True) else pos["sym1"]
+    oid = store.add_order(cid, {
+        "wallet": addr, "pid": pid, "meme_sym": meme_sym,
+        "tp_mc": tp, "sl_mc": sl, "autoswap": bool(b.get("autoswap", s["autoswap"])),
+        "slippage": float(b.get("slippage_pct", s["slippage_pct"])),
+    })
+    return {"ok": True, "id": oid, "tp_mc": tp, "sl_mc": sl, "mc_now": mc, "meme_sym": meme_sym}
+
+
+ROUTES_GET = {"/api/state": api_state, "/api/candles": api_candles,
+              "/api/positions": api_positions, "/api/orders": api_orders}
 ROUTES_POST = {"/api/settings": api_settings, "/api/discover": api_discover,
                "/api/pool": api_pool, "/api/preview": api_preview,
                "/api/liquidity": api_liquidity, "/api/mint": api_mint,
-               "/api/action": api_action}
+               "/api/action": api_action, "/api/order": api_order}
 
 
 # ──────────────────────────── HTTP ────────────────────────────

@@ -4,6 +4,7 @@ untuk hitung PnL portfolio ala /list.
 """
 import json
 import time
+import uuid
 from pathlib import Path
 
 BASE = Path(__file__).parent
@@ -138,6 +139,73 @@ def portfolio_summary(chain_id: int, wallet: str = "") -> dict:
     withdrawals = sum(e["usd"] for e in ev if e["kind"] == "close")
     fees = sum(e["usd"] for e in ev if e["kind"] == "fees")
     return {"deposits": deposits, "withdrawals": withdrawals, "fees_claimed": fees}
+
+
+# ---------- Order TP/SL (auto-close posisi LP saat market cap sentuh batas) ----------
+# Disimpan di history.json → "orders": {"<chain>": [order, ...]}.
+# Satu order = satu posisi LP + batas TP (MC atas) dan/atau SL (MC bawah).
+# EKSEKUTOR TUNGGAL: monitor_loop di bot.py. Web hanya membuat/membatalkan order
+# (menulis file ini); bot yang menjalankan close saat trigger — jadi tidak ada
+# risiko dua proses menutup posisi yang sama (nonce/double-spend).
+# Field order:
+#   id, wallet (lowercase), pid (str), meme_sym,
+#   tp_mc (float|None), sl_mc (float|None), autoswap (bool),
+#   status ("active"|"done"|"error"|"cancelled"),
+#   created (ts), triggered (ts|None), reason (str), tx (str|None)
+def add_order(chain_id: int, order: dict) -> str:
+    h = _hist()
+    o = dict(order)
+    o["id"] = uuid.uuid4().hex[:6]
+    o.setdefault("created", int(time.time()))
+    o.setdefault("status", "active")
+    o.setdefault("triggered", None)
+    o.setdefault("reason", "")
+    o.setdefault("tx", None)
+    o["wallet"] = str(o.get("wallet", "")).lower()
+    o["pid"] = str(o.get("pid", ""))
+    (h.setdefault("orders", {}).setdefault(str(chain_id), [])).append(o)
+    _write(HISTORY_FILE, h)
+    return o["id"]
+
+
+def orders(chain_id: int, wallet: str = "", status: str = "") -> list[dict]:
+    lst = _hist().get("orders", {}).get(str(chain_id), [])
+    out = []
+    for o in lst:
+        if wallet and o.get("wallet", "").lower() != wallet.lower():
+            continue
+        if status and o.get("status") != status:
+            continue
+        out.append(o)
+    return out
+
+
+def get_order(chain_id: int, oid: str) -> dict | None:
+    for o in _hist().get("orders", {}).get(str(chain_id), []):
+        if o.get("id") == oid:
+            return o
+    return None
+
+
+def update_order(chain_id: int, oid: str, **fields) -> bool:
+    h = _hist()
+    for o in h.get("orders", {}).get(str(chain_id), []):
+        if o.get("id") == oid:
+            o.update(fields)
+            _write(HISTORY_FILE, h)
+            return True
+    return False
+
+
+def drop_order(chain_id: int, oid: str) -> bool:
+    h = _hist()
+    lst = h.get("orders", {}).get(str(chain_id), [])
+    n = len(lst)
+    lst[:] = [o for o in lst if o.get("id") != oid]
+    if len(lst) != n:
+        _write(HISTORY_FILE, h)
+        return True
+    return False
 
 
 def fmt_age(ts: int | None) -> str:

@@ -103,6 +103,15 @@ def disp_pid(pid) -> str:
     return f"#{s}" if s.isdigit() else s
 
 
+def pk_for(addr: str) -> str | None:
+    """Private key untuk alamat wallet tertentu (buat eksekusi order milik wallet itu)."""
+    al = str(addr).lower()
+    for k in all_pks():
+        if _addr_of(k).lower() == al:
+            return k
+    return None
+
+
 def list_positions_all(cid: int, key: str | None = None) -> list[dict]:
     """Posisi v3 + v4 + v2 wallet (v4/v2 dari registry yang dicatat saat mint)."""
     key = key or pk()
@@ -158,6 +167,7 @@ HELP = (
     "<b>Perintah:</b>\n"
     "/start — menu utama\n"
     "/list — posisi + PnL + chart/add/reduce/close\n"
+    "/orders — pesanan TP/SL (auto-close posisi saat market cap sentuh batas)\n"
     "/wallet — saldo semua token + nilai USD\n"
     "/settings — pengaturan via tombol\n"
     "/set <code>key value</code> — set manual (width, amount, amount_pct, slippage, gap, alert, autoswap)\n"
@@ -177,11 +187,12 @@ def menu_kb() -> InlineKeyboardMarkup:
                      for i in range(min(n, 8))])
     rows += [
         [InlineKeyboardButton("📊 Posisi LP", callback_data="menu|list"),
-         InlineKeyboardButton("👛 Dompet", callback_data="menu|wallet")],
-        [InlineKeyboardButton("⚙️ Pengaturan", callback_data="menu|settings"),
-         InlineKeyboardButton("⛓ Chain", callback_data="menu|chain")],
-        [InlineKeyboardButton("❓ Bantuan", callback_data="menu|help"),
-         InlineKeyboardButton("🔄 Segarkan", callback_data="menu|main")],
+         InlineKeyboardButton("🎯 Pesanan", callback_data="menu|orders")],
+        [InlineKeyboardButton("👛 Dompet", callback_data="menu|wallet"),
+         InlineKeyboardButton("⚙️ Pengaturan", callback_data="menu|settings")],
+        [InlineKeyboardButton("⛓ Chain", callback_data="menu|chain"),
+         InlineKeyboardButton("❓ Bantuan", callback_data="menu|help")],
+        [InlineKeyboardButton("🔄 Segarkan", callback_data="menu|main")],
     ]
     return InlineKeyboardMarkup(rows)
 
@@ -1014,6 +1025,40 @@ async def handle_awaiting(update: Update) -> bool:
         ])
         await reply(update, f"Konfirmasi tambah dana ke posisi {disp_pid(tid)}:", kb)
         return True
+    if st["kind"] == "order":
+        pid = st["key"]
+        text = (update.message.text or "").strip()
+        cid = store.load_settings()["chain"]
+
+        def snap():
+            return next((p for p in list_positions_all(cid) if p["pid"] == str(pid)), None)
+
+        p = await asyncio.to_thread(snap)
+        mc_now = (p.get("mc_now") or 0.0) if p else 0.0
+        try:
+            tp, sl = parse_tpsl(text, mc_now)
+        except ValueError as e:
+            await reply(update, f"❌ {esc(e)}\nContoh: <code>tp 800k</code> · "
+                                f"<code>sl 200k</code> · <code>800k 200k</code>")
+            return True  # tetap nunggu balasan berikutnya
+        AWAITING.pop(chat_id, None)
+        meme_sym = (p["sym0"] if p["quote_is_token1"] else p["sym1"]) if p else ""
+        tp_s = str(int(round(tp))) if tp is not None else "x"
+        sl_s = str(int(round(sl))) if sl is not None else "x"
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Buat + auto-swap saat trigger",
+                                  callback_data=f"orderok|{pid}|{tp_s}|{sl_s}|1")],
+            [InlineKeyboardButton("✅ Buat, tahan token saat trigger",
+                                  callback_data=f"orderok|{pid}|{tp_s}|{sl_s}|0")],
+            [InlineKeyboardButton("❌ Cancel", callback_data="cancel")],
+        ])
+        await reply(update, (
+            f"🎯 <b>Konfirmasi pesanan {esc(meme_sym)} {disp_pid(pid)}</b>\n"
+            f"· TP (close saat MC ≥): <b>{ch.fmt_usd(tp) if tp is not None else '—'}</b>\n"
+            f"· SL (close saat MC ≤): <b>{ch.fmt_usd(sl) if sl is not None else '—'}</b>\n"
+            f"MC sekarang: {ch.fmt_usd(mc_now) if mc_now else '?'}\n\n"
+            f"Saat trigger → posisi di-close otomatis (full exit)."), kb)
+        return True
     key = st["key"]
     ctx = PENDING.get(key)
     if not ctx:
@@ -1316,6 +1361,8 @@ def position_kb(cid: int, p: dict) -> InlineKeyboardMarkup:
     rows = [chart_buttons(cid, p["pool"], meme_ca) + [InlineKeyboardButton("🔄", callback_data=f"pos|{pid}")],
             actions]
     if ver != 2:
+        rows.append([InlineKeyboardButton("🎯 TP/SL (auto-close di market cap)",
+                                          callback_data=f"tpsl|{pid}")])
         rows.append([InlineKeyboardButton("⚖️ Rebalance (mint ulang di harga sekarang)",
                                           callback_data=f"reb|{pid}")])
     rows.append([InlineKeyboardButton("⬅️ Posisi", callback_data="menu|list"),
@@ -1822,64 +1869,367 @@ async def on_callback(update: Update, _):
         await q.edit_message_reply_markup(None)
         await do_close(update, parts[1], autoswap=(len(parts) > 2 and parts[2] == "1"))
         return
+    if data == "menu|orders":
+        await show_orders(update, q.message)
+        return
+    if data.startswith("tpsl|"):
+        await ask_tpsl(update, data.split("|", 1)[1])
+        return
+    if data.startswith("orderok|"):
+        _, pid, tp_s, sl_s, sw = data.split("|")
+        await q.edit_message_reply_markup(None)
+        await do_create_order(update, pid, tp_s, sl_s, sw == "1")
+        return
+    if data.startswith("ordcancel|"):
+        oid = data.split("|", 1)[1]
+        cid = store.load_settings()["chain"]
+        store.update_order(cid, oid, status="cancelled", reason="dibatalkan user")
+        await show_orders(update, q.message)
+        return
 
 
-# ---------- Monitor alert in/out range ----------
+# ---------- Order TP/SL (auto-close posisi LP saat market cap sentuh batas) ----------
+def parse_tpsl(text: str, mc_now: float) -> tuple[float | None, float | None]:
+    """Parse balasan TP/SL → (tp_mc, sl_mc) dalam USD. Format:
+    'tp 800k' · 'sl 200k' · 'tp 800k sl 200k' · '800k 200k' (TP lalu SL) ·
+    '800k -' / '- 200k' (lewati satu sisi). Raise ValueError kalau invalid."""
+    t = text.lower().replace("$", "").strip()
+    toks = [x for x in t.replace(",", " ").split() if x]
+
+    def num(x):
+        if x in ("-", "x", "skip", "none", "n"):
+            return None
+        return _num_usd(x)
+
+    tp = sl = None
+    if any(x in ("tp", "sl") for x in toks):     # bentuk berlabel
+        i = 0
+        while i < len(toks):
+            if toks[i] in ("tp", "sl") and i + 1 < len(toks):
+                v = num(toks[i + 1])
+                if toks[i] == "tp":
+                    tp = v
+                else:
+                    sl = v
+                i += 2
+            else:
+                i += 1
+    else:                                        # posisional: [TP] [SL]
+        if len(toks) >= 1:
+            tp = num(toks[0])
+        if len(toks) >= 2:
+            sl = num(toks[1])
+    if tp is None and sl is None:
+        raise ValueError("isi minimal satu batas TP atau SL")
+    if mc_now > 0:
+        if tp is not None and tp <= mc_now:
+            raise ValueError(f"TP harus > MC sekarang ({ch.fmt_usd(mc_now)})")
+        if sl is not None and sl >= mc_now:
+            raise ValueError(f"SL harus < MC sekarang ({ch.fmt_usd(mc_now)})")
+    if tp is not None and sl is not None and sl >= tp:
+        raise ValueError("SL harus < TP")
+    return tp, sl
+
+
+async def ask_tpsl(update: Update, pid: str):
+    s = store.load_settings()
+    cid = s["chain"]
+
+    def work():
+        return next((p for p in list_positions_all(cid) if p["pid"] == str(pid)), None)
+
+    p = await asyncio.to_thread(work)
+    if not p:
+        await reply(update, f"❌ Posisi {disp_pid(pid)} tidak ditemukan.")
+        return
+    if p.get("ver") == 2:
+        await reply(update, "⚠️ Posisi v2 full-range — TP/SL berbasis market cap tidak berlaku.")
+        return
+    meme_sym = p["sym0"] if p["quote_is_token1"] else p["sym1"]
+    mc = p.get("mc_now")
+    mc_txt = f"MC {esc(meme_sym)} sekarang: <b>{ch.fmt_usd(mc)}</b>\n" if mc else ""
+    await update.effective_chat.send_message(
+        (f"🎯 <b>TP/SL untuk {esc(meme_sym)} {disp_pid(pid)}</b>\n{mc_txt}\n"
+         f"<b>Balas pesan ini</b> dengan batas market cap:\n"
+         f"· <code>tp 800k</code> — take profit di MC 800k\n"
+         f"· <code>sl 200k</code> — stop loss di MC 200k\n"
+         f"· <code>800k 200k</code> — TP lalu SL sekaligus\n"
+         f"· <code>800k -</code> / <code>- 200k</code> — lewati satu sisi\n\n"
+         f"Saat MC sentuh batas → posisi auto-close."),
+        parse_mode=ParseMode.HTML,
+        reply_markup=ForceReply(selective=True, input_field_placeholder="tp 800k · sl 200k · 800k 200k"))
+    AWAITING[update.effective_chat.id] = {"kind": "order", "key": str(pid)}
+
+
+async def do_create_order(update: Update, pid: str, tp_s: str, sl_s: str, autoswap: bool):
+    s = store.load_settings()
+    cid = s["chain"]
+
+    def snap():
+        return next((p for p in list_positions_all(cid) if p["pid"] == str(pid)), None)
+
+    p = await asyncio.to_thread(snap)
+    if not p:
+        await reply(update, f"❌ Posisi {disp_pid(pid)} tidak ditemukan (mungkin sudah ditutup).")
+        return
+    meme_sym = p["sym0"] if p["quote_is_token1"] else p["sym1"]
+    tp = None if tp_s == "x" else float(tp_s)
+    sl = None if sl_s == "x" else float(sl_s)
+    oid = await asyncio.to_thread(store.add_order, cid, {
+        "wallet": wallet_address(), "pid": str(pid), "meme_sym": meme_sym,
+        "tp_mc": tp, "sl_mc": sl, "autoswap": bool(autoswap), "slippage": s["slippage_pct"],
+    })
+    interval = int(s.get("alert_secs", 60) or 0)
+    warn = "" if interval > 0 else ("\n<i>ℹ️ Alert OFF — cek TP/SL tetap jalan tiap ~30s "
+                                    "selama ada pesanan aktif.</i>")
+    await reply(update, (
+        f"✅ <b>Pesanan dibuat</b> <code>{oid}</code>\n"
+        f"{esc(meme_sym)} {disp_pid(pid)} · TP {ch.fmt_usd(tp) if tp else '—'} · "
+        f"SL {ch.fmt_usd(sl) if sl else '—'} · {'auto-swap' if autoswap else 'tahan token'}{warn}"),
+        InlineKeyboardMarkup([[InlineKeyboardButton("🎯 Pesanan", callback_data="menu|orders"),
+                               InlineKeyboardButton("🏠 Menu", callback_data="menu|main"), DEL_BTN]]))
+
+
+def _orders_for_chain(cid: int, status: str = "") -> list[dict]:
+    out = []
+    for k in all_pks():
+        out += store.orders(cid, _addr_of(k), status=status)
+    return out
+
+
+def orders_text(cid: int) -> str:
+    cfg = ch.CHAINS[cid]
+    lines = [f"🎯 <b>Pesanan TP/SL</b> — {esc(cfg['name'])}",
+             "Auto-close posisi LP saat market cap sentuh batas.\n"]
+    active = _orders_for_chain(cid, "active")
+    if not active:
+        lines.append("Belum ada pesanan aktif.\nBuka 📊 Posisi → tombol 🎯 TP/SL untuk buat.")
+    else:
+        for o in active:
+            tp = ch.fmt_usd(o["tp_mc"]) if o.get("tp_mc") else "—"
+            sl = ch.fmt_usd(o["sl_mc"]) if o.get("sl_mc") else "—"
+            sw = "swap" if o.get("autoswap") else "tahan"
+            lines.append(f"• <code>{o['id']}</code> {esc(o.get('meme_sym', ''))} "
+                         f"{disp_pid(o['pid'])} · TP {tp} · SL {sl} · {sw}")
+    hist = [o for o in _orders_for_chain(cid)
+            if o.get("status") in ("done", "error", "cancelled")]
+    hist.sort(key=lambda o: o.get("triggered") or o.get("created") or 0, reverse=True)
+    if hist:
+        lines.append("\n<b>Riwayat terakhir:</b>")
+        for o in hist[:5]:
+            icon = {"done": "✅", "error": "⚠️", "cancelled": "🚫"}.get(o["status"], "•")
+            lines.append(f"{icon} <code>{o['id']}</code> {disp_pid(o['pid'])} · "
+                         f"{esc(o.get('reason', '') or o['status'])}")
+    return "\n".join(lines)
+
+
+def orders_kb(cid: int) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(f"✖ Batal {o['id']} ({disp_pid(o['pid'])})",
+                                  callback_data=f"ordcancel|{o['id']}")]
+            for o in _orders_for_chain(cid, "active")]
+    rows.append([InlineKeyboardButton("📊 Posisi (buat baru)", callback_data="menu|list"),
+                 InlineKeyboardButton("🏠 Menu", callback_data="menu|main")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def show_orders(update: Update, msg=None):
+    cid = store.load_settings()["chain"]
+    if msg is None:
+        msg = await reply(update, "⏳ Memuat pesanan...")
+    else:
+        await edit(msg, "⏳ Memuat pesanan...")
+    try:
+        text = await asyncio.to_thread(orders_text, cid)
+        kb = await asyncio.to_thread(orders_kb, cid)
+    except Exception as e:
+        await edit(msg, f"❌ Gagal load pesanan: {esc(e)}", InlineKeyboardMarkup([BACK_ROW]))
+        return
+    await edit(msg, text, kb)
+
+
+async def cmd_orders(update: Update, _, status_msg=None):
+    if not authorized(update):
+        return
+    await show_orders(update, status_msg)
+
+
+# ---------- Monitor: alert in/out range + eksekusi order TP/SL ----------
+async def _notify(app, body: str):
+    for chat_id in allowed_chat_ids():
+        try:
+            await app.bot.send_message(chat_id, body, parse_mode=ParseMode.HTML,
+                                       disable_web_page_preview=True)
+        except Exception:
+            pass
+
+
+async def _emit_range_alerts(app, cid: int, positions: list[dict]):
+    for p in positions:
+        if p.get("ver") == 2:
+            continue  # v2 full-range, tidak pernah out of range
+        key = (cid, p["pid"])
+        now_in = p["in_range"]
+        prev = RANGE_STATE.get(key)
+        RANGE_STATE[key] = now_in
+        if prev is None or prev == now_in:
+            continue  # baseline pertama / tidak berubah
+        meme_sym = p["sym0"] if p["quote_is_token1"] else p["sym1"]
+        if now_in:
+            head = f"🟢 <b>{esc(meme_sym)} {_pos_disp(p)} MASUK range</b> — fee mulai mengalir."
+        else:
+            if p.get("mc_now") and p.get("mc_lower") and p["mc_now"] < p["mc_lower"]:
+                arah = f"tembus ke BAWAH — posisi jadi penuh {esc(meme_sym)}"
+            else:
+                arah = f"keluar ke ATAS — posisi jadi penuh {esc(p['quote_sym'] or 'quote')}"
+            head = f"🔴 <b>{esc(meme_sym)} {_pos_disp(p)} KELUAR range</b> — {arah}. Fee berhenti."
+        body = (f"{head}\n"
+                f"Val {ch.fmt_usd(p['value_usd'])} · Unclaimed {ch.fmt_usd(p['unclaimed_usd'])}\n"
+                f"Range: {esc(range_str(p))}")
+        meme_ca = p["token0"] if p["quote_is_token1"] else p["token1"]
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📋 Detail", callback_data=f"pos|{p['pid']}"),
+             InlineKeyboardButton("⚖️ Rebalance", callback_data=f"reb|{p['pid']}"),
+             InlineKeyboardButton("🗑 Close", callback_data=f"close|{p['pid']}"), DEL_BTN],
+            chart_buttons(cid, p["pool"], meme_ca),
+        ])
+        for chat_id in allowed_chat_ids():
+            try:
+                await app.bot.send_message(chat_id, body, parse_mode=ParseMode.HTML,
+                                           reply_markup=kb, disable_web_page_preview=True)
+            except Exception:
+                pass
+
+
+async def _check_orders(app, cid: int, active_orders: list[dict], by_wallet: dict):
+    """Cek tiap order aktif vs MC posisi. by_wallet[addr] = {pid: pos} atau None (fetch gagal)."""
+    for o in active_orders:
+        live = by_wallet.get(o.get("wallet", "").lower())
+        if live is None:
+            continue  # fetch wallet ini gagal / wallet tak ada → skip aman, coba lagi nanti
+        p = live.get(str(o["pid"]))
+        if p is None:
+            # Wallet kosong TOTAL = ambigu (mungkin fetch transient) → biarkan aktif, coba lagi.
+            # Cap "done" hanya kalau wallet masih punya posisi LAIN → bukti fetch sukses &
+            # posisi order ini memang sudah ditutup manual. Cegah order valid tak terlindungi.
+            if not live:
+                continue
+            store.update_order(cid, o["id"], status="done",
+                               reason="posisi sudah tidak ada", triggered=int(time.time()))
+            await _notify(app, f"🎯 Pesanan <code>{o['id']}</code> {disp_pid(o['pid'])} "
+                               f"dihapus otomatis — posisi sudah tidak ada.")
+            continue
+        mc = p.get("mc_now")
+        if not mc:
+            continue
+        hit = None
+        if o.get("tp_mc") and mc >= o["tp_mc"]:
+            hit = ("TP", o["tp_mc"], "≥")
+        elif o.get("sl_mc") and mc <= o["sl_mc"]:
+            hit = ("SL", o["sl_mc"], "≤")
+        if hit:
+            await _trigger_order(app, cid, o, p, hit, mc)
+
+
+async def _trigger_order(app, cid: int, o: dict, p: dict, hit: tuple, mc: float):
+    kind, level, op = hit
+    # KUNCI ANTI DOUBLE-TRIGGER: tandai done SEBELUM eksekusi. Kalau close lambat,
+    # iterasi loop berikutnya tidak akan melihat order ini sebagai active lagi.
+    store.update_order(cid, o["id"], status="done",
+                       reason=f"{kind} @ MC {ch.fmt_usd(mc)}", triggered=int(time.time()))
+    waddr = o.get("wallet", "")
+    key = pk_for(waddr)
+    if not key:
+        store.update_order(cid, o["id"], status="error", reason="wallet tidak tersedia di .env")
+        await _notify(app, f"⚠️ Pesanan <code>{o['id']}</code> gagal: wallet "
+                           f"<code>{esc(waddr)}</code> tidak ada di .env.")
+        return
+    slip = float(o.get("slippage") or store.load_settings()["slippage_pct"])
+    autoswap = bool(o.get("autoswap"))
+    meme_sym = o.get("meme_sym", "")
+    await _notify(app, (f"🎯 <b>TRIGGER {kind}</b> {esc(meme_sym)} {disp_pid(o['pid'])} — "
+                        f"MC {ch.fmt_usd(mc)} {op} {ch.fmt_usd(level)}\n⏳ Auto-close posisi..."))
+    ver, ref = ch.parse_pid(o["pid"])
+    async with TX_LOCK:
+        try:
+            r = await asyncio.to_thread(ch.close_any, cid, key, o["pid"], slip, autoswap)
+        except Exception as e:
+            store.update_order(cid, o["id"], status="error", reason=str(e)[:200])
+            await _notify(app, f"⚠️ <b>Order {o['id']} close GAGAL</b>: {esc(str(e)[:300])}\n"
+                               f"Posisi TIDAK ditutup — cek manual di 📊 Posisi.")
+            return
+    # catat event PnL (mirror do_close) supaya riwayat konsisten
+    ev_tid = ref if ver == 3 else str(o["pid"])
+    if ver == 4:
+        store.drop_ref(cid, waddr, "v4", str(ref))
+    elif ver == 2:
+        store.drop_ref(cid, waddr, "v2", str(ref))
+    store.record_event(cid, "close", ev_tid, p.get("value_usd", 0.0), wallet=waddr)
+    if p.get("unclaimed_usd", 0) > 0:
+        store.record_event(cid, "fees", ev_tid, p["unclaimed_usd"], wallet=waddr)
+    if r.get("steps"):
+        store.update_order(cid, o["id"], tx=r["steps"][0][1])
+    lines = [f"✅ <b>Order {o['id']} eksekusi</b> — {kind} {esc(meme_sym)} {disp_pid(o['pid'])}",
+             f"Close pada MC {ch.fmt_usd(mc)} · withdraw "
+             f"~{ch.fmt_usd(p.get('value_usd', 0) + p.get('unclaimed_usd', 0))}"]
+    for label, h in r.get("steps", []):
+        lines.append(f"{label}: {ch.tx_link(cid, h)}")
+    for sym, h in r.get("swaps", []):
+        if str(h).startswith("0x"):
+            lines.append(f"swap {esc(sym)} → {esc(ch.CHAINS[cid]['wrapped_symbol'])}: "
+                         f"{ch.tx_link(cid, h)}")
+    await _notify(app, "\n".join(lines))
+
+
+async def _gather_positions(cid: int):
+    """Ambil posisi semua wallet di satu chain. Return (positions, by_wallet).
+    by_wallet[addr] = {pid: pos} atau None kalau fetch wallet itu gagal."""
+    positions = []
+    by_wallet = {}
+    for key in all_pks():
+        waddr = _addr_of(key).lower()
+        try:
+            pk_pos = await asyncio.to_thread(list_positions_all, cid, key)
+        except Exception as e:
+            log.warning("monitor posisi %s/%s: %s", cid, waddr, e)
+            by_wallet[waddr] = None  # fetch gagal → JANGAN anggap posisi hilang
+            continue
+        by_wallet[waddr] = {p["pid"]: p for p in pk_pos}
+        positions += pk_pos
+    return positions, by_wallet
+
+
 async def monitor_loop(app):
-    """Cek berkala semua posisi; kirim alert saat posisi keluar/masuk range."""
+    """Cek berkala: alert in/out range (chain aktif) + eksekusi order TP/SL.
+    Order dicek di SEMUA chain yang punya pesanan aktif — jadi TP/SL tetap jalan
+    walau bot lagi di chain lain. Loop ~30s selama ada pesanan aktif."""
     await asyncio.sleep(15)  # kasih waktu bot siap
     while True:
         s = store.load_settings()
+        active_cid = s["chain"]
         interval = int(s.get("alert_secs", 60) or 0)
-        if interval <= 0:
+        alert_on = interval > 0
+        order_chains = [c for c in ch.CHAINS if _orders_for_chain(c, "active")]
+        chains = set(order_chains)
+        if alert_on:
+            chains.add(active_cid)
+        if not chains:
             await asyncio.sleep(60)
             continue
-        cid = s["chain"]
-        try:
-            positions = []
-            for key in all_pks():
-                positions += await asyncio.to_thread(list_positions_all, cid, key)
-            for p in positions:
-                if p.get("ver") == 2:
-                    continue  # v2 full-range, tidak pernah out of range
-                key = (cid, p["pid"])
-                now_in = p["in_range"]
-                prev = RANGE_STATE.get(key)
-                RANGE_STATE[key] = now_in
-                if prev is None or prev == now_in:
-                    continue  # baseline pertama / tidak berubah
-                meme_sym = p["sym0"] if p["quote_is_token1"] else p["sym1"]
-                if now_in:
-                    head = f"🟢 <b>{esc(meme_sym)} {_pos_disp(p)} MASUK range</b> — fee mulai mengalir."
-                else:
-                    if p.get("mc_now") and p.get("mc_lower") and p["mc_now"] < p["mc_lower"]:
-                        arah = f"tembus ke BAWAH — posisi jadi penuh {esc(meme_sym)}"
-                    else:
-                        arah = f"keluar ke ATAS — posisi jadi penuh {esc(p['quote_sym'] or 'quote')}"
-                    head = f"🔴 <b>{esc(meme_sym)} {_pos_disp(p)} KELUAR range</b> — {arah}. Fee berhenti."
-                body = (f"{head}\n"
-                        f"Val {ch.fmt_usd(p['value_usd'])} · Unclaimed {ch.fmt_usd(p['unclaimed_usd'])}\n"
-                        f"Range: {esc(range_str(p))}")
-                meme_ca = p["token0"] if p["quote_is_token1"] else p["token1"]
-                kb = InlineKeyboardMarkup([
-                    [InlineKeyboardButton("📋 Detail", callback_data=f"pos|{p['pid']}"),
-                     InlineKeyboardButton("⚖️ Rebalance", callback_data=f"reb|{p['pid']}"),
-                     InlineKeyboardButton("🗑 Close", callback_data=f"close|{p['pid']}"), DEL_BTN],
-                    chart_buttons(cid, p["pool"], meme_ca),
-                ])
-                for chat_id in allowed_chat_ids():
-                    try:
-                        await app.bot.send_message(chat_id, body, parse_mode=ParseMode.HTML,
-                                                   reply_markup=kb, disable_web_page_preview=True)
-                    except Exception:
-                        pass
-            # posisi yang sudah ditutup → buang dari state
-            live = {(cid, p["pid"]) for p in positions}
-            for k in [k for k in RANGE_STATE if k[0] == cid and k not in live]:
-                RANGE_STATE.pop(k, None)
-        except Exception as e:
-            log.warning("monitor alert: %s", e)
-        await asyncio.sleep(max(30, interval))
+        for cid in chains:
+            try:
+                positions, by_wallet = await _gather_positions(cid)
+                if alert_on and cid == active_cid:
+                    await _emit_range_alerts(app, cid, positions)
+                active_orders = _orders_for_chain(cid, "active")
+                if active_orders:
+                    await _check_orders(app, cid, active_orders, by_wallet)
+                # posisi yang sudah ditutup → buang dari state alert
+                live = {(cid, p["pid"]) for p in positions}
+                for k in [k for k in RANGE_STATE if k[0] == cid and k not in live]:
+                    RANGE_STATE.pop(k, None)
+            except Exception as e:
+                log.warning("monitor %s: %s", cid, e)
+        await asyncio.sleep(30 if order_chains else max(30, interval))
 
 
 async def post_init(app):
@@ -1888,6 +2238,7 @@ async def post_init(app):
         await app.bot.set_my_commands([
             BotCommand("start", "Menu utama (dashboard saldo)"),
             BotCommand("list", "Posisi LP + PnL + chart/close"),
+            BotCommand("orders", "Pesanan TP/SL (auto-close di market cap)"),
             BotCommand("wallet", "Saldo semua token + nilai USD"),
             BotCommand("settings", "Pengaturan via tombol"),
             BotCommand("chain", "Ganti chain aktif"),
@@ -1931,6 +2282,7 @@ def main():
     app.add_handler(CommandHandler("chain", cmd_chain))
     app.add_handler(CommandHandler("wallet", cmd_wallet))
     app.add_handler(CommandHandler("list", cmd_list))
+    app.add_handler(CommandHandler("orders", cmd_orders))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_address))
     app.add_error_handler(on_error)
