@@ -103,6 +103,36 @@ def disp_pid(pid) -> str:
     return f"#{s}" if s.isdigit() else s
 
 
+def fmt_short(v) -> str:
+    """Angka USD ringkas tanpa '$' untuk kolom tabel: 4.8M · 100.2k · 189.6 · –."""
+    if v is None:
+        return "–"
+    a = abs(v)
+    if a >= 1e9:
+        return f"{v / 1e9:.1f}B"
+    if a >= 1e6:
+        return f"{v / 1e6:.1f}M"
+    if a >= 1e5:
+        return f"{v / 1e3:.0f}k"      # 128.8k → 129k, biar kolom tetap ≤5 karakter
+    if a >= 1e3:
+        return f"{v / 1e3:.1f}k"
+    if a >= 10:
+        return f"{v:.0f}"
+    return f"{v:.1f}"
+
+
+def fmt_pct_short(v) -> str:
+    """Persen ringkas: 52k% · 3.0k% · 55% · –."""
+    if not v:
+        return "–"
+    a = abs(v)
+    if a >= 1e4:
+        return f"{v / 1e3:.0f}k%"
+    if a >= 1e3:
+        return f"{v / 1e3:.1f}k%"
+    return f"{v:.0f}%"
+
+
 def pk_for(addr: str) -> str | None:
     """Private key untuk alamat wallet tertentu (buat eksekusi order milik wallet itu)."""
     al = str(addr).lower()
@@ -534,7 +564,8 @@ async def on_address(update: Update, _):
     vol30s = await asyncio.to_thread(lambda: [ch.dex_vol30(cid, p["pool"]) for p in top])
 
     tsym = res["token"]["symbol"]
-    lines = [f"Found {len(pools)} pool(s) untuk <b>{esc(tsym)}</b> ({_t.time() - t0:.1f}s):", ""]
+    # Tabel monospace (<pre>) — 42 kolom, muat di layar HP tanpa wrap.
+    rows = [f"{'#':>2} {'pool':<7} {'fee':>6} {'TVL':>6} {'APR':>5} {'1D':>5} {'30D':>5}"]
     buttons = []
     for i, (p, v30) in enumerate(zip(top, vol30s), 1):
         key = uuid.uuid4().hex[:10]
@@ -543,20 +574,20 @@ async def on_address(update: Update, _):
                         "low_pct": s["width_pct"], "up_pct": 100.0,
                         "amount_pct": s["amount_pct"], "amount_fixed": s["amount_fixed"],
                         "gap": int(s.get("gap", 1)), "vol": None, "rec": None}
-        apr = f"APR ~{p['apr_pct']:,.0f}%" if p.get("apr_pct") else "APR –"
-        v1 = ch.fmt_usd(p["vol24_usd"]) if p.get("vol24_usd") is not None else "–"
-        v30t = ch.fmt_usd(v30) if v30 else "–"
-        lines += [
-            f"<b>{i}. [v{p.get('ver', 3)}] {esc(tsym)}/{esc(p['quote_sym'])} · fee {p['fee'] / 10000:.2f}%</b>",
-            f"    TVL {ch.fmt_usd(p['tvl_usd'])} · {apr}",
-            f"    Vol 1D {v1} · 30D {v30t}",
-        ]
+        ver = p.get("ver", 3)
+        rows.append(
+            f"{i:>2} {f'v{ver} ' + p['quote_sym'][:5]:<7} {p['fee'] / 10000:>5.2f}% "
+            f"{fmt_short(p['tvl_usd']):>6} {fmt_pct_short(p.get('apr_pct')):>5} "
+            f"{fmt_short(p.get('vol24_usd')):>5} {fmt_short(v30):>5}")
         buttons.append([InlineKeyboardButton(
-            f"{i}. [v{p.get('ver', 3)}] {p['quote_sym']} {p['fee'] / 10000:.2f}% · {ch.fmt_usd(p['tvl_usd'])}",
+            f"{i}. [v{ver}] {p['quote_sym']} {p['fee'] / 10000:.2f}% · {ch.fmt_usd(p['tvl_usd'])}",
             callback_data=f"pool|{key}")])
-    lines.append("\nPilih pool:")
     buttons.append([InlineKeyboardButton("✖ Cancel", callback_data="cancel")])
-    await edit(status, "\n".join(lines), InlineKeyboardMarkup(buttons))
+    text = (f"Found {len(pools)} pool(s) untuk <b>{esc(tsym)}</b> ({_t.time() - t0:.1f}s):\n"
+            f"<pre>{esc(chr(10).join(rows))}</pre>\n"
+            f"<i>TVL/volume USD · APR estimasi · vol dari dexscreener &amp; GeckoTerminal "
+            f"(– = pool belum terindeks)</i>\n\nPilih pool:")
+    await edit(status, text, InlineKeyboardMarkup(buttons))
 
 
 # ---------- Mint flow ----------
