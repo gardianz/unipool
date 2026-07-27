@@ -723,7 +723,154 @@ def dex_vol30(chain_id: int, pool_addr: str, _cache={}) -> float | None:
     return vol
 
 
-# ---------- Discovery pool ----------
+# ---------- Discovery pool via API resmi Uniswap (ListPools) ----------
+# Sumber yang sama dengan app.uniswap.org & dengan daftar posisi, jadi konsisten.
+# Read-only, tanpa API key. Penting: pool v4 di chain ini banyak yang pakai fee &
+# tick spacing NON-STANDAR (mis. 34880/698) — scan RPC yang cuma mencoba tier
+# standar (100/500/3000/10000) tidak akan pernah menemukannya.
+_UNI_POOLS_API = "https://interface.gateway.uniswap.org/v2/data.v1.DataApiService/ListPools"
+_UNI_POOLS_CACHE: dict[tuple, tuple] = {}   # (cid, token) -> (ts, pools mentah)
+
+
+def uni_pools(cid: int, token: str, ttl: int = 30) -> list | None:
+    """Semua pool Uniswap yang memuat `token` di chain `cid` (v3 + v4), langsung
+    dari API resmi Uniswap. Cache pendek per-token. Read-only — cuma alamat token
+    publik, tak pernah untuk tx. None kalau gagal → caller fallback ke scan RPC."""
+    ck = (cid, token.lower())
+    hit = _UNI_POOLS_CACHE.get(ck)
+    if hit and time.time() - hit[0] < ttl:
+        return hit[1]
+    body = {"chainId": cid, "token0": Web3.to_checksum_address(token),
+            "protocolVersions": ["PROTOCOL_VERSION_V3", "PROTOCOL_VERSION_V4"],
+            "pageSize": 100}
+    try:
+        r = requests.post(_UNI_POOLS_API, headers=_UNI_HDR, json=body, timeout=10)
+        pools = r.json().get("pools")
+        if not isinstance(pools, list):
+            return hit[1] if hit else None
+        _UNI_POOLS_CACHE[ck] = (time.time(), pools)
+        return pools
+    except Exception:
+        return hit[1] if hit else None
+
+
+def _uni_v3_pool(cid: int, w3: Web3, ap: dict, tl: str, quotes_lc: dict) -> dict | None:
+    """Petakan satu entri pool v3 ListPools → dict pool bot, hanya yang sisi
+    lawannya quote dikenal (biar bisa deposit single-side). None kalau bukan."""
+    a0 = str(ap.get("token0") or "").lower()
+    a1 = str(ap.get("token1") or "").lower()
+    if tl not in (a0, a1):
+        return None
+    if a0 == tl and a1 in quotes_lc:
+        qaddr_lc, qsym, q_is_t1 = a1, quotes_lc[a1], True
+    elif a1 == tl and a0 in quotes_lc:
+        qaddr_lc, qsym, q_is_t1 = a0, quotes_lc[a0], False
+    else:
+        return None
+    fee = int(ap.get("fee"))
+    qaddr = Web3.to_checksum_address(qaddr_lc)
+    return {
+        "ver": 3, "pool": Web3.to_checksum_address(str(ap.get("poolId"))), "fee": fee,
+        "quote_sym": qsym, "quote_addr": qaddr,
+        "quote_decimals": token_info(w3, qaddr)["decimals"],
+        "quote_usd": quote_usd_price(w3, cid, qsym), "quote_is_token1": q_is_t1,
+        "token0": Web3.to_checksum_address(a0), "token1": Web3.to_checksum_address(a1),
+        "tick_spacing": int(ap.get("tickSpacing") or 0) or TICK_SPACING.get(fee),
+        "basis": "uniswap",
+    }
+
+
+def _uni_v4_pool(cid: int, w3: Web3, ap: dict, tl: str) -> dict | None:
+    """Petakan satu entri pool v4 ListPools → dict pool bot, HANYA yang bisa dipakai
+    bot: vanilla (hooks=0), sisi lawan quote dikenal, PoolKey autentik (hash ==
+    poolId). Native ETH (currency 0x0) dihitung quote. None kalau bukan / ber-hooks."""
+    c0 = str(ap.get("token0") or "")
+    c1 = str(ap.get("token1") or "")
+    hooks = str((ap.get("hooks") or {}).get("address") or V4_NATIVE)
+    if not c0 or not c1 or int(hooks, 16) != 0:
+        return None
+    if tl not in (c0.lower(), c1.lower()):
+        return None
+    c0 = Web3.to_checksum_address(c0)
+    c1 = Web3.to_checksum_address(c1)
+    qsym, q_is_c1 = _v4_quote_side(cid, c0, c1)
+    if qsym is None:
+        return None
+    fee, spacing = int(ap.get("fee")), int(ap.get("tickSpacing"))
+    key = (c0, c1, fee, spacing, Web3.to_checksum_address(hooks))
+    pid = v4_pool_id(key)
+    if "0x" + pid.hex() != str(ap.get("poolId")).lower():   # PoolKey harus menghasilkan poolId ini
+        return None
+    qaddr = c1 if q_is_c1 else c0
+    return {
+        "ver": 4, "pool": "0x" + pid.hex(), "pool_id": pid, "key": key,
+        "fee": fee, "tick_spacing": spacing, "quote_sym": qsym, "quote_addr": qaddr,
+        "quote_decimals": _v4_currency_info(w3, cid, qaddr)["decimals"],
+        "quote_usd": quote_usd_price(w3, cid, qsym), "quote_is_token1": q_is_c1,
+        "token0": c0, "token1": c1, "basis": "uniswap",
+    }
+
+
+def uni_discover(cid: int, token: str) -> dict | None:
+    """Pool discovery cepat via API Uniswap (ListPools): v3 + v4 vanilla yang salah
+    satu sisinya quote dikenal bot. Bentuk balikan sama dengan discover_pools.
+    None kalau API mati / token tak ada pool cocok → caller fallback ke scan RPC.
+
+    Dict pool tetap diverifikasi on-chain di mint builder (assert_pool_orientation)
+    sebelum dana bergerak — API cuma untuk kecepatan tampilan, bukan sumber
+    tepercaya untuk transaksi."""
+    pools = uni_pools(cid, token)
+    if not pools:
+        return None
+    cfg = CHAINS[cid]
+    w3 = get_w3(cid)
+    tl = token.lower()
+    quotes_lc = {a.lower(): s for s, a in cfg["quotes"].items()}
+    out = []
+    for ap in pools:
+        try:
+            proto = str(ap.get("protocolVersion"))
+            if proto == "PROTOCOL_VERSION_V3":
+                p = _uni_v3_pool(cid, w3, ap, tl, quotes_lc)
+            elif proto == "PROTOCOL_VERSION_V4":
+                p = _uni_v4_pool(cid, w3, ap, tl)
+            else:
+                continue
+            if not p:
+                continue
+            tvl = float(ap.get("totalLiquidityUsd") or 0)
+            if tvl < 10:      # ListPools mengembalikan banyak pool receh/mati — buang dust
+                continue
+            p["tvl_usd"] = tvl
+            p["vol24_usd"] = None
+            apr = ap.get("apr")
+            p["apr_pct"] = float(apr) if apr is not None else None
+            out.append(p)
+        except Exception:
+            continue
+    if not out:
+        return None
+    out.sort(key=lambda p: p["tvl_usd"], reverse=True)
+    try:
+        tinfo = token_info(w3, Web3.to_checksum_address(token))
+    except Exception:
+        tinfo = {"symbol": "?", "decimals": 18, "name": ""}
+    return {"token": tinfo, "pools": out}
+
+
+def discover_any(chain_id: int, token_addr: str) -> dict:
+    """Discovery pool untuk SEMUA UI (bot & web): API Uniswap dulu (lengkap, cepat,
+    termasuk v4 fee non-standar), fallback scan RPC kalau API mati / nihil."""
+    try:
+        res = uni_discover(chain_id, token_addr)
+        if res and res.get("pools"):
+            return res
+    except Exception:
+        pass
+    return discover_pools(chain_id, token_addr)
+
+
+# ---------- Discovery pool via scan RPC (fallback) ----------
 def discover_pools(chain_id: int, token_addr: str) -> dict:
     """Scan semua quote × fee tier (paralel). Return {token, pools} urut TVL desc."""
     w3 = get_w3(chain_id)
@@ -773,6 +920,12 @@ def discover_pools(chain_id: int, token_addr: str) -> dict:
                 m_usd = m_bal * meme_in_q * qusd
             except Exception:
                 m_usd = q_bal * qusd      # gagal baca sisi meme → balik ke estimasi lama
+            # Pool mati (liquidity 0 / tick mentok batas = harga tak pernah diset benar):
+            # rasio slot0 jadi ekstrem (~1e38) sehingga saldo debu ikut jadi TVL raksasa.
+            # Pool begini tak bisa dipakai LP — nilai nol saja biar tak nongol di atas.
+            if liq == 0 or abs(slot0[1]) >= MAX_TICK - 1:
+                m_usd = 0.0
+                q_bal = 0.0
             return {
                 "ver": 3, "pool": pool_addr, "fee": fee, "quote_sym": qsym, "quote_addr": q,
                 "quote_decimals": qdec, "quote_usd": qusd,

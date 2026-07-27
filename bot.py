@@ -519,7 +519,7 @@ async def on_address(update: Update, _):
     import time as _t
     t0 = _t.time()
     try:
-        res = await asyncio.to_thread(ch.discover_pools, cid, token)
+        res = await asyncio.to_thread(ch.discover_any, cid, token)
     except Exception as e:
         await edit(status, f"❌ Gagal fetch: {esc(e)}")
         return
