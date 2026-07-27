@@ -826,6 +826,12 @@ def uni_discover(cid: int, token: str) -> dict | None:
     w3 = get_w3(cid)
     tl = token.lower()
     quotes_lc = {a.lower(): s for s, a in cfg["quotes"].items()}
+    # ListPools TIDAK mengirim volume (cuma TVL + apr) → vol 24 jam dari dexscreener,
+    # key-nya pairAddress = alamat pool (v3) / poolId (v4), sama dengan p["pool"].
+    try:
+        vols = dex_volumes(cid, token)
+    except Exception:
+        vols = {}
     out = []
     for ap in pools:
         try:
@@ -842,9 +848,16 @@ def uni_discover(cid: int, token: str) -> dict | None:
             if tvl < 10:      # ListPools mengembalikan banyak pool receh/mati — buang dust
                 continue
             p["tvl_usd"] = tvl
-            p["vol24_usd"] = None
+            p["vol24_usd"] = vols.get(str(p["pool"]).lower())
             apr = ap.get("apr")
-            p["apr_pct"] = float(apr) if apr is not None else None
+            if apr is None:
+                apr = ap.get("totalApr")
+            if apr is not None:
+                p["apr_pct"] = float(apr)
+            else:
+                # tak dikirim API → estimasi sendiri: fee 24 jam × 365 ÷ TVL
+                v = p["vol24_usd"]
+                p["apr_pct"] = (v * p["fee"] / 1e6 / tvl * 365 * 100) if (v and tvl) else None
             out.append(p)
         except Exception:
             continue
