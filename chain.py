@@ -277,6 +277,14 @@ V2_ROUTER_ABI = [
                 {"name": "deadline", "type": "uint256"}],
      "name": "swapExactTokensForTokens", "outputs": [{"name": "amounts", "type": "uint256[]"}],
      "type": "function", "stateMutability": "nonpayable"},
+    # Varian untuk token fee-on-transfer: pair mengecek invarian K dari saldo yang
+    # BENAR-BENAR sampai, sedangkan swapExactTokensForTokens memakai hasil
+    # getAmountsOut yang menganggap tidak ada pajak → revert "Pancake: K".
+    {"inputs": [{"name": "amountIn", "type": "uint256"}, {"name": "amountOutMin", "type": "uint256"},
+                {"name": "path", "type": "address[]"}, {"name": "to", "type": "address"},
+                {"name": "deadline", "type": "uint256"}],
+     "name": "swapExactTokensForTokensSupportingFeeOnTransferTokens", "outputs": [],
+     "type": "function", "stateMutability": "nonpayable"},
     {"inputs": [{"name": "tokenA", "type": "address"}, {"name": "tokenB", "type": "address"},
                 {"name": "amountADesired", "type": "uint256"}, {"name": "amountBDesired", "type": "uint256"},
                 {"name": "amountAMin", "type": "uint256"}, {"name": "amountBMin", "type": "uint256"},
@@ -2779,6 +2787,70 @@ def verify_v2_router(w3: Web3, chain_id: int, _cache={}) -> bool:
     return ok
 
 
+def _v2_fot_output(w3: Web3, account_addr: str, router, router_addr: str,
+                   path: list, amount_in: int, est_out: int, deadline: int) -> int:
+    """Keluaran NYATA swap fee-on-transfer, dicari lewat simulasi berjenjang.
+
+    Fungsi ...SupportingFeeOnTransferTokens tidak mengembalikan nilai apa pun, jadi
+    jumlahnya tidak bisa dibaca langsung. Yang bisa: menyempitkan amountOutMin sampai
+    simulasi berhenti lolos — batas itulah keluaran sebenarnya. Dipakai supaya bot
+    tidak perlu mengirim swap ber-amountOutMin 0 (undangan sandwich)."""
+    lo, hi = 0, max(est_out, 1)
+    for _ in range(14):
+        mid = (lo + hi) // 2
+        if mid <= lo:
+            break
+        data = calldata(router.functions.swapExactTokensForTokensSupportingFeeOnTransferTokens(
+            amount_in, mid, path, account_addr, deadline))
+        try:
+            w3.eth.call({"from": account_addr, "to": router_addr, "data": data})
+            lo = mid
+        except Exception:
+            hi = mid
+    return lo
+
+
+def _v2_swap_exec(w3: Web3, chain_id: int, pk: str, router, router_addr: str,
+                  path: list, amount_in: int, slippage_pct: float) -> str:
+    """Swap lewat router v2, otomatis jatuh ke jalur fee-on-transfer kalau perlu.
+    Return txhash."""
+    account = w3.eth.account.from_key(pk)
+    slip = (100 - slippage_pct) / 100
+    deadline = int(time.time()) + DEADLINE_SECS
+    est = router.functions.getAmountsOut(amount_in, path).call()[-1]
+    if est <= 0:
+        raise RuntimeError("Estimasi hasil swap 0 — likuiditas pair terlalu tipis.")
+    ensure_approval(w3, pk, path[0], router_addr, amount_in)
+
+    data = calldata(router.functions.swapExactTokensForTokens(
+        amount_in, int(est * slip), path, account.address, deadline))
+    try:
+        _preflight(w3, account.address, {"to": router_addr, "data": data})
+    except Exception as e:
+        if not any(s in str(e) for s in ("Pancake: K", "UniswapV2: K")):
+            raise      # revert lain (saldo kurang, harga bergerak) — bukan soal pajak
+        # Token memungut pajak transfer: pakai varian FoT dengan batas bawah yang
+        # dihitung dari keluaran nyata, bukan dari getAmountsOut yang kelewat optimis.
+        real = _v2_fot_output(w3, account.address, router, router_addr, path,
+                              amount_in, est, deadline)
+        if real <= 0:
+            raise RuntimeError(
+                f"Swap {token_info(w3, path[0])['symbol']} gagal: token menahan seluruh "
+                f"hasil transfer (kemungkinan honeypot).")
+        tax_pct = (1 - real / est) * 100
+        if tax_pct > 50:
+            raise RuntimeError(
+                f"Pajak transfer {token_info(w3, path[0])['symbol']} ~{tax_pct:.0f}% — "
+                f"terlalu besar, swap dibatalkan.")
+        data = calldata(router.functions.swapExactTokensForTokensSupportingFeeOnTransferTokens(
+            amount_in, int(real * slip), path, account.address, deadline))
+        _preflight(w3, account.address, {"to": router_addr, "data": data})
+
+    h = send_tx(w3, pk, {"to": router_addr, "data": data})
+    wait_ok(w3, h, "swap v2")
+    return h
+
+
 def _preflight(w3: Web3, account_addr: str, tx: dict):
     """Simulasi eth_call sebelum kirim — send_tx fallback gas 500k bakal
     broadcast buta kalau estimate gagal, jadi revert harus ketahuan di sini."""
@@ -2891,16 +2963,10 @@ def mint_v2(chain_id: int, pk: str, pool_info: dict, budget: float, slippage_pct
     swap_in = budget_wei - quote_keep
     swapped = False
     if swap_in > budget_wei // 500:
-        est_out = router.functions.getAmountsOut(swap_in, [quote, meme]).call()[-1]
-        min_out = int(est_out * slip)
-        if min_out <= 0:
-            raise RuntimeError("Estimasi hasil swap 0 — likuiditas pair terlalu tipis.")
-        steps += ensure_approval(w3, pk, quote, router_addr, swap_in)
-        data = calldata(router.functions.swapExactTokensForTokens(
-            swap_in, min_out, [quote, meme], account.address, deadline))
-        _preflight(w3, account.address, {"to": router_addr, "data": data})
-        h = send_tx(w3, pk, {"to": router_addr, "data": data})
-        wait_ok(w3, h, "swap v2")
+        # _v2_swap_exec otomatis pindah ke jalur fee-on-transfer kalau pair menolak
+        # dengan "Pancake: K" — token berpajak seperti RTX butuh itu.
+        h = _v2_swap_exec(w3, chain_id, pk, router, router_addr,
+                          [quote, meme], swap_in, slippage_pct)
         steps.append(("swap", h))
         swapped = True
     meme_have = poll_balance(w3, meme, account.address, meme_bal + 1) if swapped \
@@ -3046,16 +3112,7 @@ def reduce_v2(chain_id: int, pk: str, pair_addr: str, pct: int, slippage_pct: fl
         quotes_lc = {a.lower() for a in cfg["quotes"].values()}
 
         def v2_swap(taddr, path, bal):
-            est = router.functions.getAmountsOut(bal, path).call()[-1]
-            if est <= 0:
-                raise RuntimeError("getAmountsOut 0")
-            ensure_approval(w3, pk, taddr, router_addr, bal)
-            sdata = calldata(router.functions.swapExactTokensForTokens(
-                bal, int(est * slip), path, account.address, int(time.time()) + DEADLINE_SECS))
-            _preflight(w3, account.address, {"to": router_addr, "data": sdata})
-            sh = send_tx(w3, pk, {"to": router_addr, "data": sdata})
-            wait_ok(w3, sh, "swap v2")
-            return sh
+            return _v2_swap_exec(w3, chain_id, pk, router, router_addr, path, bal, slippage_pct)
 
         def has_v3_route(a):
             try:
@@ -3092,7 +3149,7 @@ def reduce_v2(chain_id: int, pk: str, pair_addr: str, pct: int, slippage_pct: fl
             try:
                 hs = swap_any(chain_id, pk, taddr, wrapped, bal, slippage_pct)
                 if hs:
-                    swaps += [(info["symbol"], h) for _l, h in hs]
+                    swaps += [(lbl, h) for lbl, h in hs]   # label per hop, bukan nama sisi
                     continue
             except Exception as e:
                 err = e

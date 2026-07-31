@@ -258,7 +258,7 @@ port-forward yang sama, tapi ribet — Tailscale jauh lebih enak untuk ponsel.
 ## Catatan risiko
 
 - Bot ini memindahkan **dana sungguhan** di chain live. Uji dengan nominal kecil dulu.
-- Token **fee-on-transfer** tidak didukung di jalur v2 (router standar) dan berisiko di v3/v4.
+- Token **fee-on-transfer** (berpajak) kini ditangani di jalur v2: kalau pair menolak dengan `Pancake: K`, bot otomatis pindah ke `swapExactTokensForTokensSupportingFeeOnTransferTokens` dengan batas bawah dari keluaran nyata (bukan `getAmountsOut` yang mengabaikan pajak). Tetap berisiko di v3/v4, dan pajaknya sendiri (mis. RTX 2%) tetap memotong tiap kali token masuk/keluar pool.
 - Pool v4 dengan **hooks** sengaja tidak didukung — hook bisa berisi kode arbitrer (risiko rug).
 - Posisi v4 dan LP v2 dicatat di `history.json` lokal (registry) — jangan hapus file itu selama masih ada posisi terbuka; posisi tetap aman on-chain, tapi bot tidak bisa menampilkannya lagi tanpa registry (v4 PositionManager tidak bisa di-enumerate).
 - LP memecoin berisiko tinggi: fee tidak menutup rugi kalau harga token jatuh permanen (impermanent loss). Anggap sebagai beli token diskon sambil dibayar menunggu — bukan mesin uang pasif.
