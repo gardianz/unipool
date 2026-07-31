@@ -106,6 +106,43 @@ def drop_ref(chain_id: int, wallet: str, kind: str, ref: str):
         _write(HISTORY_FILE, h)
 
 
+# ---------- Patokan fee posisi V2 ----------
+# LP v2 tidak punya "fee unclaimed" — fee mengendap ke reserve, jadi jumlah LP token
+# tetap tapi nilainya naik. Patokannya √k per LP saat masuk (k = reserve0×reserve1):
+# angka itu KEBAL pergerakan harga dan hanya naik oleh fee, jadi
+#   fee = nilai_sekarang × (1 − k_saat_masuk / k_sekarang).
+def v2_basis(chain_id: int, wallet: str, pair: str) -> float | None:
+    return (_hist().get("v2_basis", {}).get(str(chain_id), {})
+            .get(wallet.lower(), {}).get(str(pair).lower()))
+
+
+def set_v2_basis(chain_id: int, wallet: str, pair: str, k_per_lp: float,
+                 lp_before: int = 0, lp_after: int = 0):
+    """Simpan patokan. Kalau sudah ada posisi (add liquidity berikutnya), patokan
+    lama dan baru dirata-rata berbobot jumlah LP — kalau tidak, LP yang baru masuk
+    ikut diklaim sudah mengumpulkan fee sejak mint pertama."""
+    if not k_per_lp:
+        return
+    h = _hist()
+    d = (h.setdefault("v2_basis", {}).setdefault(str(chain_id), {})
+          .setdefault(wallet.lower(), {}))
+    key = str(pair).lower()
+    old = d.get(key)
+    if old and lp_after > lp_before > 0:
+        added = lp_after - lp_before
+        d[key] = (old * lp_before + k_per_lp * added) / lp_after
+    else:
+        d[key] = k_per_lp
+    _write(HISTORY_FILE, h)
+
+
+def drop_v2_basis(chain_id: int, wallet: str, pair: str):
+    h = _hist()
+    d = (h.get("v2_basis", {}).get(str(chain_id), {}).get(wallet.lower(), {}))
+    if d.pop(str(pair).lower(), None) is not None:
+        _write(HISTORY_FILE, h)
+
+
 def mint_ts(chain_id: int, token_id) -> int | None:
     for e in _hist()["events"].get(str(chain_id), []):
         if e["kind"] == "mint" and e["token_id"] == token_id:

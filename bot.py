@@ -191,7 +191,8 @@ def range_str(p: dict) -> str:
 
 # ---------- Commands & menu utama ----------
 HELP = (
-    "<b>unipool — LP Uniswap V3 (Robinhood + BSC)</b>\n\n"
+    "<b>unipool — LP concentrated liquidity</b>\n"
+    "<i>Uniswap v2/v3/v4 di Robinhood · PancakeSwap v2/v3 di BSC</i>\n\n"
     "Paste alamat token (0x...) → bot cari pool → pilih → atur strategi → mint.\n"
     "/start membuka menu utama (dashboard saldo + tombol navigasi).\n\n"
     "<b>Perintah:</b>\n"
@@ -267,7 +268,7 @@ def build_main_menu() -> str:
             parts.append(f"{mark}W{i + 1} {ch.fmt_amount(bal)}")
         wallets_line = f"👛 {' · '.join(parts)} {esc(cfg['native_symbol'])}\n"
     return (
-        f"🦄 <b>unipool</b> — LP Uniswap V3\n"
+        f"🦄 <b>unipool</b> — LP {esc(ch.dex_name(cid))} {esc(ch.versions_label(cid))}\n"
         f"⛓ {esc(cfg['name'])} (chain {cid})\n"
         f"{wallets_line}"
         f"{esc(wallet_label())}: <code>{esc(addr)}</code>\n\n"
@@ -543,7 +544,8 @@ async def on_address(update: Update, _):
     cfg = ch.CHAINS[cid]
     amount_desc = f"amount {s['amount_fixed']} fix" if s["amount_fixed"] else f"amount {s['amount_pct']}%"
     status = await reply(update, (
-        f"⏳ Fetching Uniswap v2/v3/v4 pools on {esc(cfg['name'])}...\n"
+        f"⏳ Fetching {esc(ch.dex_name(cid))} {esc(ch.versions_label(cid))} pools "
+        f"on {esc(cfg['name'])}...\n"
         f"(width {s['width_pct']:g}% · {esc(amount_desc)} · deposit auto)"))
 
     import time as _t
@@ -556,7 +558,8 @@ async def on_address(update: Update, _):
 
     pools = res["pools"]
     if not pools:
-        await edit(status, f"❌ Tidak ada pool v2/v3/v4 untuk {esc(res['token']['symbol'])} di {esc(cfg['name'])}.")
+        await edit(status, f"❌ Tidak ada pool {esc(ch.versions_label(cid))} untuk "
+                           f"{esc(res['token']['symbol'])} di {esc(cfg['name'])}.")
         return
 
     top = pools[:10]
@@ -618,7 +621,7 @@ def compute_amount(ctx_data: dict) -> float:
         mdec = ch.token_info(w3, meme)["decimals"]
         bal = ch.erc20(w3, meme).functions.balanceOf(addr).call()
         return (bal * ctx_data["amount_pct"] / 100) / 10 ** mdec
-    gas_reserve = int(0.0005 * 1e18)
+    gas_reserve = ch.gas_reserve_wei(cid, w3)
     if p["quote_addr"].lower() == ch.V4_NATIVE:
         # pool v4 ber-quote ETH native: modal = saldo native + WETH (bisa di-unwrap? tidak —
         # cukup native; WETH tidak dihitung biar tidak overcommit)
@@ -673,6 +676,21 @@ def _meme_price(p: dict, tdec: int, tick: int) -> float:
     return (1 / raw if raw else 0) * 10 ** (tdec - p["quote_decimals"])
 
 
+def pool_warnings(cid: int, p: dict) -> str:
+    """Peringatan kartu konfirmasi untuk pool yang bukan profil normal."""
+    cfg = ch.CHAINS[cid]
+    lines = []
+    if p.get("foreign_quote"):
+        lines.append(
+            f"⚠️ Quote pool ini <b>{esc(p['quote_sym'])}</b>, bukan "
+            f"{esc(cfg['wrapped_symbol'])}/stable. Nilai posisi &amp; PnL USD ikut "
+            f"naik-turun harga {esc(p['quote_sym'])}, dan modal masuk/keluar lewat "
+            f"swap 2 langkah (fee &amp; slippage dobel).")
+    if p.get("thin"):
+        lines.append("⚠️ TVL pool sangat kecil — slippage besar dan harga gampang digeser.")
+    return ("\n\n" + "\n".join(lines)) if lines else ""
+
+
 def build_preview_v2(ctx_data: dict) -> str:
     """Kartu konfirmasi add liquidity V2 (full-range 50/50, tanpa strategi range)."""
     cid = ctx_data["chain"]
@@ -704,7 +722,8 @@ def build_preview_v2(ctx_data: dict) -> str:
     return (
         f"<b>Confirm add liquidity · {esc(cfg['name'])} · v2</b>\n"
         f"CA: <code>{esc(ctx_data['token']['address'])}</code>\n"
-        f"{esc(tsym)}/{esc(p['quote_sym'])} 0.30% · TVL {ch.fmt_usd(p['tvl_usd'])} · {vol_txt}\n"
+        f"{esc(tsym)}/{esc(p['quote_sym'])} {p['fee'] / 10000:.2f}% · "
+        f"TVL {ch.fmt_usd(p['tvl_usd'])} · {vol_txt}\n"
         f"📈 <a href=\"https://gmgn.ai/{cfg['gmgn']}/token/{ctx_data['token']['address']}\">GMGN</a> · "
         f"<a href=\"https://dexscreener.com/{cfg['dexscreener']}/{p['pool']}\">DexScreener</a>\n\n"
         f"Value deposited: {ch.fmt_amount(amount)} {esc(p['quote_sym'])} ({ch.fmt_usd(usd)} · {esc(amount_desc)})\n"
@@ -714,7 +733,7 @@ def build_preview_v2(ctx_data: dict) -> str:
         f"· {ch.fmt_amount(quote_keep / 10 ** p['quote_decimals'])} {esc(p['quote_sym'])} masuk pair\n"
         + (f"· swap {ch.fmt_amount(swap_in / 10 ** p['quote_decimals'])} {esc(p['quote_sym'])} → {esc(tsym)}\n"
            if swap_in > qwei // 500 else f"· tanpa swap — {esc(tsym)} existing dipakai\n")
-        + f"\n<i>LP v2 = full range, selalu aktif. Fee 0.3% auto-compound ke posisi "
+        + f"\n<i>LP v2 = full range, selalu aktif. Fee {p['fee'] / 10000:g}% auto-compound ke posisi "
         f"(tidak ada klaim fee terpisah). Token fee-on-transfer tidak didukung.</i>\n\n"
         f"Custom: <code>a 0.005</code> / <code>a 30%</code> (amount)\n"
         f"Slippage {store.load_settings()['slippage_pct']:g}% · deadline 20 menit"
@@ -923,6 +942,7 @@ async def show_confirm(msg, key: str):
     except Exception as e:
         await edit(msg, f"❌ {esc(e)}")
         return
+    text += pool_warnings(ctx_data["chain"], ctx_data["pool_info"])
     await edit(msg, text, confirm_kb(key, ctx_data))
     LAST_CONFIRM[msg.chat_id] = (key, msg)
 
@@ -1202,6 +1222,8 @@ async def do_mint(update: Update, ctx_data: dict):
     if ver == 2:
         pid = f"v2:{r['pair'].lower()}"
         store.add_ref(cid, wallet_address(), "v2", r["pair"])
+        store.set_v2_basis(cid, wallet_address(), r["pair"], r.get("k_per_lp") or 0,
+                           r.get("lp_before", 0), r.get("lp_after", 0))
         store.record_event(cid, "mint", pid, r["deposited_usd"],
                            f"{tsym}/{p['quote_sym']} v2", wallet=wallet_address())
         lines = [f"✅ <b>{esc(tsym)} LP</b> [v2] · full range ({ch.fmt_usd(r['deposited_usd'])})",
@@ -1312,6 +1334,24 @@ def _pos_disp(p: dict) -> str:
     return f"#{p['token_id']}"
 
 
+def v2_earned_usd(cid: int, p: dict, wallet: str = "") -> float:
+    """Fee yang sudah mengendap ke dalam posisi v2 — tidak pernah muncul sebagai
+    'unclaimed' karena langsung jadi bagian reserve. Dihitung dari pertumbuhan
+    √k per LP sejak masuk (kebal pergerakan harga, hanya naik oleh fee).
+
+    Posisi lama yang belum punya patokan diinisialisasi saat PERTAMA terlihat, jadi
+    fee-nya terhitung sejak saat itu — bukan sejak mint (k saat mint tidak bisa
+    dibaca lagi: node publik memangkas state lama)."""
+    if p.get("ver") != 2 or not p.get("k_per_lp") or not p.get("value_usd"):
+        return 0.0
+    w = wallet or wallet_address()
+    basis = store.v2_basis(cid, w, p["pool"])
+    if not basis:
+        store.set_v2_basis(cid, w, p["pool"], p["k_per_lp"])
+        return 0.0
+    return p["value_usd"] * (1 - basis / p["k_per_lp"]) if p["k_per_lp"] > basis else 0.0
+
+
 def _pos_metrics(cid: int, p: dict) -> dict:
     """Angka turunan posisi untuk label ringkasan + kartu detail."""
     tid = p["token_id"]
@@ -1321,16 +1361,22 @@ def _pos_metrics(cid: int, p: dict) -> dict:
     cur_total = p["value_usd"] + p["unclaimed_usd"]
     mts = store.mint_ts(cid, tid)
     pnl = pnl_pct = apr = None
+    # Fee v2 tidak pernah muncul di unclaimed_usd (mengendap ke dalam posisi), jadi
+    # dihitung dari pertumbuhan √k per LP sejak masuk. Tanpa ini APR posisi v2
+    # dijamin selalu 0% — rumus di bawah berbentuk v3.
+    earned = p["unclaimed_usd"] + claimed
+    if p.get("ver") == 2:
+        earned = v2_earned_usd(cid, p) + claimed
     if dep:
         pnl = cur_total + claimed + withdrawn - dep
         pnl_pct = pnl / dep * 100
         if mts:
             age_days = max((int(time.time()) - mts) / 86400, 0.01)
-            apr = (p["unclaimed_usd"] + claimed) / dep / age_days * 365 * 100
+            apr = earned / dep / age_days * 365 * 100
     return {
         "meme_sym": p["sym0"] if p["quote_is_token1"] else p["sym1"],
         "dep": dep, "claimed": claimed, "withdrawn": withdrawn, "cur_total": cur_total,
-        "pnl": pnl, "pnl_pct": pnl_pct, "apr": apr,
+        "pnl": pnl, "pnl_pct": pnl_pct, "apr": apr, "earned": earned,
         "age": store.fmt_age(mts),
     }
 
@@ -1349,7 +1395,11 @@ def position_card(cid: int, p: dict) -> str:
         pnl_line = "PnL: ? (mint di luar bot)"
     range_line = ("📊 Full range (v2, selalu aktif)" if ver == 2
                   else f"📊 Range: {esc(range_str(p))}")
-    fee_line = ("💰 Fee 0.3% auto-compound ke posisi (v2)" if ver == 2 else
+    fee_line = ((f"💰 Fee terkumpul ~{ch.fmt_usd(m['earned'])} "
+                 f"<i>(fee {p.get('fee', 3000) / 10000:g}% auto-compound — sudah termasuk "
+                 f"di nilai posisi, tak perlu diklaim)</i>"
+                 if m.get("earned") else
+                 f"💰 Fee {p.get('fee', 3000) / 10000:g}% auto-compound ke posisi (v2)") if ver == 2 else
                 f"💰 <b>Fee unclaimed {ch.fmt_usd(p['unclaimed_usd'])}</b>\n"
                 f"· {ch.fmt_amount(p['fees0'])} {esc(p['sym0'])} ({ch.fmt_usd(p['fees_usd0'])}) + "
                 f"{ch.fmt_amount(p['fees1'])} {esc(p['sym1'])} ({ch.fmt_usd(p['fees_usd1'])})")
@@ -1463,7 +1513,7 @@ async def do_add_exec(update: Update, pid: str, val: float, is_pct: bool):
             if not pos:
                 raise RuntimeError("Posisi tidak ditemukan.")
             quote = pos["token1"] if pos["quote_is_token1"] else pos["token0"]
-            gas_reserve = int(0.0005e18)
+            gas_reserve = ch.gas_reserve_wei(cid, w3)
             if quote.lower() == ch.V4_NATIVE:
                 bal = max(0, w3.eth.get_balance(wallet_address()) - gas_reserve)
                 qdec = 18
@@ -1718,6 +1768,9 @@ async def do_close(update: Update, pid: str, autoswap: bool):
     ev_tid = ref if ver == 3 else str(pid)
     if ver == 4:
         store.drop_ref(cid, wallet_address(), "v4", str(ref))
+    elif ver == 2:   # dulu tidak pernah dibersihkan — registry & patokan fee jadi basi
+        store.drop_ref(cid, wallet_address(), "v2", str(ref))
+        store.drop_v2_basis(cid, wallet_address(), str(ref))
     store.record_event(cid, "close", ev_tid, pos["value_usd"] if pos else usd, wallet=wallet_address())
     if pos and pos["unclaimed_usd"] > 0:
         store.record_event(cid, "fees", ev_tid, pos["unclaimed_usd"], wallet=wallet_address())
@@ -2194,6 +2247,7 @@ async def _trigger_order(app, cid: int, o: dict, p: dict, hit: tuple, mc: float)
         store.drop_ref(cid, waddr, "v4", str(ref))
     elif ver == 2:
         store.drop_ref(cid, waddr, "v2", str(ref))
+        store.drop_v2_basis(cid, waddr, str(ref))
     store.record_event(cid, "close", ev_tid, p.get("value_usd", 0.0), wallet=waddr)
     if p.get("unclaimed_usd", 0) > 0:
         store.record_event(cid, "fees", ev_tid, p["unclaimed_usd"], wallet=waddr)

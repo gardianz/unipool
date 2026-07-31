@@ -74,6 +74,7 @@ const S = {
                        menaruhnya. Boleh seluruhnya di bawah/atas harga sekarang
                        (mis. harga 60k, range 20k–40k) dan tidak akan ditarik
                        balik menempel harga. */
+  dex: 'Uniswap', versions: 'v2/v3/v4', uniApi: true,   // diisi loadState() per chain
   preset: 'lower30', mode: 'lower', lowPct: 30, upPct: 30,
   preview: null, amountPct: 50, amountFixed: null, bars: [], busy: false,
   unit: 'mc',        // sumbu harga: market cap atau harga quote
@@ -543,8 +544,12 @@ function renderDeposit(p) {
      p.mode === 'upper' ? `Range di atas harga · deposit ${p.dep_sym} saja` :
      'Range mencakup harga sekarang · dua sisi');
   const rows = [];
+  if (t.foreign_quote) {
+    rows.push(`⚠️ Quote pool ini <b>${t.quote_sym}</b>, bukan wrapped/stable — nilai USD & PnL ikut harga ${t.quote_sym}, modal masuk/keluar lewat swap 2 langkah.`);
+  }
+  if (t.thin) rows.push('⚠️ TVL pool sangat kecil — slippage besar, harga gampang digeser.');
   if (p.ver === 2) {
-    rows.push('LP v2 full range 50/50 — fee 0.3% auto-compound.');
+    rows.push(`LP v2 full range 50/50 — fee ${(t.fee_pct ?? 0.3).toFixed(2)}% auto-compound.`);
   } else {
     rows.push(MODE_TXT[p.mode] || MODE_TXT[S.mode]);
     const unit = S.unit === 'mc' && mcFactor() !== 1 ? 'market cap' : `${t.quote_sym}/${t.token_sym}`;
@@ -678,7 +683,9 @@ async function discover() {
       <div class="poolrow" data-key="${p.key}">
         <span class="badge v${p.ver}">v${p.ver}</span>
         <div><b>${r.token.symbol} / ${p.quote_sym}</b>
-          <div class="dim" style="font-size:11px">fee ${p.fee_pct.toFixed(2)}%</div></div>
+          <div class="dim" style="font-size:11px">fee ${p.fee_pct.toFixed(2)}%${
+            p.foreign_quote ? ` · <span title="Quote pool ini bukan ${S.dex === 'PancakeSwap' ? 'WBNB' : 'WETH'}/stable — nilai USD ikut harga ${p.quote_sym}, masuk/keluar lewat swap 2 langkah">⚠ quote ${p.quote_sym}</span>` : ''
+          }${p.thin ? ' · <span title="TVL sangat kecil — slippage besar, harga gampang digeser">⚠ TVL tipis</span>' : ''}</div></div>
         <div class="cell"><small>TVL</small>${usd(p.tvl_usd)}</div>
         <div class="cell"><small>Vol 24H</small>${usd(p.vol24_usd)}</div>
         <div class="cell"><small>APR</small>${p.apr_pct ? nf(p.apr_pct, 1) + '%' : '—'}</div>
@@ -726,7 +733,7 @@ async function doMint() {
       });
       toast(`✅ <b>Position ${r.pid}</b> · ${usd(r.deposited_usd)}<br>` +
         r.steps.map(s => `${s.label}: <a href="${s.url}" target="_blank" rel="noopener">tx</a>`).join(' · ') +
-        `<br><a href="${r.link}" target="_blank" rel="noopener">buka di Uniswap</a>`, 'ok');
+        `<br><a href="${r.link}" target="_blank" rel="noopener">buka di ${S.dex}</a>`, 'ok');
       loadState();
     } catch (e) {
       toast('❌ Mint gagal: ' + e.message, 'err');
@@ -799,7 +806,9 @@ function renderPositions(r) {
       <div><small>In range</small><b data-f="inrange">${s.in_range} / ${s.open}</b></div>`;
   }
   const upd = `diperbarui ${new Date((r.ts || Date.now() / 1000) * 1000).toLocaleTimeString('id-ID')}`;
-  const srcTag = `<span title="daftar posisi lengkap dari API Uniswap (menangkap posisi lama & mint di luar bot), detail + in/out-range dibaca langsung dari chain via RPC-mu. Bot Telegram pakai sumber yang sama.">sumber: chain (daftar via Uniswap)</span>`;
+  const srcTag = S.uniApi
+    ? `<span title="daftar posisi lengkap dari API Uniswap (menangkap posisi lama & mint di luar bot), detail + in/out-range dibaca langsung dari chain via RPC-mu. Bot Telegram pakai sumber yang sama.">sumber: chain (daftar via Uniswap)</span>`
+    : `<span title="${S.dex} tidak punya indexer posisi yang dipakai bot, jadi daftar posisi dienumerasi langsung dari NFT position manager on-chain — semuanya lewat RPC-mu. Catatan: enumerasi memindai NFT terbaru saja, posisi ber-indeks sangat lama bisa terlewat (pakai Refresh untuk scan penuh).">sumber: chain (enumerasi NFT on-chain)</span>`;
   $('#posSub').innerHTML = srcTag
     + ` · realized ${usd(net)} (deposit ${usd(s.deposits)}, withdraw ${usd(s.withdrawals)}) · ${upd}`;
 
@@ -940,7 +949,7 @@ function posCard(p) {
       <button data-act="add" data-pid="${p.pid}" data-ver="${ver}">➕ Add</button>
       <button data-act="reduce" data-pid="${p.pid}" data-ver="${ver}">➖ Reduce</button>
       <button class="danger" data-act="close" data-pid="${p.pid}" data-ver="${ver}">Close</button>
-      ${p.link ? `<a class="btnlink" href="${p.link}" target="_blank" rel="noopener">↗ Uniswap</a>` : ''}
+      ${p.link ? `<a class="btnlink" href="${p.link}" target="_blank" rel="noopener">↗ ${S.dex}</a>` : ''}
     </div>
   </div>`;
 }
@@ -1071,6 +1080,8 @@ function cancelOrder(id) {
 async function loadState() {
   const s = await api('/api/state' + (TOKEN ? '?t=' + encodeURIComponent(TOKEN) : ''));
   S.chain = s.chain; S.settings = s.settings;
+  S.dex = s.dex || 'Uniswap'; S.versions = s.versions || 'v2/v3/v4'; S.uniApi = !!s.uni_api;
+  $('#posSub').textContent = `Live dari chain — ${S.dex} ${S.versions.replace(/\//g, ', ')}.`;
   $('#chain').innerHTML = s.chains.map(c =>
     `<option value="${c.id}"${c.id === s.chain ? ' selected' : ''}>${c.name}</option>`).join('');
   $('#wallet').innerHTML = s.wallets.map(w =>

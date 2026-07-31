@@ -251,6 +251,10 @@ def api_state(_q, _b) -> dict:
         wrapped = 0.0
     return {
         "chain": cid, "chain_name": cfg["name"], "explorer": cfg["explorer"],
+        # DEX aktif berbeda per chain (Uniswap di Robinhood, PancakeSwap di BSC) —
+        # front-end memakainya untuk label tombol & teks sumber data.
+        "dex": ch.dex_name(cid), "versions": ch.versions_label(cid),
+        "uni_api": bool(cfg.get("uni_api")),
         "wallets": [{"idx": i, "label": f"W{i + 1}", "address": bot._addr_of(k)}
                     for i, k in enumerate(pks)],
         "wallet_idx": idx, "address": addr,
@@ -273,12 +277,14 @@ def api_settings(_q, b) -> dict:
 def api_discover(_q, b) -> dict:
     cid = int(b["chain"])
     token = Web3.to_checksum_address(str(b["token"]).strip())
-    # ch.discover_any: API resmi Uniswap (ListPools) dulu — daftar pool v3/v4 instan
-    # & lengkap, sama seperti app.uniswap.org; kosong/API mati → scan RPC penuh (juga
-    # menemukan v2). Fungsi yang sama dipakai bot Telegram → dua UI konsisten.
+    # ch.discover_any: di chain Uniswap, API resmi (ListPools) dulu — daftar pool
+    # v3/v4 instan & lengkap, sama seperti app.uniswap.org; kosong/API mati → scan
+    # RPC penuh (juga menemukan v2). Di BSC/PancakeSwap indexer itu dilewati dan
+    # selalu scan RPC + dexscreener. Fungsi yang sama dipakai bot Telegram.
     res = ch.discover_any(cid, token)
     if not res["pools"]:
-        raise RuntimeError("Tidak ada pool Uniswap (v2/v3/v4) untuk token ini.")
+        raise RuntimeError(f"Tidak ada pool {ch.dex_name(cid)} "
+                           f"({ch.versions_label(cid)}) untuk token ini.")
     _TOKENS[f"{cid}:{token.lower()}"] = res["token"]
     out = []
     for p in res["pools"][:12]:
@@ -290,6 +296,8 @@ def api_discover(_q, b) -> dict:
             "quote_sym": p["quote_sym"], "tvl_usd": p["tvl_usd"],
             "vol24_usd": p.get("vol24_usd"), "apr_pct": p.get("apr_pct"),
             "quote_usd": p["quote_usd"],
+            # quote di luar daftar tetap & pool bernilai kecil: klien menampilkan peringatan
+            "foreign_quote": bool(p.get("foreign_quote")), "thin": bool(p.get("thin")),
         })
     return {"token": res["token"], "pools": out}
 
@@ -324,6 +332,7 @@ def api_pool(_q, b) -> dict:
         "tvl_usd": p["tvl_usd"], "vol24_usd": p.get("vol24_usd"), "apr_pct": p.get("apr_pct"),
         "mc_usd": price * p["quote_usd"] * supply if supply else None,
         "supply": supply,
+        "foreign_quote": bool(p.get("foreign_quote")), "thin": bool(p.get("thin")),
     }
 
 
@@ -472,6 +481,8 @@ def api_mint(_q, b) -> dict:
     if ver == 2:
         pid = f"v2:{r['pair'].lower()}"
         store.add_ref(cid, addr, "v2", r["pair"])
+        store.set_v2_basis(cid, addr, r["pair"], r.get("k_per_lp") or 0,
+                           r.get("lp_before", 0), r.get("lp_after", 0))
     else:
         pid = f"v4:{r['token_id']}" if ver == 4 else r["token_id"]
         if ver == 4 and r["token_id"]:
@@ -685,6 +696,8 @@ def _positions_build(cid: int, full: bool = False, with_basis: bool = True) -> d
         d["quote_amount"] = p["amount1"] if q_is_t1 else p["amount0"]
         d["meme_fees"] = p["fees0"] if q_is_t1 else p["fees1"]
         d["quote_fees"] = p["fees1"] if q_is_t1 else p["fees0"]
+        # fee v2 mengendap di dalam posisi → tidak ada "unclaimed", dihitung terpisah
+        d["earned_usd"] = bot.v2_earned_usd(cid, p, addr) if p.get("ver") == 2 else 0.0
         if p.get("ver") != 2 and p.get("tick_lower") is not None:
             mdec = p["dec0"] if q_is_t1 else p["dec1"]
             qdec = p["dec1"] if q_is_t1 else p["dec0"]
@@ -798,6 +811,7 @@ def api_action(_q, b) -> dict:
             store.drop_ref(cid, addr, "v4", str(ref))
         elif ver == 2:
             store.drop_ref(cid, addr, "v2", str(ref))
+            store.drop_v2_basis(cid, addr, str(ref))
         store.record_event(cid, "close", tid, pos["value_usd"] if pos else 0.0, wallet=addr)
         if pos and pos["unclaimed_usd"] > 0:
             store.record_event(cid, "fees", tid, pos["unclaimed_usd"], wallet=addr)

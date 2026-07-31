@@ -1,6 +1,7 @@
 """
 chain.py — Web3 core untuk LP bot: discovery pool, mint single-sided,
-listing posisi, close, dan auto-swap. Uniswap V3 di Robinhood (4663) + BSC (56).
+listing posisi, close, dan auto-swap.
+DEX per chain: Uniswap v2/v3/v4 di Robinhood (4663), PancakeSwap v2/v3 di BSC (56).
 """
 import math
 import os
@@ -19,13 +20,22 @@ from web3.exceptions import ContractLogicError
 Q96 = 2**96
 MAX_UINT128 = 2**128 - 1
 MAX_UINT256 = 2**256 - 1
-TICK_SPACING = {100: 1, 500: 10, 3000: 60, 10000: 200}
+# Gabungan fee tier Uniswap (3000→60) dan PancakeSwap (2500→50). Pemetaannya tidak
+# pernah bentrok — fee 2500 cuma ada di Pancake, 3000 cuma di Uniswap — jadi satu map
+# aman untuk dua DEX. Fee tier yang di-scan per chain: CHAINS[cid]["fee_tiers"].
+TICK_SPACING = {100: 1, 500: 10, 2500: 50, 3000: 60, 10000: 200}
 MIN_TICK, MAX_TICK = -887272, 887272
 DEADLINE_SECS = 1200
 
 CHAINS = {
     4663: {
         "name": "Robinhood",
+        "dex": "Uniswap",
+        "fee_tiers": (100, 500, 3000, 10000),   # tier v3 yang di-scan discovery
+        "uni_api": True,        # boleh pakai API indexer resmi Uniswap (ListPools/ListPositions)
+        "v2_fee": 3000,         # fee pair v2 (ppm) — Uniswap V2 = 0.3%
+        "v2_swap_num": 997, "v2_swap_den": 1000,   # konstanta getAmountOut router v2
+        "gas_reserve": 0.0005,  # fallback cadangan gas kalau harga gas tak terbaca
         "slug": "robinhood",  # slug URL app.uniswap.org
         "dexscreener": "robinhood",
         "gecko": "robinhood",
@@ -73,11 +83,22 @@ CHAINS = {
     },
     56: {
         "name": "BSC",
-        "slug": "bnb",
+        "dex": "PancakeSwap",
+        # Pancake tidak punya fee 3000; punya 2500 (spacing 50) yang tidak ada di Uniswap.
+        "fee_tiers": (100, 500, 2500, 10000),
+        # Indexer resmi Uniswap tidak mengindeks pool PancakeSwap → discovery & daftar
+        # posisi di BSC memakai scan RPC + dexscreener dan enumerasi NPM on-chain.
+        "uni_api": False,
+        "v2_fee": 2500,         # PancakeSwap V2 = 0.25%
+        "v2_swap_num": 9975, "v2_swap_den": 10000,  # PancakeV2Pair.getAmountOut
+        "gas_reserve": 0.001,   # fallback cadangan gas kalau harga gas tak terbaca
+        "slug": "bsc",          # slug URL pancakeswap.finance
         "dexscreener": "bsc",
         "gecko": "bsc",
         "gmgn": "bsc",
-        "v2_factory": "0x8909Dc15e40173Ff4699343b6eB8132c65e18eC6",  # Uniswap V2 BSC
+        # PancakeSwap V2 (diverifikasi on-chain: v2_router.factory()==v2_factory,
+        # v2_router.WETH()==wrapped)
+        "v2_factory": "0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73",
         "rpcs": [
             "https://1rpc.io/bnb",
             "https://bsc-dataseed.bnbchain.org",
@@ -86,19 +107,20 @@ CHAINS = {
         "alchemy": "bnb-mainnet",
         "rpc_env": "RPC_56",
         "explorer": "https://bscscan.com",
-        "factory": "0xdB1d10011AD0Ff90774D0C6Bb92e5C5c8b4461F7",
-        "npm": "0x7b8A01B39D58278b5DE7e48c8449c9f4F5170613",
-        # SwapRouter02 Uniswap di BSC (docs.uniswap.org deployments)
-        "router": "0xB971eF87ede563556b2ED4b1C0b0019111Dd85d2",
-        # V2 router — diverifikasi on-chain: factory()==v2_factory, WETH()==wrapped
-        "v2_router": "0x4752ba5DBc23f44D87826276BF6Fd6b1C372aD24",
-        # Uniswap V4 (diverifikasi on-chain, sama seperti Robinhood)
-        "v4_pm": "0x28e2ea090877bf75740558f6bfb36a5ffee9e9df",
-        "v4_posm": "0x7a4a5c919ae2541aed11041a1aeee68f1287f95b",
-        "v4_stateview": "0xd13dd3d6e93f276fafc9db9e6bb47c1180aee0c4",
-        "v4_quoter": "0x9f75dd27d6664c475b90e105573e550ff69437b0",
-        "v4_router": "0x1906c1d672b88cd1b9ac7593301ca990f94eae07",
-        "permit2": "0x000000000022D473030F116dDEE9F6B43aC78BA3",
+        # PancakeSwap V3 (docs.pancakeswap.finance; diverifikasi on-chain:
+        # npm.factory() == factory, npm.WETH9() == wrapped)
+        "factory": "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865",
+        "npm": "0x46A15B0b27311cedF172AB29E4f4766fbE7F4364",
+        # SmartRouter — dipakai karena ExactInputSingleParams-nya bentuk SwapRouter02
+        # (tanpa deadline), persis ROUTER_ABI. JANGAN ganti ke SwapRouter V3
+        # 0x1b81D678ffb9C0263b24A97847620C99d213eB14: strukturnya versi lama (pakai
+        # deadline, selector 0x414bf389) sehingga calldata-nya tidak cocok.
+        # Diverifikasi on-chain: router.factory() == factory.
+        "router": "0x13f4EA83D0bd40E75C8222255bc855a974568Dd4",
+        "v2_router": "0x10ED43C718714eb63d5aA57B78B54704E256024E",
+        # Tidak ada key v4_* → jalur v4 mati di chain ini (has_v4() False).
+        # Padanan v4 di Pancake adalah "Infinity" (Vault + CLPoolManager), arsitektur
+        # berbeda total dari Uniswap V4 dan belum didukung.
         "wrapped": "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c",
         "wrapped_symbol": "WBNB",
         "native_symbol": "BNB",
@@ -110,6 +132,49 @@ CHAINS = {
         "stable_syms": {"USDT", "USDC"},
     },
 }
+
+
+# ---------- Kemampuan per chain ----------
+def dex_name(chain_id: int) -> str:
+    """Nama DEX yang dipakai di chain ini (untuk teks UI)."""
+    return CHAINS[chain_id].get("dex", "Uniswap")
+
+
+def has_v4(chain_id: int) -> bool:
+    """True kalau chain punya deployment v4 yang didukung. PancakeSwap tidak punya
+    kontrak kompatibel-v4 (padanannya 'Infinity', arsitektur beda) → False di BSC."""
+    return bool(CHAINS[chain_id].get("v4_pm"))
+
+
+def versions_label(chain_id: int) -> str:
+    """'v2/v3/v4' atau 'v2/v3' — dipakai di pesan discovery kedua UI."""
+    return "v2/v3/v4" if has_v4(chain_id) else "v2/v3"
+
+
+def fee_tiers(chain_id: int) -> tuple:
+    return tuple(CHAINS[chain_id].get("fee_tiers") or (100, 500, 3000, 10000))
+
+
+GAS_UNITS_FULL_FLOW = 1_500_000   # wrap + approve×3 + swap×3 + addLiquidity, token boros
+
+
+def gas_reserve_wei(chain_id: int, w3: Web3 | None = None) -> int:
+    """Native yang tidak boleh ikut dipakai jadi modal — cadangan gas.
+
+    Dihitung dari harga gas SEKARANG (2× satu alur mint penuh), bukan angka mati:
+    di BSC 0,05 gwei satu alur penuh cuma ~0,00006 BNB (~$0,04), jadi cadangan tetap
+    sebesar 0,003 BNB akan mengunci sebagian besar saldo wallet kecil tanpa guna —
+    sementara kalau harga gas naik ke level lama (3 gwei) justru kurang.
+    Di-clamp ke [1/5, 5×] nilai fallback config supaya tidak ekstrem ke dua arah."""
+    fallback = int(float(CHAINS[chain_id].get("gas_reserve", 0.001)) * 1e18)
+    if w3 is None:
+        return fallback
+    try:
+        est = int(w3.eth.gas_price * GAS_UNITS_FULL_FLOW * 2)
+    except Exception:
+        return fallback
+    return min(max(est, fallback // 5), fallback * 5)
+
 
 # ---------- ABIs minimal ----------
 ERC20_ABI = [
@@ -133,7 +198,10 @@ POOL_ABI = [
     {"constant": True, "inputs": [], "name": "slot0", "outputs": [
         {"name": "sqrtPriceX96", "type": "uint160"}, {"name": "tick", "type": "int24"},
         {"name": "observationIndex", "type": "uint16"}, {"name": "observationCardinality", "type": "uint16"},
-        {"name": "observationCardinalityNext", "type": "uint16"}, {"name": "feeProtocol", "type": "uint8"},
+        # feeProtocol: uint8 di Uniswap V3, uint32 di PancakeSwap V3 (fee0 | fee1<<16,
+        # nilai nyatanya ratusan juta). uint32 mendekode keduanya — dengan uint8,
+        # eth-abi menolak padding tidak nol dan SEMUA pool Pancake gagal dibaca.
+        {"name": "observationCardinalityNext", "type": "uint16"}, {"name": "feeProtocol", "type": "uint32"},
         {"name": "unlocked", "type": "bool"}], "type": "function", "stateMutability": "view"},
     {"constant": True, "inputs": [], "name": "liquidity", "outputs": [{"name": "", "type": "uint128"}], "type": "function", "stateMutability": "view"},
     {"constant": True, "inputs": [], "name": "token0", "outputs": [{"name": "", "type": "address"}], "type": "function", "stateMutability": "view"},
@@ -546,7 +614,15 @@ def send_tx(w3: Web3, pk: str, tx: dict) -> str:
     tx["chainId"] = w3.eth.chain_id
     tx.setdefault("value", 0)
     try:
-        tx["gas"] = int(w3.eth.estimate_gas(tx) * 1.3)
+        est = w3.eth.estimate_gas(tx)
+        # Buffer 1.3x SAJA tidak aman: sebagian token memecoin punya logika pajak /
+        # reflection yang cuma terpicu pada kondisi tertentu (mis. saldo pajak
+        # menembus ambang → token menjual sendiri ke BNB). Biaya transfernya lalu
+        # melonjak ratusan ribu gas ANTARA estimasi dan eksekusi — terukur di RTX
+        # (0x2Ec3…): 51k s/d 357k gas untuk satu transfer, dan satu addLiquidity
+        # gagal kehabisan gas di limit 368k padahal estimasinya 283k. Karena gas
+        # yang tak terpakai dikembalikan, kelebihan limit praktis gratis.
+        tx["gas"] = max(int(est * 1.3), est + 300_000)
     except ContractLogicError:
         raise
     except Exception:
@@ -613,7 +689,17 @@ def poll_balance(w3: Web3, token: str, addr: str, min_expected: int,
 def wait_ok(w3: Web3, txhash: str, what: str):
     r = w3.eth.wait_for_transaction_receipt(txhash, timeout=180)
     if r.status != 1:
-        raise RuntimeError(f"Tx {what} FAILED: {txhash}")
+        hint = ""
+        try:
+            # gasUsed mepet limit = kehabisan gas, bukan require() yang gagal.
+            # Bedanya penting: yang satu tinggal naikkan limit, yang satu salah angka.
+            lim = w3.eth.get_transaction(txhash)["gas"]
+            if r.gasUsed >= lim * 0.97:
+                hint = (f" — kehabisan gas (pakai {r.gasUsed:,} dari limit {lim:,}). "
+                        f"Token ini boros gas dan biayanya berubah-ubah; coba ulang.")
+        except Exception:
+            pass
+        raise RuntimeError(f"Tx {what} FAILED: {txhash}{hint}")
     return r
 
 
@@ -622,7 +708,10 @@ def tx_link(chain_id: int, h: str) -> str:
 
 
 def pos_link(chain_id: int, token_id: int) -> str:
-    return f"https://app.uniswap.org/positions/v3/{CHAINS[chain_id]['slug']}/{token_id}"
+    cfg = CHAINS[chain_id]
+    if cfg.get("dex") == "PancakeSwap":
+        return f"https://pancakeswap.finance/liquidity/{token_id}?chain={cfg['slug']}"
+    return f"https://app.uniswap.org/positions/v3/{cfg['slug']}/{token_id}"
 
 
 def pos_link_any(chain_id: int, pid) -> str:
@@ -643,11 +732,51 @@ def _pool_price_t1_per_t0(w3: Web3, pool_addr: str) -> float:
     return (sp / Q96) ** 2
 
 
+# ---------- Quote di luar daftar tetap (hasil auto-deteksi discovery) ----------
+# Banyak pool memecoin tidak ber-quote WBNB/USDT/USDC melainkan token lain (mis.
+# RTX/NVDAB). Token lawan seperti itu didaftarkan di sini saat discovery supaya
+# seluruh kode lama yang memanggil quote_usd_price(quote_sym) tetap bisa menghargainya.
+_EXTRA_QUOTES: dict[int, dict[str, str]] = {}   # chain_id -> {symbol: address}
+
+
+def register_quote(chain_id: int, sym: str, addr: str) -> str:
+    """Daftarkan token lawan sebagai quote runtime. Return simbol final yang dipakai
+    di dict pool (bisa didisambiguasi kalau bentrok)."""
+    cfg = CHAINS[chain_id]
+    addr = Web3.to_checksum_address(addr)
+    reg = _EXTRA_QUOTES.setdefault(chain_id, {})
+    for s, a in reg.items():
+        if a.lower() == addr.lower():
+            return s
+    sym = (str(sym or "").strip() or "?")[:12]
+    # JANGAN pernah menimpa simbol quote resmi: token mana pun bisa mengaku bernama
+    # "USDT" dan akan meracuni SELURUH perhitungan USD kalau simbolnya dipakai polos.
+    if sym in cfg["quotes"] or sym in cfg["stable_syms"] or sym in reg:
+        sym = f"{sym}~{addr[-4:]}"
+    reg[sym] = addr
+    return sym
+
+
+def quote_addr_of(chain_id: int, quote_sym: str) -> str | None:
+    """Alamat quote dari daftar tetap maupun hasil auto-deteksi."""
+    return (CHAINS[chain_id]["quotes"].get(quote_sym)
+            or _EXTRA_QUOTES.get(chain_id, {}).get(quote_sym))
+
+
+def is_extra_quote(chain_id: int, quote_sym: str) -> bool:
+    return quote_sym in _EXTRA_QUOTES.get(chain_id, {})
+
+
 def quote_usd_price(w3: Web3, chain_id: int, quote_sym: str, _cache={}) -> float:
-    """Harga USD 1 unit quote. Stable = 1. Wrapped native = dari pool wrapped/stable."""
+    """Harga USD 1 unit quote. Stable = 1. Wrapped native = dari pool wrapped/stable.
+    Quote hasil auto-deteksi = harga tokennya sendiri (token_usd_price)."""
     cfg = CHAINS[chain_id]
     if quote_sym in cfg["stable_syms"]:
         return 1.0
+    extra = _EXTRA_QUOTES.get(chain_id, {}).get(quote_sym)
+    if extra:
+        # token_usd_price hanya melihat quote TETAP, jadi tidak ada rekursi balik ke sini
+        return token_usd_price(w3, chain_id, extra)
     key = (chain_id, quote_sym)
     hit = _cache.get(key)
     if hit and time.time() - hit[1] < 60:
@@ -657,7 +786,7 @@ def quote_usd_price(w3: Web3, chain_id: int, quote_sym: str, _cache={}) -> float
     for stable_sym in cfg["stable_syms"]:
         stable = Web3.to_checksum_address(cfg["quotes"][stable_sym])
         t0, t1 = sorted([wrapped, stable])
-        for fee in (500, 3000, 100, 10000):
+        for fee in fee_tiers(chain_id):
             pool = factory.functions.getPool(t0, t1, fee).call()
             if int(pool, 16) == 0:
                 continue
@@ -735,7 +864,11 @@ _UNI_POOLS_CACHE: dict[tuple, tuple] = {}   # (cid, token) -> (ts, pools mentah)
 def uni_pools(cid: int, token: str, ttl: int = 30) -> list | None:
     """Semua pool Uniswap yang memuat `token` di chain `cid` (v3 + v4), langsung
     dari API resmi Uniswap. Cache pendek per-token. Read-only — cuma alamat token
-    publik, tak pernah untuk tx. None kalau gagal → caller fallback ke scan RPC."""
+    publik, tak pernah untuk tx. None kalau gagal → caller fallback ke scan RPC.
+    None juga di chain yang DEX-nya bukan Uniswap (indexer ini tidak mengenal
+    pool PancakeSwap; jawabannya akan kosong atau justru pool DEX yang salah)."""
+    if not CHAINS[cid].get("uni_api"):
+        return None
     ck = (cid, token.lower())
     hit = _UNI_POOLS_CACHE.get(ck)
     if hit and time.time() - hit[0] < ttl:
@@ -845,10 +978,14 @@ def uni_discover(cid: int, token: str) -> dict | None:
             if not p:
                 continue
             tvl = float(ap.get("totalLiquidityUsd") or 0)
-            if tvl < 10:      # ListPools mengembalikan banyak pool receh/mati — buang dust
+            vol = vols.get(str(p["pool"]).lower())
+            # Pool kecil tetap ditampilkan (ditandai "thin"). Yang dibuang hanya pool
+            # yang benar-benar mati: tanpa TVL DAN tanpa volume — ListPools memuat
+            # ratusan pool semacam itu dan cuma jadi sampah di daftar.
+            if tvl <= 0 and not vol:
                 continue
             p["tvl_usd"] = tvl
-            p["vol24_usd"] = vols.get(str(p["pool"]).lower())
+            p["vol24_usd"] = vol
             apr = ap.get("apr")
             if apr is None:
                 apr = ap.get("totalApr")
@@ -873,14 +1010,33 @@ def uni_discover(cid: int, token: str) -> dict | None:
 
 def discover_any(chain_id: int, token_addr: str) -> dict:
     """Discovery pool untuk SEMUA UI (bot & web): API Uniswap dulu (lengkap, cepat,
-    termasuk v4 fee non-standar), fallback scan RPC kalau API mati / nihil."""
+    termasuk v4 fee non-standar), fallback scan RPC kalau API mati / nihil.
+    Terakhir ditambah pool ber-quote di luar daftar tetap (mis. RTX/NVDAB) — banyak
+    memecoin cuma punya pool jenis ini, tak terjangkau scan quote biasa."""
+    res = None
     try:
         res = uni_discover(chain_id, token_addr)
-        if res and res.get("pools"):
-            return res
+    except Exception:
+        res = None
+    if not (res and res.get("pools")):
+        res = discover_pools(chain_id, token_addr)
+
+    # BERURUTAN, jangan diparalelkan dengan scan di atas: keduanya memukul RPC yang
+    # sama dan pada endpoint publik hasilnya justru kena rate-limit (terukur 19s vs
+    # 10s untuk token ber-pool banyak).
+    try:
+        skip = {str(p["pool"]).lower() for p in res["pools"]}
+        extra = discover_foreign_pools(get_w3(chain_id), chain_id, token_addr, skip)
+        if extra:
+            res["pools"] = sorted(res["pools"] + extra,
+                                  key=lambda p: p["tvl_usd"], reverse=True)
     except Exception:
         pass
-    return discover_pools(chain_id, token_addr)
+    # Pool bernilai kecil tidak lagi dibuang — ditandai supaya UI bisa memperingatkan
+    # (slippage besar, harga gampang digeser, fee kemungkinan tak menutup gas).
+    for p in res["pools"]:
+        p["thin"] = (p.get("tvl_usd") or 0) < 50
+    return res
 
 
 # ---------- Discovery pool via scan RPC (fallback) ----------
@@ -893,7 +1049,7 @@ def discover_pools(chain_id: int, token_addr: str) -> dict:
 
     quotes = [(qsym, Web3.to_checksum_address(qaddr)) for qsym, qaddr in cfg["quotes"].items()
               if Web3.to_checksum_address(qaddr) != token]
-    combos = [(qsym, q, fee) for qsym, q in quotes for fee in (100, 500, 3000, 10000)]
+    combos = [(qsym, q, fee) for qsym, q in quotes for fee in fee_tiers(chain_id)]
 
     with ThreadPoolExecutor(max_workers=5) as ex:
         tinfo_f = ex.submit(token_info, w3, token)
@@ -1069,12 +1225,13 @@ def discover_dex_pools(w3: Web3, chain_id: int, token: str,
     for pr in pairs:
         labels = pr.get("labels") or []
         addr = pr.get("pairAddress") or ""
-        if float((pr.get("liquidity") or {}).get("usd") or 0) < 50:
-            continue
+        # tanpa ambang likuiditas: pool kecil tetap jadi kandidat, verifikasi on-chain
+        # + probe round-trip di build() yang jadi gerbangnya
         if "v3" in labels and addr.lower() not in skip_v3 and n3 < 6:
             cands.append(("v3", addr))
             n3 += 1
-        elif "v4" in labels and len(addr) == 66 and addr.lower() not in skip_v4 and n4 < 8:
+        elif ("v4" in labels and has_v4(chain_id) and len(addr) == 66
+              and addr.lower() not in skip_v4 and n4 < 8):
             cands.append(("v4", addr))
             n4 += 1
 
@@ -1085,7 +1242,9 @@ def discover_dex_pools(w3: Web3, chain_id: int, token: str,
                 pool = w3.eth.contract(address=Web3.to_checksum_address(addr), abi=POOL_ABI)
                 t0, t1 = pool.functions.token0().call(), pool.functions.token1().call()
                 fee = pool.functions.fee().call()
-                # otentikasi: alamat harus terdaftar di factory Uniswap
+                # otentikasi: alamat harus terdaftar di factory DEX chain ini —
+                # ini juga yang menyaring pool DEX lain (mis. Uniswap di BSC) yang
+                # ikut muncul di daftar dexscreener
                 if factory.functions.getPool(t0, t1, fee).call().lower() != addr.lower():
                     return None
                 if t1.lower() in quotes_lc:
@@ -1098,7 +1257,7 @@ def discover_dex_pools(w3: Web3, chain_id: int, token: str,
                 qdec = token_info(w3, q)["decimals"]
                 qusd = quote_usd_price(w3, chain_id, qsym)
                 q_bal = erc20(w3, q).functions.balanceOf(addr).call() / 10 ** qdec
-                if q_bal * qusd * 2 < 10:   # gerbang aman tetap pakai sisi quote saja
+                if q_bal <= 0:   # sisi quote kosong = tidak ada yang bisa di-LP
                     return None
                 meme = t0 if q_is_t1 else t1
                 mdec = token_info(w3, meme)["decimals"]
@@ -1135,7 +1294,7 @@ def discover_dex_pools(w3: Web3, chain_id: int, token: str,
                 qusd = quote_usd_price(w3, chain_id, price_sym)
                 q_virt = (pliq * sqrtp // Q96) if q_is_c1 else (pliq * Q96 // sqrtp if sqrtp else 0)
                 tvl = q_virt / 10 ** qinfo["decimals"] * qusd * 2
-                if tvl < 10:
+                if tvl <= 0:
                     return None
                 probe = int(min(100 / qusd if qusd else 0,
                                 q_virt / 10 ** qinfo["decimals"] / 100 or 1) * 10 ** qinfo["decimals"]) or 1
@@ -1153,6 +1312,128 @@ def discover_dex_pools(w3: Web3, chain_id: int, token: str,
             return None
 
     with ThreadPoolExecutor(max_workers=5) as ex:
+        for r in ex.map(build, cands):
+            if r:
+                out.append(r)
+    return out
+
+
+# ---------- Discovery pool ber-quote di luar daftar tetap ----------
+def _foreign_counter(pr: dict, token_lc: str) -> tuple[str, str] | None:
+    """(alamat, simbol) sisi lawan dari entri dexscreener. None kalau tidak jelas."""
+    for side, other in (("baseToken", "quoteToken"), ("quoteToken", "baseToken")):
+        a = str((pr.get(side) or {}).get("address") or "")
+        if a.lower() == token_lc:
+            o = pr.get(other) or {}
+            oa = str(o.get("address") or "")
+            if oa.startswith("0x") and len(oa) == 42:
+                return oa, str(o.get("symbol") or "?")
+    return None
+
+
+def discover_foreign_pools(w3: Web3, chain_id: int, token: str, skip: set,
+                           max_pools: int = 6) -> list[dict]:
+    """Pool token terhadap token lawan DI LUAR daftar quote tetap — mis. RTX/NVDAB,
+    yang jumlahnya banyak di memecoin dan tak akan pernah ketemu oleh scan quote biasa.
+
+    Kandidat datang dari dexscreener, tapi tidak ada satu pun angka darinya yang
+    dipercaya untuk transaksi: alamat pool WAJIB cocok dengan factory chain ini
+    (itu juga yang menendang pool DEX lain), dan token lawannya wajib bisa dihargai
+    USD on-chain — tanpa harga, nilai posisi & PnL tidak bisa dihitung."""
+    cfg = CHAINS[chain_id]
+    token = Web3.to_checksum_address(token)
+    token_lc = token.lower()
+    quotes_lc = {str(a).lower() for a in cfg["quotes"].values()}
+    pairs = _dex_pairs(chain_id, token)
+    pairs.sort(key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0), reverse=True)
+
+    v2f = (w3.eth.contract(address=Web3.to_checksum_address(cfg["v2_factory"]), abi=V2_FACTORY_ABI)
+           if cfg.get("v2_factory") else None)
+    f3 = w3.eth.contract(address=Web3.to_checksum_address(cfg["factory"]), abi=FACTORY_ABI)
+
+    cands, seen = [], set()
+    for pr in pairs:
+        addr = str(pr.get("pairAddress") or "")
+        if not addr.startswith("0x") or len(addr) != 42 or addr.lower() in skip:
+            continue
+        c = _foreign_counter(pr, token_lc)
+        if not c or c[0].lower() in quotes_lc or c[0].lower() == token_lc:
+            continue          # quote tetap → sudah ditangani scan biasa
+        if addr.lower() in seen:
+            continue
+        seen.add(addr.lower())
+        labels = pr.get("labels") or []
+        ver = 3 if "v3" in labels else 2 if ("v2" in labels or not labels) else None
+        if ver is None:       # v4 dsb — di luar jangkauan jalur ini
+            continue
+        cands.append((ver, Web3.to_checksum_address(addr), Web3.to_checksum_address(c[0]), c[1],
+                      float((pr.get("volume") or {}).get("h24") or 0)))
+        if len(cands) >= max_pools:
+            break
+
+    def build(item):
+        ver, addr, counter, csym, vol24 = item
+        try:
+            # Syaratnya bukan sekadar "punya harga" (token_usd_price bisa jatuh ke
+            # dexscreener untuk token apa pun), tapi punya sokongan likuiditas
+            # on-chain terhadap quote tetap — itu yang membuat nilainya bisa
+            # diverifikasi sendiri DAN membuat auto-buy/auto-swap punya rute.
+            if quote_backing_usd(w3, chain_id, counter) <= 0:
+                return None
+            qusd = token_usd_price(w3, chain_id, counter)
+            if qusd <= 0:
+                return None       # tak bisa dihargai → nilai posisi/PnL mustahil dihitung
+            qdec = token_info(w3, counter)["decimals"]
+            if ver == 2:
+                if not v2f or v2f.functions.getPair(token, counter).call().lower() != addr.lower():
+                    return None   # bukan pair factory chain ini
+                rq, rm = _v2_pair_reserves(w3, addr, counter)
+                if rq == 0 or rm == 0:
+                    return None   # pair kosong: harga belum ada, deposit pertama yang menentukannya
+                num, den = cfg.get("v2_swap_num", 997), cfg.get("v2_swap_den", 1000)
+                probe = int(min(100 / qusd, rq / 10 ** qdec / 100 or 1) * 10 ** qdec) or 1
+                o1 = probe * num * rm // (rq * den + probe * num)
+                back = o1 * num * rq // (rm * den + o1 * num)
+                if back < probe * 70 // 100:
+                    return None   # dust / harga dimanipulasi
+                t0, t1 = sorted([token, counter])
+                p = {"ver": 2, "pool": addr, "fee": cfg.get("v2_fee", 3000),
+                     "tick": None, "sqrtp": None, "liquidity": None,
+                     "reserve_quote": rq, "reserve_meme": rm,
+                     "tvl_usd": rq / 10 ** qdec * qusd * 2}
+            else:
+                pool = w3.eth.contract(address=addr, abi=POOL_ABI)
+                t0, t1 = pool.functions.token0().call(), pool.functions.token1().call()
+                fee = pool.functions.fee().call()
+                if f3.functions.getPool(t0, t1, fee).call().lower() != addr.lower():
+                    return None
+                slot0 = pool.functions.slot0().call()
+                q_bal = erc20(w3, counter).functions.balanceOf(addr).call() / 10 ** qdec
+                mdec = token_info(w3, token)["decimals"]
+                raw = (slot0[0] / Q96) ** 2
+                q_is_t1 = Web3.to_checksum_address(t1) == counter
+                meme_in_q = (raw if q_is_t1 else (1 / raw if raw else 0)) * 10 ** (mdec - qdec)
+                m_bal = erc20(w3, token).functions.balanceOf(addr).call() / 10 ** mdec
+                p = {"ver": 3, "pool": addr, "fee": fee,
+                     "tick_spacing": pool.functions.tickSpacing().call(),
+                     "tick": slot0[1], "sqrtp": slot0[0],
+                     "liquidity": pool.functions.liquidity().call(),
+                     "tvl_usd": q_bal * qusd + m_bal * meme_in_q * qusd}
+            t0, t1 = sorted([token, counter])
+            p.update({
+                "quote_sym": register_quote(chain_id, csym, counter),
+                "quote_addr": counter, "quote_decimals": qdec, "quote_usd": qusd,
+                "token0": t0, "token1": t1, "quote_is_token1": counter == t1,
+                "vol24_usd": vol24 or None, "foreign_quote": True,
+            })
+            v, tvl = p.get("vol24_usd"), p["tvl_usd"]
+            p["apr_pct"] = (v * p["fee"] / 1e6 / tvl * 365 * 100) if (v and tvl) else None
+            return p
+        except Exception:
+            return None
+
+    out = []
+    with ThreadPoolExecutor(max_workers=4) as ex:
         for r in ex.map(build, cands):
             if r:
                 out.append(r)
@@ -1277,7 +1558,7 @@ def find_pool(w3: Web3, chain_id: int, a: str, b: str) -> tuple[str | None, int]
     a = Web3.to_checksum_address(a)
     t0, t1 = sorted([a, Web3.to_checksum_address(b)])
     best, best_fee, best_bal = None, 0, -1
-    for f in (100, 500, 3000, 10000):
+    for f in fee_tiers(chain_id):
         addr = factory.functions.getPool(t0, t1, f).call()
         if int(addr, 16) == 0:
             continue
@@ -1291,16 +1572,23 @@ def find_pool(w3: Web3, chain_id: int, a: str, b: str) -> tuple[str | None, int]
 
 
 def wrapped_per_quote_wei(w3: Web3, chain_id: int, quote_addr: str) -> float:
-    """Kurs wei wrapped per wei quote via pool wrapped/quote v3."""
+    """Kurs wei wrapped per wei quote via pool wrapped/quote v3. Kalau pool langsung
+    tidak ada (lazim untuk quote hasil auto-deteksi seperti NVDAB yang cuma
+    berpasangan dengan USDT), kursnya dihitung dari harga USD kedua sisi."""
     cfg = CHAINS[chain_id]
     wrapped = Web3.to_checksum_address(cfg["wrapped"])
     quote = Web3.to_checksum_address(quote_addr)
     pool_addr, _ = find_pool(w3, chain_id, wrapped, quote)
-    if not pool_addr:
+    if pool_addr:
+        raw = _pool_price_t1_per_t0(w3, pool_addr)  # t1-wei per t0-wei
+        t0, _ = sorted([wrapped, quote])
+        return (1 / raw if raw else 0) if wrapped == t0 else raw
+    q_usd = token_usd_price(w3, chain_id, quote)
+    w_usd = quote_usd_price(w3, chain_id, cfg["wrapped_symbol"])
+    if q_usd <= 0 or w_usd <= 0:
         raise RuntimeError(f"Tidak ada pool {cfg['wrapped_symbol']}/quote untuk konversi.")
-    raw = _pool_price_t1_per_t0(w3, pool_addr)  # t1-wei per t0-wei
-    t0, _ = sorted([wrapped, quote])
-    return (1 / raw if raw else 0) if wrapped == t0 else raw
+    qdec = token_info(w3, quote)["decimals"]
+    return q_usd / w_usd * 10 ** (18 - qdec)   # wei wrapped per wei quote
 
 
 def ensure_quote_balance(w3: Web3, chain_id: int, pk: str, quote_addr: str, need_wei: int,
@@ -1317,7 +1605,7 @@ def ensure_quote_balance(w3: Web3, chain_id: int, pk: str, quote_addr: str, need
     if bal >= need_wei:
         return txs
     deficit = need_wei - bal
-    gas_reserve = w3.to_wei("0.0005", "ether")
+    gas_reserve = gas_reserve_wei(chain_id, w3)
 
     if quote == wrapped:
         native = w3.eth.get_balance(account.address)
@@ -1331,12 +1619,22 @@ def ensure_quote_balance(w3: Web3, chain_id: int, pk: str, quote_addr: str, need
         return txs
 
     # quote bukan wrapped: tutup kekurangan dengan swap wrapped → quote
-    pool_addr, fee = find_pool(w3, chain_id, wrapped, quote)
-    if not pool_addr:
+    route = swap_route(w3, chain_id, wrapped, quote)
+    if route is None:
         raise RuntimeError(
-            f"Saldo quote kurang dan tidak ada pool {cfg['wrapped_symbol']}/quote untuk auto-swap.")
-    rate = wrapped_per_quote_wei(w3, chain_id, quote)
-    need_in = int(deficit * rate * 1.02)  # +2% margin biar hasil swap ≥ deficit
+            f"Saldo quote kurang dan tidak ada rute {cfg['wrapped_symbol']}→quote untuk auto-swap.")
+    if len(route) == 1:
+        rate = wrapped_per_quote_wei(w3, chain_id, quote)
+        need_in = int(deficit * rate * 1.02)  # +2% margin biar hasil swap ≥ deficit
+    else:
+        # 2-hop: tidak ada pool langsung untuk menghitung kurs → pakai harga USD
+        # kedua sisi, margin lebih besar karena fee & slippage dibayar dua kali
+        qdec = token_info(w3, quote)["decimals"]
+        q_usd = token_usd_price(w3, chain_id, quote)
+        w_usd = quote_usd_price(w3, chain_id, cfg["wrapped_symbol"])
+        if q_usd <= 0 or w_usd <= 0:
+            raise RuntimeError("Harga USD quote/wrapped tidak terbaca — auto-buy quote dibatalkan.")
+        need_in = int(deficit / 10 ** qdec * q_usd / w_usd * 1e18 * 1.05)
     if need_in <= 0:
         raise RuntimeError("Konversi kurs wrapped/quote gagal (rate 0).")
     wbal = erc20(w3, wrapped).functions.balanceOf(account.address).call()
@@ -1352,9 +1650,16 @@ def ensure_quote_balance(w3: Web3, chain_id: int, pk: str, quote_addr: str, need
         h = send_tx(w3, pk, {"to": wrapped, "value": wrap_amt, "data": calldata(weth.functions.deposit())})
         wait_ok(w3, h, "wrap")
         txs.append(("wrap", h))
-    h = swap_to_token(chain_id, pk, wrapped, quote, fee, need_in, slippage_pct)
-    if h:
-        txs.append(("swap→quote", h))
+        # tunggu saldo wrapped benar-benar terbaca sebelum swap — tanpa ini estimasi
+        # gas swap bisa jalan di replika RPC yang belum sinkron dan revert
+        # TRANSFER_FROM_FAILED walaupun wrap-nya sudah sukses
+        poll_balance(w3, wrapped, account.address, need_in)
+    try:
+        for lbl, h in swap_any(chain_id, pk, wrapped, quote, need_in, slippage_pct):
+            txs.append((lbl, h))
+    except Exception as e:
+        qs = token_info(w3, quote)["symbol"]
+        raise RuntimeError(f"Gagal beli {qs} dari {cfg['wrapped_symbol']}: {e}")
     got = poll_balance(w3, quote, account.address, need_wei)
     if got < int(need_wei * 0.97):
         raise RuntimeError(f"Hasil swap ke quote kurang: {got} < {need_wei} (slippage terlalu besar?)")
@@ -1699,7 +2004,12 @@ def uniswap_v3_token_ids(chain_id: int, address: str, _cache={}, ttl: int = 20) 
     mem-burn NFT), dan posisi yang di-mint langsung di app.uniswap.org tidak ada di
     cache bot. Enumerasi indeks yang cuma memindai N NFT terakhir bisa MELEWATKAN
     posisi aktif yang indeksnya lama — API Uniswap tidak. Read-only & aman (cuma
-    alamat publik). None kalau gagal → caller fallback ke scan indeks."""
+    alamat publik). None kalau gagal → caller fallback ke scan indeks.
+
+    Di chain non-Uniswap (BSC/PancakeSwap) selalu None: indexer ini tidak mengenal
+    NPM PancakeSwap, jadi daftar posisi murni dari enumerasi NFT on-chain."""
+    if not CHAINS[chain_id].get("uni_api"):
+        return None
     key = (chain_id, address.lower())
     hit = _cache.get(key)
     if hit and time.time() - hit[1] < ttl:
@@ -1802,6 +2112,79 @@ def pool_addr_of(factory, t0: str, t1: str, fee: int, _cache={}) -> str:
     return _cache[key]
 
 
+def quote_backing_usd(w3: Web3, chain_id: int, token: str, _cache={}) -> float:
+    """Likuiditas USD token ini terhadap quote TETAP, dibaca on-chain (pool v3 + pair
+    v2). Sengaja TIDAK memakai fallback harga dexscreener seperti token_usd_price:
+    di sini pertanyaannya bukan 'berapa harganya' tapi 'apakah sisi ini benar-benar
+    bisa ditukar & dinilai on-chain' — itu yang memenuhi syarat jadi quote."""
+    key = (chain_id, token.lower())
+    hit = _cache.get(key)
+    if hit and time.time() - hit[1] < 300:
+        return hit[0]
+    cfg = CHAINS[chain_id]
+    token = Web3.to_checksum_address(token)
+    best = 0.0
+    try:
+        f3 = w3.eth.contract(address=Web3.to_checksum_address(cfg["factory"]), abi=FACTORY_ABI)
+        v2f = (w3.eth.contract(address=Web3.to_checksum_address(cfg["v2_factory"]), abi=V2_FACTORY_ABI)
+               if cfg.get("v2_factory") else None)
+        for qsym, qaddr in cfg["quotes"].items():
+            q = Web3.to_checksum_address(qaddr)
+            if q == token:
+                best = float("inf")
+                break
+            qusd = quote_usd_price(w3, chain_id, qsym)
+            if qusd <= 0:
+                continue
+            qdec = token_info(w3, q)["decimals"]
+            t0s, t1s = sorted([token, q])
+            addrs = []
+            for fee in fee_tiers(chain_id):
+                a = f3.functions.getPool(t0s, t1s, fee).call()
+                if int(a, 16):
+                    addrs.append(a)
+            if v2f:
+                a = v2f.functions.getPair(token, q).call()
+                if int(a, 16):
+                    addrs.append(a)
+            for a in addrs:
+                try:
+                    bal = erc20(w3, q).functions.balanceOf(a).call() / 10 ** qdec * qusd
+                    best = max(best, bal)
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    _cache[key] = (best, time.time())
+    return best
+
+
+def resolve_quote_side(w3: Web3, chain_id: int, t0: str, t1: str,
+                       sym0: str = "", sym1: str = "") -> tuple[str | None, bool]:
+    """(quote_sym, quote_is_token1) untuk sepasang token posisi.
+
+    Quote tetap didahulukan. Kalau tidak ada (pool ber-quote auto-deteksi, mis.
+    RTX/NVDAB), sisi quote = sisi yang harganya bisa dibaca on-chain — itu satu-
+    satunya sisi yang bisa dipakai menilai posisi dalam USD. Tanpa ini posisi
+    semacam itu tampil bernilai 0 (v3) atau hilang sama sekali (v2)."""
+    quotes_lc = {a.lower(): s for s, a in CHAINS[chain_id]["quotes"].items()}
+    if t1.lower() in quotes_lc:
+        return quotes_lc[t1.lower()], True
+    if t0.lower() in quotes_lc:
+        return quotes_lc[t0.lower()], False
+    # Kedua sisi bisa saja "punya harga" (token_usd_price jatuh ke dexscreener untuk
+    # token apa pun), jadi pemilihannya pakai sokongan likuiditas on-chain: sisi yang
+    # benar-benar bisa ditukar ke quote tetap. Untuk RTX/NVDAB → NVDAB.
+    b1 = quote_backing_usd(w3, chain_id, t1)
+    b0 = quote_backing_usd(w3, chain_id, t0)
+    if max(b0, b1) <= 0:
+        return None, True
+    is_t1 = b1 >= b0
+    addr = t1 if is_t1 else t0
+    sym = (sym1 if is_t1 else sym0) or token_info(w3, addr)["symbol"]
+    return register_quote(chain_id, sym, addr), is_t1
+
+
 def _position_detail(w3: Web3, chain_id: int, npm, factory, account, tid: int, p) -> dict | None:
     cfg = CHAINS[chain_id]
     try:
@@ -1821,13 +2204,7 @@ def _position_detail(w3: Web3, chain_id: int, npm, factory, account, tid: int, p
             f0, f1 = owed0, owed1
 
         # tentukan sisi quote untuk valuasi USD
-        quotes_lc = {a.lower(): s for s, a in cfg["quotes"].items()}
-        if t1.lower() in quotes_lc:
-            qsym, q_is_t1 = quotes_lc[t1.lower()], True
-        elif t0.lower() in quotes_lc:
-            qsym, q_is_t1 = quotes_lc[t0.lower()], False
-        else:
-            qsym, q_is_t1 = None, True
+        qsym, q_is_t1 = resolve_quote_side(w3, chain_id, t0, t1, i0["symbol"], i1["symbol"])
 
         raw_price = (sqrtp / Q96) ** 2  # token1 per token0, raw
         usd = unclaimed_usd = 0.0
@@ -1931,7 +2308,7 @@ def token_usd_price(w3: Web3, chain_id: int, token_addr: str, _cache={}) -> floa
         qd = token_info(w3, q)["decimals"]
         qusd = quote_usd_price(w3, chain_id, qsym)
         t0, t1 = sorted([token, q])
-        for fee in (100, 500, 3000, 10000):
+        for fee in fee_tiers(chain_id):
             pool = factory.functions.getPool(t0, t1, fee).call()
             if int(pool, 16) == 0:
                 continue
@@ -2218,7 +2595,7 @@ def swap_to_token(chain_id: int, pk: str, token_in: str, token_out: str, fee: in
     t0, t1 = sorted([token_in, token_out])
     pool_addr = factory.functions.getPool(t0, t1, fee).call()
     if int(pool_addr, 16) == 0:
-        for f in (500, 3000, 10000, 100):
+        for f in fee_tiers(chain_id):
             pool_addr = factory.functions.getPool(t0, t1, f).call()
             if int(pool_addr, 16) != 0:
                 fee = f
@@ -2233,12 +2610,97 @@ def swap_to_token(chain_id: int, pk: str, token_in: str, token_out: str, fee: in
         out_est = amount_in_wei / raw_price if raw_price else 0
     min_out = int(out_est * (100 - slippage_pct) / 100)
 
+    # Saldo token masuk WAJIB dicek di sini: kalau kurang, router balas
+    # "TransferHelper: TRANSFER_FROM_FAILED" — revert mentah yang tak menyebut
+    # token, jumlah, maupun langkahnya. Pakai poll: sesudah wrap/swap sebelumnya,
+    # replika RPC bisa masih menunjukkan saldo lama (read-after-write).
+    sym_in = token_info(w3, token_in)["symbol"]
+    dec_in = token_info(w3, token_in)["decimals"]
+    bal_in = poll_balance(w3, token_in, account.address, amount_in_wei, tries=6)
+    if bal_in < amount_in_wei:
+        raise RuntimeError(
+            f"Saldo {sym_in} kurang untuk swap: punya {bal_in / 10 ** dec_in:.8f}, "
+            f"butuh {amount_in_wei / 10 ** dec_in:.8f}")
+
     ensure_approval(w3, pk, token_in, cfg["router"], amount_in_wei)
     router = w3.eth.contract(address=Web3.to_checksum_address(cfg["router"]), abi=ROUTER_ABI)
     params = (token_in, token_out, fee, account.address, amount_in_wei, min_out, 0)
-    h = send_tx(w3, pk, {"to": cfg["router"], "data": calldata(router.functions.exactInputSingle(params))})
+    tx = {"to": cfg["router"], "data": calldata(router.functions.exactInputSingle(params))}
+    sym_out = token_info(w3, token_out)["symbol"]
+    try:
+        _preflight(w3, account.address, tx)
+    except Exception as e:
+        raise RuntimeError(f"Swap {sym_in}→{sym_out} (fee {fee}) ditolak pool: {e}")
+    h = send_tx(w3, pk, tx)
     wait_ok(w3, h, "swap")
     return h
+
+
+def _hop_candidates(chain_id: int) -> list[str]:
+    """Token perantara untuk swap 2-hop, stable dulu lalu wrapped."""
+    cfg = CHAINS[chain_id]
+    mids = [cfg["quotes"][s] for s in cfg["stable_syms"] if s in cfg["quotes"]]
+    mids.append(cfg["wrapped"])
+    return [Web3.to_checksum_address(a) for a in mids]
+
+
+def swap_route(w3: Web3, chain_id: int, token_in: str, token_out: str) -> list[tuple] | None:
+    """Rute swap v3: [(token_in, token_out, fee)] kalau ada pool langsung, atau dua
+    hop lewat stable/wrapped. None kalau tidak ada rute.
+
+    Quote hasil auto-deteksi sering TIDAK punya pool langsung ke wrapped (mis.
+    NVDAB cuma berpasangan dengan USDT), jadi 2-hop wajib ada supaya auto-buy saat
+    mint dan auto-swap saat close tetap jalan."""
+    token_in = Web3.to_checksum_address(token_in)
+    token_out = Web3.to_checksum_address(token_out)
+    if token_in == token_out:
+        return []
+    pool, fee = find_pool(w3, chain_id, token_in, token_out)
+    if pool:
+        return [(token_in, token_out, fee)]
+    for mid in _hop_candidates(chain_id):
+        if mid in (token_in, token_out):
+            continue
+        p1, f1 = find_pool(w3, chain_id, token_in, mid)
+        if not p1:
+            continue
+        p2, f2 = find_pool(w3, chain_id, mid, token_out)
+        if p2:
+            return [(token_in, mid, f1), (mid, token_out, f2)]
+    return None
+
+
+def swap_any(chain_id: int, pk: str, token_in: str, token_out: str,
+             amount_in_wei: int, slippage_pct: float) -> list[tuple[str, str]]:
+    """Swap token apa pun → token apa pun lewat rute langsung / 2-hop. Tiap hop
+    memakai swap_to_token (exactInputSingle) yang sudah teruji — bukan calldata
+    multi-hop baru. Return [(label, txhash)]."""
+    if amount_in_wei <= 0:
+        return []
+    w3 = get_w3(chain_id)
+    route = swap_route(w3, chain_id, token_in, token_out)
+    if route is None:
+        si = token_info(w3, Web3.to_checksum_address(token_in))["symbol"]
+        so = token_info(w3, Web3.to_checksum_address(token_out))["symbol"]
+        raise RuntimeError(f"Tidak ada rute swap {si} → {so} (langsung maupun 2-hop).")
+    account = w3.eth.account.from_key(pk)
+    out = []
+    amt = amount_in_wei
+    for i, (a, b, fee) in enumerate(route):
+        before = erc20(w3, b).functions.balanceOf(account.address).call()
+        h = swap_to_token(chain_id, pk, a, b, fee, amt, slippage_pct)
+        if not h:
+            break
+        si = token_info(w3, a)["symbol"]
+        so = token_info(w3, b)["symbol"]
+        out.append((f"swap {si}→{so}", h))
+        if i + 1 < len(route):
+            # hop berikutnya memakai jumlah yang BENAR-BENAR diterima, bukan estimasi
+            got = poll_balance(w3, b, account.address, before + 1)
+            amt = got - before
+            if amt <= 0:
+                raise RuntimeError(f"Hop {si}→{so} tidak menghasilkan saldo — swap berhenti.")
+    return out
 
 
 def close_position(chain_id: int, pk: str, token_id: int, slippage_pct: float,
@@ -2286,8 +2748,10 @@ def close_position(chain_id: int, pk: str, token_id: int, slippage_pct: float,
                 swaps.append((info["symbol"], "SWAP GAGAL: saldo terbaca 0 (RPC lag) — jual manual/close lagi"))
                 continue
             try:
-                sh = swap_to_token(chain_id, pk, taddr, wrapped, fee, bal, slippage_pct)
-                if sh:
+                # swap_any: pool langsung kalau ada, kalau tidak 2-hop lewat stable —
+                # sisi pool ber-quote auto-deteksi (mis. NVDAB) tidak punya pool
+                # langsung ke wrapped, tanpa ini auto-swap-nya selalu gagal.
+                for _lbl, sh in swap_any(chain_id, pk, taddr, wrapped, bal, slippage_pct):
                     swaps.append((info["symbol"], sh))
             except Exception as e:
                 swaps.append((info["symbol"], f"SWAP GAGAL: {e}"))
@@ -2368,17 +2832,21 @@ def discover_v2_pools(w3: Web3, chain_id: int, token: str) -> list[dict]:
             qdec = token_info(w3, q)["decimals"]
             qusd = quote_usd_price(w3, chain_id, qsym)
             tvl = rq / 10 ** qdec * qusd * 2
-            if tvl < 10:  # pair dust — harga tidak bisa dipercaya
-                continue
-            # round-trip lokal $100: pair yang tidak bisa serap swap kecil = dust/manipulasi
+            # Tidak ada ambang TVL minimum: pool kecil pun tetap ditampilkan (ditandai
+            # "thin" untuk UI). Gerbang keamanannya adalah probe round-trip di bawah —
+            # itu yang menangkal pool dust/harga dimanipulasi, bukan angka TVL.
+            # round-trip lokal $100: pair yang tidak bisa serap swap kecil = dust/manipulasi.
+            # Konstanta fee ikut router chain ini (Uniswap 997/1000, Pancake 9975/10000).
+            num, den = cfg.get("v2_swap_num", 997), cfg.get("v2_swap_den", 1000)
             probe = int(min(100 / qusd if qusd else 0, rq / 10 ** qdec / 100 or 1) * 10 ** qdec) or 1
-            o1 = probe * 997 * rm // (rq * 1000 + probe * 997)
-            back = o1 * 997 * rq // (rm * 1000 + o1 * 997)
+            o1 = probe * num * rm // (rq * den + probe * num)
+            back = o1 * num * rq // (rm * den + o1 * num)
             if back < probe * 70 // 100:
                 continue
             t0, t1 = sorted([token, q])
             out.append({
-                "ver": 2, "pool": pair, "fee": 3000, "quote_sym": qsym, "quote_addr": q,
+                "ver": 2, "pool": pair, "fee": cfg.get("v2_fee", 3000),
+                "quote_sym": qsym, "quote_addr": q,
                 "quote_decimals": qdec, "quote_usd": qusd,
                 "tick": None, "sqrtp": None, "liquidity": None,
                 "reserve_quote": rq, "reserve_meme": rm,
@@ -2442,17 +2910,38 @@ def mint_v2(chain_id: int, pk: str, pool_info: dict, budget: float, slippage_pct
 
     rq, rm = _v2_pair_reserves(w3, pair, quote)  # fresh setelah swap
     meme_need = quote_keep * rm // rq
+    if meme_have < meme_need:
+        # Meme yang benar-benar dipegang lebih sedikit dari yang dituntut rasio pool
+        # (fee + price impact swap, atau reserve bergerak sesudahnya). Router memakai
+        # sisi yang paling membatasi, jadi sisi quote HARUS ikut diturunkan — kalau
+        # tidak, amountAOptimal jatuh di bawah amountAMin dan router menolak dengan
+        # INSUFFICIENT_A_AMOUNT.
+        quote_keep = meme_have * rq // rm
+        meme_need = meme_have
+        if quote_keep <= 0:
+            raise RuntimeError("Sisi meme terlalu kecil untuk dipasangkan — coba amount lebih besar.")
     meme_desired = min(meme_have, meme_need + meme_need // 100 + 1)
     a_min = int(quote_keep * slip)
     b_min = int(min(meme_need, meme_desired) * slip)
     steps += ensure_approval(w3, pk, quote, router_addr, quote_keep)
     steps += ensure_approval(w3, pk, meme, router_addr, meme_desired)
+    lp_before = erc20(w3, pair).functions.balanceOf(account.address).call()
     data = calldata(router.functions.addLiquidity(
         quote, meme, quote_keep, meme_desired, a_min, b_min, account.address, deadline))
     _preflight(w3, account.address, {"to": router_addr, "data": data})
     h = send_tx(w3, pk, {"to": router_addr, "data": data})
     receipt = wait_ok(w3, h, "addLiquidity v2")
     steps.append(("addLiquidity", h))
+
+    # Patokan fee: √k per LP saat masuk. Disimpan pemanggil (registry) supaya nanti
+    # bisa dihitung berapa fee yang sudah mengendap ke dalam posisi.
+    lp_after = poll_balance(w3, pair, account.address, lp_before + 1)
+    try:
+        nrq, nrm = _v2_pair_reserves(w3, pair, quote)
+        ntot = erc20(w3, pair).functions.totalSupply().call()
+        k_per_lp = math.sqrt(nrq * nrm) / ntot if ntot else 0.0
+    except Exception:
+        k_per_lp = 0.0
 
     qusd = pool_info["quote_usd"]
     amts = _v2_event_amounts(receipt, pair, V2_MINT_TOPIC)
@@ -2465,7 +2954,8 @@ def mint_v2(chain_id: int, pk: str, pool_info: dict, budget: float, slippage_pct
     deposited_usd = (q_amt + m_in_q) / 10 ** qdec * qusd
     return {"steps": steps, "pair": pair, "deposited_usd": deposited_usd,
             "quote_in": q_amt / 10 ** qdec, "meme_in": m_amt / 10 ** minfo["decimals"],
-            "quote_sym": pool_info["quote_sym"], "meme_sym": minfo["symbol"]}
+            "quote_sym": pool_info["quote_sym"], "meme_sym": minfo["symbol"],
+            "k_per_lp": k_per_lp, "lp_before": lp_before, "lp_after": lp_after}
 
 
 def _v2_position_detail(w3: Web3, chain_id: int, pair_addr: str, account_addr: str) -> dict | None:
@@ -2482,30 +2972,31 @@ def _v2_position_detail(w3: Web3, chain_id: int, pair_addr: str, account_addr: s
         i0, i1 = token_info(w3, t0), token_info(w3, t1)
         a0, a1 = r0 * lp // total, r1 * lp // total
 
-        quotes_lc = {a.lower(): s for s, a in cfg["quotes"].items()}
-        if t1.lower() in quotes_lc:
-            qsym, q_is_t1 = quotes_lc[t1.lower()], True
-        elif t0.lower() in quotes_lc:
-            qsym, q_is_t1 = quotes_lc[t0.lower()], False
-        else:
-            return None
+        qsym, q_is_t1 = resolve_quote_side(w3, chain_id, t0, t1, i0["symbol"], i1["symbol"])
+        if not qsym:
+            return None       # kedua sisi tak bisa dihargai — nilai posisi mustahil dihitung
         qusd = quote_usd_price(w3, chain_id, qsym)
         rq, rm = (r1, r0) if q_is_t1 else (r0, r1)
         aq, am = (a1, a0) if q_is_t1 else (a0, a1)
         qdec = (i1 if q_is_t1 else i0)["decimals"]
         usd_q = aq / 10 ** qdec * qusd
         usd_m = (am * rq // rm) / 10 ** qdec * qusd if rm else 0
+        # √k per LP token: patokan fee v2. Perdagangan menggeser harga tanpa mengubah
+        # angka ini — yang menaikkannya HANYA fee yang mengendap di reserve. Jadi
+        # selisihnya terhadap nilai saat mint = fee yang sudah kamu kumpulkan.
+        k_per_lp = (math.sqrt(r0 * r1) / total) if total else 0.0
         usd0, usd1 = (usd_m, usd_q) if q_is_t1 else (usd_q, usd_m)
         return {
             "ver": 2, "pid": f"v2:{pair.lower()}", "token_id": f"v2:{pair.lower()}",
             "token0": t0, "token1": t1, "sym0": i0["symbol"], "sym1": i1["symbol"],
-            "dec0": i0["decimals"], "dec1": i1["decimals"], "fee": 3000, "pool": pair,
+            "dec0": i0["decimals"], "dec1": i1["decimals"],
+            "fee": CHAINS[chain_id].get("v2_fee", 3000), "pool": pair,
             "tick_lower": None, "tick_upper": None, "cur_tick": None,
             "liquidity": lp, "amount0": a0 / 10 ** i0["decimals"], "amount1": a1 / 10 ** i1["decimals"],
             "fees0": 0.0, "fees1": 0.0, "in_range": True,
             "value_usd": usd0 + usd1, "unclaimed_usd": 0.0,
             "usd0": usd0, "usd1": usd1, "fees_usd0": 0.0, "fees_usd1": 0.0,
-            "quote_sym": qsym, "quote_is_token1": q_is_t1,
+            "quote_sym": qsym, "quote_is_token1": q_is_t1, "k_per_lp": k_per_lp,
             "mc_lower": None, "mc_upper": None, "mc_now": None,
         }
     except Exception:
@@ -2553,30 +3044,67 @@ def reduce_v2(chain_id: int, pk: str, pair_addr: str, pct: int, slippage_pct: fl
     if autoswap:
         wrapped = Web3.to_checksum_address(cfg["wrapped"])
         quotes_lc = {a.lower() for a in cfg["quotes"].values()}
-        for taddr, info in ((t0, i0), (t1, i1)):
+
+        def v2_swap(taddr, path, bal):
+            est = router.functions.getAmountsOut(bal, path).call()[-1]
+            if est <= 0:
+                raise RuntimeError("getAmountsOut 0")
+            ensure_approval(w3, pk, taddr, router_addr, bal)
+            sdata = calldata(router.functions.swapExactTokensForTokens(
+                bal, int(est * slip), path, account.address, int(time.time()) + DEADLINE_SECS))
+            _preflight(w3, account.address, {"to": router_addr, "data": sdata})
+            sh = send_tx(w3, pk, {"to": router_addr, "data": sdata})
+            wait_ok(w3, sh, "swap v2")
+            return sh
+
+        def has_v3_route(a):
+            try:
+                return swap_route(w3, chain_id, a, wrapped) is not None
+            except Exception:
+                return False
+
+        # Urutan penting: sisi yang TIDAK punya rute ke wrapped dikerjakan duluan supaya
+        # bisa dikonversi ke sisi lawannya, lalu sisi lawan itu yang dijual ke wrapped.
+        # Kasus nyata: pair RTX/NVDAB — RTX cuma ada di pair ini, NVDAB cuma punya
+        # pool v3 ke USDT. Tanpa urutan ini, keduanya gagal dijual.
+        sides = sorted(((t0, i0), (t1, i1)),
+                       key=lambda s: has_v3_route(Web3.to_checksum_address(s[0])))
+        for taddr, info in sides:
             if taddr.lower() == wrapped.lower():
                 continue
+            taddr = Web3.to_checksum_address(taddr)
             bal = erc20(w3, taddr).functions.balanceOf(account.address).call()
             if bal == 0:
                 continue
-            # path langsung ke wrapped, atau lewat quote pair-nya
-            other = t1 if taddr == t0 else t0
-            path = [Web3.to_checksum_address(taddr), wrapped]
+            other = Web3.to_checksum_address(t1 if taddr == Web3.to_checksum_address(t0) else t0)
+            err = None
+            # 1) rute v2: langsung ke wrapped, atau lewat sisi lawan pair ini
+            path = [taddr, wrapped]
             if taddr.lower() not in quotes_lc and other.lower() != wrapped.lower():
-                path = [Web3.to_checksum_address(taddr), Web3.to_checksum_address(other), wrapped]
+                path = [taddr, other, wrapped]
             try:
-                est = router.functions.getAmountsOut(bal, path).call()[-1]
-                if est <= 0:
-                    continue
-                ensure_approval(w3, pk, taddr, router_addr, bal)
-                sdata = calldata(router.functions.swapExactTokensForTokens(
-                    bal, int(est * slip), path, account.address, int(time.time()) + DEADLINE_SECS))
-                _preflight(w3, account.address, {"to": router_addr, "data": sdata})
-                sh = send_tx(w3, pk, {"to": router_addr, "data": sdata})
-                wait_ok(w3, sh, "swap v2")
-                swaps.append((info["symbol"], sh))
+                swaps.append((info["symbol"], v2_swap(taddr, path, bal)))
+                continue
             except Exception as e:
-                swaps.append((info["symbol"], f"SWAP GAGAL: {e}"))
+                err = e
+            # 2) rute v3 (langsung / 2-hop lewat stable) — dipakai saat sisi ini tidak
+            #    punya pair v2 ke wrapped, mis. quote auto-deteksi yang cuma ada di v3
+            try:
+                hs = swap_any(chain_id, pk, taddr, wrapped, bal, slippage_pct)
+                if hs:
+                    swaps += [(info["symbol"], h) for _l, h in hs]
+                    continue
+            except Exception as e:
+                err = e
+            # 3) terakhir: jual ke sisi lawan lewat pair ini sendiri — sisi lawan yang
+            #    punya rute ke wrapped akan menjualnya di iterasi berikutnya
+            if other.lower() != wrapped.lower():
+                try:
+                    swaps.append((info["symbol"], v2_swap(taddr, [taddr, other], bal)))
+                    continue
+                except Exception as e:
+                    err = e
+            swaps.append((info["symbol"], f"SWAP GAGAL: {err}"))
 
     return {"steps": steps, "swaps": swaps,
             "got0": amts[0] / 10 ** i0["decimals"], "got1": amts[1] / 10 ** i1["decimals"],
@@ -2709,7 +3237,7 @@ def discover_v4_pools(w3: Web3, chain_id: int, token: str) -> list[dict]:
                 else:
                     q_virt = liq * Q96 // sqrtp if sqrtp else 0
                 tvl = q_virt / 10 ** qinfo["decimals"] * qusd * 2
-                if tvl < 10:
+                if tvl <= 0:
                     continue
                 # probe $100 (atau 1% reserve virtual) round-trip — buang pool beracun
                 probe = int(min(100 / qusd if qusd else 0, q_virt / 10 ** qinfo["decimals"] / 100 or 1)
@@ -2819,7 +3347,7 @@ def _v4_ensure_funds(w3: Web3, chain_id: int, pk: str, currency: str, need_wei: 
     if currency.lower() == V4_NATIVE:
         account = w3.eth.account.from_key(pk)
         bal = w3.eth.get_balance(account.address)
-        gas_reserve = w3.to_wei("0.0005", "ether")
+        gas_reserve = gas_reserve_wei(chain_id, w3)
         if bal < need_wei + gas_reserve:
             raise RuntimeError(
                 f"Saldo native kurang: punya {bal / 1e18:.6f}, butuh {need_wei / 1e18:.6f} + gas")

@@ -1,8 +1,12 @@
 # unipool
 
-Bot Telegram **+ UI web** untuk farming fee LP **Uniswap V2 + V3 + V4** di **Robinhood Chain** (chain id 4663) dan **BSC** (chain id 56).
+Bot Telegram **+ UI web** untuk farming fee LP concentrated liquidity:
+**Uniswap V2 + V3 + V4** di **Robinhood Chain** (chain id 4663) dan
+**PancakeSwap V2 + V3** di **BSC** (chain id 56).
 
-Paste alamat token → cari pool (v2/v3/v4 sekaligus) → pilih strategi → mint posisi LP. Pantau lewat `/list` (PnL, fee, chart), tutup posisi satu tombol dengan auto-swap. Semua data dibaca langsung dari blockchain — tidak bergantung UI Uniswap yang sering gagal fetch harga.
+Paste alamat token → cari pool (semua versi sekaligus) → pilih strategi → mint posisi LP. Pantau lewat `/list` (PnL, fee, chart), tutup posisi satu tombol dengan auto-swap. Semua data dibaca langsung dari blockchain — tidak bergantung UI DEX yang sering gagal fetch harga.
+
+DEX-nya mengikuti chain aktif: **Robinhood → Uniswap** (v2/v3/v4), **BSC → PancakeSwap** (v2/v3). Ganti dengan `/chain 56`. PancakeSwap tidak punya kontrak yang kompatibel dengan Uniswap V4 (padanannya "Infinity", arsitektur berbeda total), jadi jalur v4 otomatis mati di BSC.
 
 Dua antarmuka, satu mesin (`chain.py`) — bisa dipakai bergantian, riwayat PnL-nya sama:
 
@@ -15,9 +19,10 @@ Dua antarmuka, satu mesin (`chain.py`) — bisa dipakai bergantian, riwayat PnL-
 
 ## Fitur
 
-- 🔍 **Auto pool discovery v2/v3/v4** — scan semua fee tier (0.01%–1%) × semua quote (WETH/USDG di Robinhood, WBNB/USDT/USDC di BSC), termasuk pool v4 ber-quote **ETH native**, urut TVL dengan label [v2]/[v3]/[v4]
-- 🧬 **Uniswap V4** — mint/add/reduce/collect/close via PositionManager + Permit2 (approval dibatasi: jumlah pas + kedaluwarsa 1 jam), swap via UniversalRouter; pool ber-hook dilewati (vanilla saja)
-- 💧 **Uniswap V2** — add liquidity full-range 50/50 (swap otomatis setengah budget), reduce/close via router; fee 0.3% auto-compound ke posisi
+- 🔍 **Auto pool discovery** — scan semua fee tier × semua quote (WETH/USDG di Robinhood, WBNB/USDT/USDC di BSC), urut TVL dengan label [v2]/[v3]/[v4]. Fee tier ikut DEX-nya: Uniswap 0.01/0.05/0.3/1%, PancakeSwap 0.01/0.05/**0.25**/1%
+- 🧩 **Quote apa pun** — pool yang pasangannya bukan WBNB/stable (mis. `RTX/NVDAB`, `CAKE/BTCB`) ikut ketemu: token lawan diverifikasi punya likuiditas on-chain, dihargai USD sendiri, dan modal masuk/keluar otomatis lewat swap 2 langkah. Pool kecil tidak lagi disembunyikan — cuma ditandai ⚠️ TVL tipis
+- 🧬 **Uniswap V4** (Robinhood saja) — mint/add/reduce/collect/close via PositionManager + Permit2 (approval dibatasi: jumlah pas + kedaluwarsa 1 jam), swap via UniversalRouter; pool ber-hook dilewati (vanilla saja)
+- 💧 **V2** — add liquidity full-range 50/50 (swap otomatis setengah budget), reduce/close via router; fee auto-compound ke posisi (Uniswap 0.3%, PancakeSwap 0.25%)
 - 🛡️ **Anti pool beracun** — probe swap bolak-balik ~$100 (Quoter v4 / matematika reserves v2): pool dust atau harga dimanipulasi dibuang dari daftar; semua alamat kontrak v2/v4 diverifikasi silang on-chain sebelum tx pertama (fail-closed)
 - 🎯 **4 strategi range**: Stable (±6%), Wide (dua sisi), Lower (setor quote saja, nampung kalau harga turun), Upper (setor token saja, jual bertahap kalau naik) + rekomendasi otomatis
 - ✏️ **Custom range** via persen atau **market cap** (`mc 300k 800k`), custom amount (persen saldo / nilai pasti)
@@ -257,6 +262,7 @@ port-forward yang sama, tapi ribet — Tailscale jauh lebih enak untuk ponsel.
 - Pool v4 dengan **hooks** sengaja tidak didukung — hook bisa berisi kode arbitrer (risiko rug).
 - Posisi v4 dan LP v2 dicatat di `history.json` lokal (registry) — jangan hapus file itu selama masih ada posisi terbuka; posisi tetap aman on-chain, tapi bot tidak bisa menampilkannya lagi tanpa registry (v4 PositionManager tidak bisa di-enumerate).
 - LP memecoin berisiko tinggi: fee tidak menutup rugi kalau harga token jatuh permanen (impermanent loss). Anggap sebagai beli token diskon sambil dibayar menunggu — bukan mesin uang pasif.
+- **Pool ber-quote non-standar** (mis. `RTX/NVDAB`): kedua sisi memecoin, jadi nilai USD & PnL ikut naik-turun harga quote-nya juga, dan modal masuk/keluar bayar fee + slippage dua kali (swap 2 langkah). Bot menandainya ⚠️ di kartu konfirmasi.
 - Private key tersimpan plaintext di `.env` pada mesin yang menjalankan bot. Amankan mesinnya.
 
 ## Struktur kode
