@@ -553,6 +553,8 @@ def _forced_ip_w3(rpc_url: str) -> Web3 | None:
 # ---------- Koneksi & util dasar ----------
 _W3_CACHE: dict[int, tuple[Web3, float]] = {}
 _NONCE_NEXT: dict[str, int] = {}  # alamat → nonce berikutnya (pelacak lokal utk tx beruntun)
+_LAST_TX: dict[str, str] = {}     # alamat → hash tx terakhir yang kita siarkan
+_LAST_RAW: dict[str, bytes] = {}  # hash → raw signed tx, untuk siar ulang kalau hilang
 
 
 def get_w3(chain_id: int, fresh: bool = False) -> Web3:
@@ -615,6 +617,16 @@ def token_info(w3: Web3, addr: str) -> dict:
     return info
 
 
+def _tx_known(w3: Web3, txhash: str | None) -> bool:
+    """True kalau node masih mengenal tx ini (pending maupun sudah ter-mine)."""
+    if not txhash:
+        return False
+    try:
+        return w3.eth.get_transaction(txhash) is not None
+    except Exception:
+        return False
+
+
 def send_tx(w3: Web3, pk: str, tx: dict) -> str:
     account = w3.eth.account.from_key(pk)
     tx["to"] = Web3.to_checksum_address(tx["to"])
@@ -651,13 +663,28 @@ def send_tx(w3: Web3, pk: str, tx: dict) -> str:
     addr_lc = account.address.lower()
     for attempt in range(5):
         rpc_n = w3.eth.get_transaction_count(account.address, "pending")
-        n = max(rpc_n, min(_NONCE_NEXT.get(addr_lc, 0), rpc_n + 3))
+        # Pelacak lokal hanya boleh mendahului RPC kalau tx terakhir kita MEMANG masih
+        # dikenal node. Kalau tx itu sudah hilang (di-drop mempool / tidak
+        # terpropagasi), mendahului = membuat LUBANG nonce, dan tx ini beserta semua
+        # tx sesudahnya tidak akan pernah bisa di-mine.
+        n = rpc_n
+        tracked = _NONCE_NEXT.get(addr_lc, 0)
+        if tracked > rpc_n:
+            if _tx_known(w3, _LAST_TX.get(addr_lc)):
+                n = min(tracked, rpc_n + 3)
+            else:
+                _NONCE_NEXT.pop(addr_lc, None)
         tx["nonce"] = n
         signed = w3.eth.account.sign_transaction(tx, pk)
         try:
             h = w3.eth.send_raw_transaction(signed.raw_transaction)
             _NONCE_NEXT[addr_lc] = n + 1
-            return "0x" + h.hex().removeprefix("0x")
+            hh = "0x" + h.hex().removeprefix("0x")
+            _LAST_TX[addr_lc] = hh
+            if len(_LAST_RAW) > 50:
+                _LAST_RAW.clear()
+            _LAST_RAW[hh] = signed.raw_transaction
+            return hh
         except Exception as e:
             s = str(e).lower()
             if "already known" in s or "already exists" in s or "known transaction" in s:
@@ -695,7 +722,30 @@ def poll_balance(w3: Web3, token: str, addr: str, min_expected: int,
 
 
 def wait_ok(w3: Web3, txhash: str, what: str):
-    r = w3.eth.wait_for_transaction_receipt(txhash, timeout=180)
+    try:
+        r = w3.eth.wait_for_transaction_receipt(txhash, timeout=90)
+    except Exception:
+        # Tidak masuk blok dalam 90 detik. Penyebab paling lazim BUKAN gas kurang,
+        # melainkan tx hilang dari mempool: node penerima tidak mempropagasikannya,
+        # atau kena eviction. Siarkan ulang raw tx yang sama persis (nonce & tanda
+        # tangan identik, jadi tidak mungkin dobel) lalu tunggu sekali lagi.
+        raw = _LAST_RAW.get(txhash)
+        if raw is not None:
+            try:
+                w3.eth.send_raw_transaction(raw)
+            except Exception:
+                pass                      # "already known" dsb — tidak apa-apa
+        try:
+            r = w3.eth.wait_for_transaction_receipt(txhash, timeout=90)
+        except Exception:
+            # Menyerah. WAJIB reset pelacak nonce: kalau tidak, tx berikutnya lahir
+            # dengan lubang nonce dan ikut mati satu per satu.
+            _NONCE_NEXT.clear()
+            _LAST_TX.clear()
+            raise RuntimeError(
+                f"Tx {what} tidak masuk chain setelah 180 detik dan sudah disiarkan "
+                f"ulang — kemungkinan besar dibuang mempool RPC. Tidak ada dana yang "
+                f"berpindah di langkah ini; ulangi saja. ({txhash})")
     if r.status != 1:
         hint = ""
         try:
