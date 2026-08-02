@@ -189,7 +189,25 @@ paramnya `tokenAddress` bukan `search`. Tidak terdokumentasi di swagger publik;
 ditemukan dari bundel JS defi.krystal.app. Fragile — semua pemanggilnya harus tetap
 jalan kalau API-nya mati, dan angkanya tidak pernah jadi dasar membangun transaksi.
 
-### Saringan pool yang ditampilkan
+### Krystal sebagai sumber utama daftar pool
+
+`discover_any()` mencoba `discover_krystal()` DULU (<1 detik, angkanya sama dengan yang
+dilihat user di web Krystal). Kalau token itu ada di Krystal, daftar yang ditampilkan =
+daftar Krystal, titik — tidak disaring ulang oleh `_drop_dead_pools`/`_drop_offprice_pools`
+(daftar mereka sudah tersaring ≥$1K TVL). Harga menyimpang cuma DITANDAI
+(`p["deviation"]`), tidak dibuang.
+
+Kalau Krystal tidak punya token itu (pair aneh: RTX/NVDAB, HOUSE/BTCB) barulah discovery
+sendiri jalan — dengan seluruh saringannya. `res["source"]` menyebut jalur mana yang dipakai.
+
+Tetap berlaku: data Krystal **tidak pernah** otoritatif untuk transaksi. Tiap pool
+diverifikasi on-chain di `discover_krystal()` — v2/v3 dicek ke factory DEX-nya,
+v4 lewat `_v4_key_from_krystal()` yang menyusun PoolKey lalu membuktikannya dengan
+hash (`v4_pool_id(key) == poolId`). Krystal tidak mengirim `tickSpacing`, jadi nilainya
+dicoba dari pola **spacing ≈ fee/50** (fee 40000→800, 18888→378) + tier klasik;
+yang diterima hanya yang hash-nya cocok.
+
+### Saringan pool yang ditampilkan (jalur discovery sendiri)
 
 Berlapis, urutannya penting (semua di ujung `discover_any()`):
 

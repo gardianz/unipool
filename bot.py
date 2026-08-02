@@ -580,8 +580,9 @@ async def on_address(update: Update, _):
         ver = p.get("ver", 3)
         # tanda DEX cuma muncul di chain ber-DEX ganda (BSC: P=PancakeSwap, U=Uniswap)
         dtag = (p.get("dex") or "")[:1] if len(ch.dex_names(cid)) > 1 else ""
+        warn = "!" if p.get("deviation") else ""
         rows.append(
-            f"{i:>2} {f'v{ver}{dtag} ' + p['quote_sym'][:5]:<7} {p['fee'] / 10000:>5.2f}% "
+            f"{i:>2} {f'v{ver}{dtag}{warn} ' + p['quote_sym'][:5]:<7} {p['fee'] / 10000:>5.2f}% "
             f"{fmt_short(p['tvl_usd']):>6} {fmt_pct_short(p.get('apr_pct')):>5} "
             f"{fmt_short(p.get('vol24_usd')):>5} {fmt_short(v30):>5}")
         buttons.append([InlineKeyboardButton(
@@ -604,7 +605,7 @@ async def on_address(update: Update, _):
                     f"yang dipakai menyeret harganya balik ke pasar.")
     text = (f"Found {len(pools)} pool(s) untuk <b>{esc(tsym)}</b> ({_t.time() - t0:.1f}s):\n"
             f"<pre>{esc(chr(10).join(rows))}</pre>\n"
-            f"<i>P=PancakeSwap · U=Uniswap · TVL/volume USD · APR estimasi · vol dari dexscreener &amp; GeckoTerminal "
+            f"<i>P=PancakeSwap · U=Uniswap · ! = harga menyimpang · TVL/volume USD · APR estimasi · vol dari dexscreener &amp; GeckoTerminal "
             f"(– = pool belum terindeks)</i>{off_line}\n\nPilih pool:")
     await edit(status, text, InlineKeyboardMarkup(buttons))
 
@@ -704,6 +705,11 @@ def pool_warnings(cid: int, p: dict) -> str:
             f"swap 2 langkah (fee &amp; slippage dobel).")
     if p.get("thin"):
         lines.append("⚠️ TVL pool sangat kecil — slippage besar dan harga gampang digeser.")
+    if p.get("deviation"):
+        lines.append(
+            f"⚠️ Harga pool ini <b>{p['deviation'] * 100:+.0f}%</b> dari pool terdalam. "
+            f"Pool begitu tidak terarbitrase — LP di situ = modalmu yang dipakai "
+            f"menyeret harganya balik ke pasar.")
     return ("\n\n" + "\n".join(lines)) if lines else ""
 
 

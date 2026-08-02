@@ -548,6 +548,7 @@ function renderDeposit(p) {
     rows.push(`⚠️ Quote pool ini <b>${t.quote_sym}</b>, bukan wrapped/stable — nilai USD & PnL ikut harga ${t.quote_sym}, modal masuk/keluar lewat swap 2 langkah.`);
   }
   if (t.thin) rows.push('⚠️ TVL pool sangat kecil — slippage besar, harga gampang digeser.');
+  if (t.deviation) rows.push(`⚠️ Harga pool ini <b>${(t.deviation*100).toFixed(0)}%</b> dari pool terdalam — pool tak terarbitrase, modalmu yang menyeret harganya balik.`);
   if (p.ver === 2) {
     rows.push(`LP v2 full range 50/50 — fee ${(t.fee_pct ?? 0.3).toFixed(2)}% auto-compound.`);
   } else {
@@ -685,7 +686,7 @@ async function discover() {
         <div><b>${r.token.symbol} / ${p.quote_sym}</b>${p.dex ? ` <span class="dim" style="font-size:11px">${p.dex}</span>` : ''}
           <div class="dim" style="font-size:11px">fee ${p.fee_pct.toFixed(2)}%${
             p.foreign_quote ? ` · <span title="Quote pool ini bukan ${S.dex === 'PancakeSwap' ? 'WBNB' : 'WETH'}/stable — nilai USD ikut harga ${p.quote_sym}, masuk/keluar lewat swap 2 langkah">⚠ quote ${p.quote_sym}</span>` : ''
-          }${p.thin ? ' · <span title="TVL sangat kecil — slippage besar, harga gampang digeser">⚠ TVL tipis</span>' : ''}</div></div>
+          }${p.thin ? ' · <span title="TVL sangat kecil — slippage besar, harga gampang digeser">⚠ TVL tipis</span>' : ''}${p.deviation ? ` · <span title="Harga pool ini menyimpang dari pool terdalam; pool begitu tidak terarbitrase">⚠ harga ${(p.deviation*100).toFixed(0)}%</span>` : ''}</div></div>
         <div class="cell"><small>TVL</small>${usd(p.tvl_usd)}</div>
         <div class="cell"><small>Vol 24H</small>${usd(p.vol24_usd)}</div>
         <div class="cell"><small>APR</small>${p.apr_pct ? nf(p.apr_pct, 1) + '%' : '—'}</div>

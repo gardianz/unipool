@@ -298,7 +298,7 @@ def api_discover(_q, b) -> dict:
             "quote_usd": p["quote_usd"],
             # quote di luar daftar tetap & pool bernilai kecil: klien menampilkan peringatan
             "foreign_quote": bool(p.get("foreign_quote")), "thin": bool(p.get("thin")),
-            "dex": p.get("dex"),
+            "dex": p.get("dex"), "deviation": p.get("deviation"),
         })
     off = res.get("dropped_offprice") or []
     return {"token": res["token"], "pools": out,
@@ -340,7 +340,7 @@ def api_pool(_q, b) -> dict:
         "mc_usd": price * p["quote_usd"] * supply if supply else None,
         "supply": supply,
         "foreign_quote": bool(p.get("foreign_quote")), "thin": bool(p.get("thin")),
-        "dex": p.get("dex"),
+        "dex": p.get("dex"), "deviation": p.get("deviation"),
     }
 
 

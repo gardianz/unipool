@@ -1202,35 +1202,204 @@ def _fill_missing_sqrtp(chain_id: int, pools: list, limit: int = 12) -> None:
 _KRYSTAL_POOLS = "https://api.krystal.app/all/v2/lp_explorer/top_pools"
 
 
-def krystal_pools(chain_id: int, token: str, _cache={}, ttl: int = 120) -> dict:
-    """{pool_address_lower: {tvl_usd, vol24_usd, apr_pct}} dari API Krystal.
-    Dict kosong kalau gagal — pemanggil harus tetap jalan tanpa ini.
+_KRYSTAL_PROTO = {          # protocol Krystal → (DEX kita, versi pool)
+    "pancakev2": ("PancakeSwap", 2), "pancakev3": ("PancakeSwap", 3),
+    "uniswapv2": ("Uniswap", 2), "uniswapv3": ("Uniswap", 3), "uniswapv4": ("Uniswap", 4),
+}
 
-    Berguna khusus untuk pool v4: saldo per-pool tidak bisa dibaca on-chain
-    (semua currency ditahan satu PoolManager), jadi tanpa sumber luar TVL-nya
-    cuma tebakan indexer yang terbukti meleset (kita $43,4k vs nyata $2,3k)."""
+
+def krystal_raw(chain_id: int, token: str, _cache={}, ttl: int = 120) -> list:
+    """Entri mentah dari API Krystal. List kosong kalau gagal / chain tak dilayani —
+    pemanggil WAJIB tetap jalan tanpa ini."""
     key = (chain_id, str(token).lower())
     hit = _cache.get(key)
     if hit and time.time() - hit[1] < ttl:
         return hit[0]
-    out = {}
     try:
         r = requests.get(_KRYSTAL_POOLS, timeout=8, headers={"accept": "application/json"},
                          params={"chainId": chain_id, "tokenAddress": str(token).lower()})
-        for p in (r.json().get("result") or []):
-            s = p.get("stat24h") or {}
-            addr = str(p.get("poolAddress") or "").lower()
-            if not addr:
-                continue
-            out[addr] = {
-                "tvl_usd": float(p.get("tvlUsd") or 0),
-                "vol24_usd": float(s.get("volumeUsd") or 0) or None,
-                "apr_pct": float(s.get("apr")) if s.get("apr") is not None else None,
-            }
+        out = r.json().get("result") or []
+        if not isinstance(out, list):
+            out = []
     except Exception:
-        return hit[0] if hit else {}
+        return hit[0] if hit else []
     _cache[key] = (out, time.time())
     return out
+
+
+def krystal_pools(chain_id: int, token: str) -> dict:
+    """{pool_address_lower: {tvl_usd, vol24_usd, apr_pct}} — angka tampilan saja."""
+    out = {}
+    for p in krystal_raw(chain_id, token):
+        s = p.get("stat24h") or {}
+        addr = str(p.get("poolAddress") or "").lower()
+        if not addr:
+            continue
+        out[addr] = {
+            "tvl_usd": float(p.get("tvlUsd") or 0),
+            "vol24_usd": float(s.get("volumeUsd") or 0) or None,
+            "apr_pct": float(s.get("apr")) if s.get("apr") is not None else None,
+        }
+    return out
+
+
+# Pool v4 fee bebas memakai spacing bebas, tapi polanya konsisten: spacing ≈ fee/50
+# (fee 40000→800, 12500→250, 18888→378). Tier klasik tetap dicoba juga.
+_V4_SPACING_FIXED = (1, 10, 50, 60, 200)
+
+
+def _spacing_candidates(fee: int) -> list[int]:
+    base = fee / 50
+    cands = {int(round(base)), int(base), int(base) + 1, *_V4_SPACING_FIXED,
+             *(s for f, s in V4_FEE_SPACINGS if f == fee)}
+    return [s for s in sorted(cands) if 1 <= s <= 32767]
+
+
+def _v4_key_from_krystal(entry: dict, pool_id_hex: str) -> tuple | None:
+    """Susun PoolKey v4 dari data Krystal, dibuktikan lewat hash.
+
+    Krystal tidak mengirim tickSpacing, jadi nilainya dicoba satu per satu dan
+    diterima HANYA kalau v4_pool_id(key) == poolId yang mereka sebut. Hash cocok =
+    kunci autentik (mustahil dipalsukan), jadi ini aman dipakai membangun transaksi
+    — dan tidak butuh getLogs yang sering ditolak RPC publik."""
+    try:
+        hooks = Web3.to_checksum_address(entry.get("hooks") or V4_NATIVE)
+        if int(hooks, 16) != 0:
+            return None                     # pool ber-hooks tidak didukung
+        c0, c1 = sort_tokens(Web3.to_checksum_address(entry["token0"]["address"]),
+                             Web3.to_checksum_address(entry["token1"]["address"]))
+        want = str(pool_id_hex).lower()
+        fees = []
+        if entry.get("dynamicFee"):
+            fees.append(0x800000)           # penanda fee dinamis di PoolKey
+        for f in (entry.get("lpFee"), entry.get("feeTier")):
+            if f is not None:
+                fees.append(int(round(float(f) * 10000)))
+        for fee in dict.fromkeys(fees):
+            for sp in _spacing_candidates(fee):
+                key = (c0, c1, fee, sp, hooks)
+                if "0x" + v4_pool_id(key).hex().removeprefix("0x") == want:
+                    return key
+    except Exception:
+        return None
+    return None
+
+
+def discover_krystal(chain_id: int, token: str) -> list[dict]:
+    """Bangun daftar pool dari Krystal, TIAP POOL DIVERIFIKASI ON-CHAIN.
+
+    Krystal cepat (<1 detik) dan angkanya sama dengan yang dilihat user di web
+    mereka, tapi tetap data luar: alamat pool wajib cocok dengan factory DEX
+    on-chain (v2/v3) atau PoolKey wajib menghasilkan poolId yang sama (v4)
+    sebelum boleh dipakai membangun transaksi.
+
+    List kosong = token tidak ada di Krystal → caller pakai discovery sendiri."""
+    raw = krystal_raw(chain_id, token)
+    if not raw:
+        return []
+    w3 = get_w3(chain_id)
+    token = Web3.to_checksum_address(token)
+    tl = token.lower()
+    quotes_lc = {a.lower(): s for s, a in CHAINS[chain_id]["quotes"].items()}
+
+    def build(entry):
+        try:
+            dname, ver = _KRYSTAL_PROTO.get(str(entry.get("protocol") or "").lower(), (None, None))
+            if not dname or dname not in dex_names(chain_id):
+                return None                      # DEX yang tidak kita dukung
+            if ver == 4 and not has_v4(chain_id, dname):
+                return None
+            addr = str(entry.get("poolAddress") or "")
+            s = entry.get("stat24h") or {}
+            stats = {"tvl_usd": float(entry.get("tvlUsd") or 0),
+                     "vol24_usd": float(s.get("volumeUsd") or 0) or None,
+                     "apr_pct": float(s.get("apr")) if s.get("apr") is not None else None,
+                     "tvl_src": "krystal", "basis": "krystal"}
+            if ver == 4:
+                # dari data Krystal dulu (tanpa RPC, dibuktikan lewat hash); log
+                # Initialize jadi cadangan karena getLogs rentang lebar sering ditolak
+                key = _v4_key_from_krystal(entry, addr) or _v4_key_from_init(w3, chain_id, addr)
+                if not key:
+                    return None
+                c0, c1 = Web3.to_checksum_address(key[0]), Web3.to_checksum_address(key[1])
+                if tl not in (c0.lower(), c1.lower()):
+                    return None
+                q = c1 if c0.lower() == tl else c0
+                qsym, qusd, qdec = _quote_meta(w3, chain_id, q, quotes_lc)
+                if qusd <= 0:
+                    return None
+                pid = v4_pool_id(key)
+                sqrtp = v4_slot0(w3, chain_id, pid)[0]
+                return {"ver": 4, "dex": dname, "pool": "0x" + pid.hex().removeprefix("0x"),
+                        "pool_id": pid, "key": key, "fee": key[2], "tick_spacing": key[3],
+                        "quote_sym": qsym, "quote_addr": q, "quote_decimals": qdec,
+                        "quote_usd": qusd, "quote_is_token1": q.lower() == c1.lower(),
+                        "token0": c0, "token1": c1, "sqrtp": sqrtp, "tick": None,
+                        "foreign_quote": q.lower() not in quotes_lc, **stats}
+            pc = w3.eth.contract(address=Web3.to_checksum_address(addr),
+                                 abi=POOL_ABI if ver == 3 else V2_PAIR_ABI)
+            t0, t1 = pc.functions.token0().call(), pc.functions.token1().call()
+            if tl not in (t0.lower(), t1.lower()):
+                return None
+            q = t1 if t0.lower() == tl else t0
+            # Krystal sudah menyebut protokolnya, jadi cukup verifikasi ke SATU
+            # factory (bukan menyisir semua DEX) — separuh panggilan RPC hemat.
+            dc = dex_cfg(chain_id, dname)
+            if ver == 3:
+                fee = pc.functions.fee().call()
+                f3 = w3.eth.contract(address=Web3.to_checksum_address(dc["factory"]),
+                                     abi=FACTORY_ABI)
+                if f3.functions.getPool(t0, t1, fee).call().lower() != addr.lower():
+                    return None                  # bukan pool factory DEX itu
+            else:
+                v2f = w3.eth.contract(address=Web3.to_checksum_address(dc["v2_factory"]),
+                                      abi=V2_FACTORY_ABI)
+                if v2f.functions.getPair(t0, t1).call().lower() != addr.lower():
+                    return None
+                fee = dc.get("v2_fee", 3000)
+            qsym, qusd, qdec = _quote_meta(w3, chain_id, q, quotes_lc)
+            if qusd <= 0:
+                return None
+            p = {"ver": ver, "dex": dname, "pool": Web3.to_checksum_address(addr), "fee": fee,
+                 "quote_sym": qsym, "quote_addr": Web3.to_checksum_address(q),
+                 "quote_decimals": qdec, "quote_usd": qusd,
+                 "token0": Web3.to_checksum_address(t0), "token1": Web3.to_checksum_address(t1),
+                 "quote_is_token1": q.lower() == t1.lower(),
+                 "foreign_quote": q.lower() not in quotes_lc, **stats}
+            if ver == 3:
+                slot0 = pc.functions.slot0().call()
+                p.update({"sqrtp": slot0[0], "tick": slot0[1],
+                          "tick_spacing": pc.functions.tickSpacing().call(),
+                          "liquidity": pc.functions.liquidity().call()})
+            else:
+                rq, rm = _v2_pair_reserves(w3, addr, q)
+                if rq <= 0 or rm <= 0:
+                    return None
+                p.update({"reserve_quote": rq, "reserve_meme": rm,
+                          "sqrtp": None, "tick": None, "liquidity": None})
+            return p
+        except Exception:
+            return None
+
+    out = []
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        for r in ex.map(build, raw[:20]):
+            if r:
+                out.append(r)
+    return out
+
+
+def _quote_meta(w3: Web3, chain_id: int, q: str, quotes_lc: dict) -> tuple[str, float, int]:
+    """(simbol, harga USD, desimal) sisi quote — quote tetap maupun auto-deteksi."""
+    ql = str(q).lower()
+    qdec = token_info(w3, Web3.to_checksum_address(q))["decimals"]
+    if ql in quotes_lc:
+        sym = quotes_lc[ql]
+        return sym, quote_usd_price(w3, chain_id, sym), qdec
+    if quote_backing_usd(w3, chain_id, q) <= 0:
+        return "?", 0.0, qdec
+    sym = register_quote(chain_id, token_info(w3, Web3.to_checksum_address(q))["symbol"], q)
+    return sym, quote_usd_price(w3, chain_id, sym), qdec
 
 
 def _fill_onchain_tvl(chain_id: int, pools: list, token: str, token_dec: int,
@@ -1360,6 +1529,39 @@ def discover_any(chain_id: int, token_addr: str) -> dict:
     termasuk v4 fee non-standar), fallback scan RPC kalau API mati / nihil.
     Terakhir ditambah pool ber-quote di luar daftar tetap (mis. RTX/NVDAB) — banyak
     memecoin cuma punya pool jenis ini, tak terjangkau scan quote biasa."""
+    # Krystal duluan: <1 detik, dan angkanya sama persis dengan yang dilihat user di
+    # web mereka. Tiap pool tetap diverifikasi on-chain di discover_krystal.
+    kr = []
+    try:
+        kr = discover_krystal(chain_id, token_addr)
+    except Exception:
+        kr = []
+    if kr:
+        try:
+            tinfo = token_info(get_w3(chain_id), Web3.to_checksum_address(token_addr))
+        except Exception:
+            tinfo = {"symbol": "?", "decimals": 18, "name": ""}
+        res = {"token": tinfo, "pools": kr, "source": "krystal"}
+        for p in res["pools"]:
+            p["thin"] = (p.get("tvl_usd") or 0) < 50
+        # Pool dari Krystal TIDAK disaring lagi (daftar mereka sudah tersaring
+        # >=$1K TVL). Harga menyimpang cuma DITANDAI, bukan dibuang, supaya isi
+        # daftarnya sama dengan web Krystal.
+        tdec = tinfo.get("decimals", 18)
+        for p in res["pools"]:
+            p["price_usd"] = _pool_price_usd(p, tdec, token_addr)
+        priced = [p for p in res["pools"] if p.get("price_usd")]
+        if len(priced) > 1:
+            ref = max(priced, key=lambda p: p.get("tvl_usd") or 0)
+            for p in priced:
+                dev = p["price_usd"] / ref["price_usd"] - 1
+                if p is not ref and abs(dev) > PRICE_DEVIATION_MAX:
+                    p["deviation"] = dev
+        res["pools"].sort(key=lambda p: p.get("tvl_usd") or 0, reverse=True)
+        res["dropped_dead"], res["dropped_offprice"] = [], []
+        return res
+
+    # Token tidak ada di Krystal (pair aneh) → discovery sendiri.
     # Indexer Uniswap menutup sisi Uniswap (termasuk pool v4 ber-fee non-standar yang
     # tak terjangkau scan tier), scan RPC menutup DEX lain. Keduanya digabung — bukan
     # salah satu — supaya di BSC pool PancakeSwap DAN Uniswap sama-sama muncul.
