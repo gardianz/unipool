@@ -158,6 +158,19 @@ def fee_tiers(chain_id: int) -> tuple:
 GAS_UNITS_FULL_FLOW = 1_500_000   # wrap + approve×3 + swap×3 + addLiquidity, token boros
 
 
+def sort_tokens(a: str, b: str) -> tuple[str, str]:
+    """Urutkan sepasang alamat token seperti kontrak melakukannya: menurut NILAI.
+
+    JANGAN pakai sorted([a, b]) untuk alamat checksum. Itu membandingkan string,
+    dan di ASCII huruf besar (A-F = 0x41-0x46) lebih kecil dari huruf kecil
+    (a-f = 0x61-0x66), sehingga urutannya bisa terbalik dari urutan numerik.
+    Contoh nyata: '0xF74548…' (memes) terbaca lebih kecil dari '0xbb4CdB…' (WBNB)
+    padahal 0xbb < 0xf7. Akibatnya quote_is_token1 terbalik, harga jadi kebalikannya,
+    dan TVL pool memes/WBNB terbaca $321 TRILIUN.
+    Aman untuk alamat yang sudah lowercase semua — tapi jangan bergantung pada itu."""
+    return (a, b) if int(a, 16) < int(b, 16) else (b, a)
+
+
 def gas_reserve_wei(chain_id: int, w3: Web3 | None = None) -> int:
     """Native yang tidak boleh ikut dipakai jadi modal — cadangan gas.
 
@@ -843,7 +856,7 @@ def quote_usd_price(w3: Web3, chain_id: int, quote_sym: str, _cache={}) -> float
     wrapped = Web3.to_checksum_address(cfg["wrapped"])
     for stable_sym in cfg["stable_syms"]:
         stable = Web3.to_checksum_address(cfg["quotes"][stable_sym])
-        t0, t1 = sorted([wrapped, stable])
+        t0, t1 = sort_tokens(wrapped, stable)
         for fee in fee_tiers(chain_id):
             pool = factory.functions.getPool(t0, t1, fee).call()
             if int(pool, 16) == 0:
@@ -1202,7 +1215,7 @@ def discover_pools(chain_id: int, token_addr: str) -> dict:
         qmeta_f = {qsym: (ex.submit(token_info, w3, q),
                           ex.submit(quote_usd_price, w3, chain_id, qsym))
                    for qsym, q in quotes}
-        addr_futs = [(c, ex.submit(factory.functions.getPool(*sorted([token, c[1]]) + [c[2]]).call))
+        addr_futs = [(c, ex.submit(factory.functions.getPool(*sort_tokens(token, c[1]), c[2]).call))
                      for c in combos]
         found = []
         for (qsym, q, fee), fut in addr_futs:
@@ -1221,7 +1234,7 @@ def discover_pools(chain_id: int, token_addr: str) -> dict:
             qdec = qmeta_f[qsym][0].result()["decimals"]
             qusd = qmeta_f[qsym][1].result()
             q_bal = erc20(w3, q).functions.balanceOf(pool_addr).call() / 10 ** qdec
-            t0, t1 = sorted([token, q])
+            t0, t1 = sort_tokens(token, q)
             q_is_t1 = q == t1
             # TVL = kedua sisi reserve (bukan sisi quote × 2). Di pool v3 likuiditas
             # sering menumpuk jauh di luar range pada sisi meme, jadi "quote × 2"
@@ -1542,7 +1555,7 @@ def discover_foreign_pools(w3: Web3, chain_id: int, token: str, skip: set,
                 back = o1 * num * rq // (rm * den + o1 * num)
                 if back < probe * 70 // 100:
                     return None   # dust / harga dimanipulasi
-                t0, t1 = sorted([token, counter])
+                t0, t1 = sort_tokens(token, counter)
                 p = {"ver": 2, "pool": addr, "fee": cfg.get("v2_fee", 3000),
                      "tick": None, "sqrtp": None, "liquidity": None,
                      "reserve_quote": rq, "reserve_meme": rm,
@@ -1565,7 +1578,7 @@ def discover_foreign_pools(w3: Web3, chain_id: int, token: str, skip: set,
                      "tick": slot0[1], "sqrtp": slot0[0],
                      "liquidity": pool.functions.liquidity().call(),
                      "tvl_usd": q_bal * qusd + m_bal * meme_in_q * qusd}
-            t0, t1 = sorted([token, counter])
+            t0, t1 = sort_tokens(token, counter)
             p.update({
                 "quote_sym": register_quote(chain_id, csym, counter),
                 "quote_addr": counter, "quote_decimals": qdec, "quote_usd": qusd,
@@ -1702,7 +1715,7 @@ def find_pool(w3: Web3, chain_id: int, a: str, b: str) -> tuple[str | None, int]
     cfg = CHAINS[chain_id]
     factory = w3.eth.contract(address=Web3.to_checksum_address(cfg["factory"]), abi=FACTORY_ABI)
     a = Web3.to_checksum_address(a)
-    t0, t1 = sorted([a, Web3.to_checksum_address(b)])
+    t0, t1 = sort_tokens(a, Web3.to_checksum_address(b))
     best, best_fee, best_bal = None, 0, -1
     for f in fee_tiers(chain_id):
         addr = factory.functions.getPool(t0, t1, f).call()
@@ -1727,7 +1740,7 @@ def wrapped_per_quote_wei(w3: Web3, chain_id: int, quote_addr: str) -> float:
     pool_addr, _ = find_pool(w3, chain_id, wrapped, quote)
     if pool_addr:
         raw = _pool_price_t1_per_t0(w3, pool_addr)  # t1-wei per t0-wei
-        t0, _ = sorted([wrapped, quote])
+        t0, _ = sort_tokens(wrapped, quote)
         return (1 / raw if raw else 0) if wrapped == t0 else raw
     q_usd = token_usd_price(w3, chain_id, quote)
     w_usd = quote_usd_price(w3, chain_id, cfg["wrapped_symbol"])
@@ -2283,7 +2296,7 @@ def quote_backing_usd(w3: Web3, chain_id: int, token: str, _cache={}) -> float:
             if qusd <= 0:
                 continue
             qdec = token_info(w3, q)["decimals"]
-            t0s, t1s = sorted([token, q])
+            t0s, t1s = sort_tokens(token, q)
             addrs = []
             for fee in fee_tiers(chain_id):
                 a = f3.functions.getPool(t0s, t1s, fee).call()
@@ -2453,7 +2466,7 @@ def token_usd_price(w3: Web3, chain_id: int, token_addr: str, _cache={}) -> floa
             break
         qd = token_info(w3, q)["decimals"]
         qusd = quote_usd_price(w3, chain_id, qsym)
-        t0, t1 = sorted([token, q])
+        t0, t1 = sort_tokens(token, q)
         for fee in fee_tiers(chain_id):
             pool = factory.functions.getPool(t0, t1, fee).call()
             if int(pool, 16) == 0:
@@ -2738,7 +2751,7 @@ def swap_to_token(chain_id: int, pk: str, token_in: str, token_out: str, fee: in
     token_out = Web3.to_checksum_address(token_out)
 
     factory = w3.eth.contract(address=Web3.to_checksum_address(cfg["factory"]), abi=FACTORY_ABI)
-    t0, t1 = sorted([token_in, token_out])
+    t0, t1 = sort_tokens(token_in, token_out)
     pool_addr = factory.functions.getPool(t0, t1, fee).call()
     if int(pool_addr, 16) == 0:
         for f in fee_tiers(chain_id):
@@ -3053,7 +3066,7 @@ def discover_v2_pools(w3: Web3, chain_id: int, token: str) -> list[dict]:
             back = o1 * num * rq // (rm * den + o1 * num)
             if back < probe * 70 // 100:
                 continue
-            t0, t1 = sorted([token, q])
+            t0, t1 = sort_tokens(token, q)
             out.append({
                 "ver": 2, "pool": pair, "fee": cfg.get("v2_fee", 3000),
                 "quote_sym": qsym, "quote_addr": q,
@@ -3337,7 +3350,10 @@ def verify_v4(w3: Web3, chain_id: int, _cache={}) -> bool:
 def v4_pool_key(a: str, b: str, fee: int, spacing: int) -> tuple:
     """(currency0, currency1, fee, tickSpacing, hooks) — currency sorted ascending,
     native ETH = address(0) selalu currency0. Hooks selalu 0 (pool vanilla saja)."""
-    c0, c1 = sorted([a.lower(), b.lower()])
+    # sort_tokens, bukan sorted(): di sini kebetulan aman karena .lower() bikin
+    # urutan string = urutan numerik, tapi jangan tinggalkan pola yang mudah salah
+    # disalin ke tempat yang alamatnya checksum (lihat catatan di sort_tokens).
+    c0, c1 = sort_tokens(a.lower(), b.lower())
     return (Web3.to_checksum_address(c0), Web3.to_checksum_address(c1), fee, spacing,
             Web3.to_checksum_address(V4_NATIVE))
 
