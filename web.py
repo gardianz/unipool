@@ -169,7 +169,7 @@ def liquidity_profile(chain_id: int, p: dict, tdec: int, span_ticks: int = 12000
     cur = cur_tick_of(chain_id, p)
 
     if ver == 4:
-        cfg = ch.CHAINS[chain_id]
+        cfg = ch.v4_cfg(chain_id)   # stateview milik DEX pemilik v4, bukan DEX utama
         sv = w3.eth.contract(address=Web3.to_checksum_address(cfg["v4_stateview"]),
                              abi=ch.V4_STATEVIEW_ABI + STATEVIEW_TICKS_ABI)
         pid = bytes.fromhex(str(p["pool"]).removeprefix("0x"))
@@ -298,6 +298,7 @@ def api_discover(_q, b) -> dict:
             "quote_usd": p["quote_usd"],
             # quote di luar daftar tetap & pool bernilai kecil: klien menampilkan peringatan
             "foreign_quote": bool(p.get("foreign_quote")), "thin": bool(p.get("thin")),
+            "dex": p.get("dex"),
         })
     off = res.get("dropped_offprice") or []
     return {"token": res["token"], "pools": out,
@@ -338,6 +339,7 @@ def api_pool(_q, b) -> dict:
         "mc_usd": price * p["quote_usd"] * supply if supply else None,
         "supply": supply,
         "foreign_quote": bool(p.get("foreign_quote")), "thin": bool(p.get("thin")),
+        "dex": p.get("dex"),
     }
 
 
@@ -544,18 +546,19 @@ def _words(hexdata: str) -> list[int]:
 
 
 def cost_basis(chain_id: int, tid: int, _cache={}, ttl: int = 900,
-               cache_only: bool = False) -> dict | None:
+               cache_only: bool = False, dex: str | None = None) -> dict | None:
     """Modal & hasil tarikan posisi v3 langsung dari event NPM (bukan dari
     history.json lokal) — supaya PnL tetap benar walau posisinya di-mint di
     luar bot ini. None kalau RPC tidak mendukung getLogs rentang penuh.
     cache_only=True: kembalikan hanya kalau sudah di cache, tanpa query getLogs."""
-    ck = (chain_id, int(tid))
+    ck = (chain_id, dex, int(tid))
     hit = _cache.get(ck)
     if hit and time.time() - hit[1] < ttl:
         return hit[0]
     if cache_only:
         return None
-    npm = ch.CHAINS[chain_id]["npm"]
+    # NPM mengikuti DEX posisi — tokenId dari dua NPM bisa bertabrakan
+    npm = ch.dex_cfg(chain_id, dex)["npm"]
     t1 = "0x" + f"{int(tid):064x}"
     from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=3) as ex:   # 3 query sekaligus, bukan berurutan
@@ -663,26 +666,28 @@ def _positions_build(cid: int, full: bool = False, with_basis: bool = True) -> d
                                 store.refs(cid, addr, "v4"), full=full)
 
     from concurrent.futures import ThreadPoolExecutor
-    v3ids = [str(p.get("pid") or p.get("token_id")) for p in pos
-             if p.get("ver", 3) == 3 and str(p.get("pid") or p.get("token_id")).isdigit()]
+    # (pid, tokenId, dex) — pid bisa bernamespace ("uniswap:99") di chain ber-DEX ganda
+    v3ids = [(str(p.get("pid") or p.get("token_id")), ch.parse_pid(p.get("pid") or p.get("token_id"))[1],
+              p.get("dex"))
+             for p in pos if p.get("ver", 3) == 3]
     # cost_basis = 3 getLogs rentang-penuh per posisi → mahal. Untuk paint pertama
     # dilewati (with_basis=False) supaya value/fee/range tampil cepat; PnL menyusul
     # dari cache getLogs yang sudah panas di refresh berikutnya.
     cbs = {}
     if with_basis and v3ids:
-        def safe(pid):
+        def safe(item):
             try:
-                return cost_basis(cid, int(pid))
+                return cost_basis(cid, int(item[1]), dex=item[2])
             except Exception:
                 return None
         with ThreadPoolExecutor(max_workers=5) as ex:
-            cbs = {pid: cb for pid, cb in zip(v3ids, ex.map(safe, v3ids)) if cb}
+            cbs = {it[0]: cb for it, cb in zip(v3ids, ex.map(safe, v3ids)) if cb}
     elif v3ids:
         # pakai basis yang sudah panas di cache; jangan query getLogs baru
-        for pid in v3ids:
-            cb = cost_basis(cid, int(pid), cache_only=True)
+        for pid_s, tid_i, dx in v3ids:
+            cb = cost_basis(cid, int(tid_i), cache_only=True, dex=dx)
             if cb:
-                cbs[pid] = cb
+                cbs[pid_s] = cb
 
     out = []
     for p in pos:

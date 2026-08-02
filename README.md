@@ -2,11 +2,11 @@
 
 Bot Telegram **+ UI web** untuk farming fee LP concentrated liquidity:
 **Uniswap V2 + V3 + V4** di **Robinhood Chain** (chain id 4663) dan
-**PancakeSwap V2 + V3** di **BSC** (chain id 56).
+**PancakeSwap V2 + V3 dan Uniswap V2 + V3 + V4** di **BSC** (chain id 56).
 
 Paste alamat token → cari pool (semua versi sekaligus) → pilih strategi → mint posisi LP. Pantau lewat `/list` (PnL, fee, chart), tutup posisi satu tombol dengan auto-swap. Semua data dibaca langsung dari blockchain — tidak bergantung UI DEX yang sering gagal fetch harga.
 
-DEX-nya mengikuti chain aktif: **Robinhood → Uniswap** (v2/v3/v4), **BSC → PancakeSwap** (v2/v3). Ganti dengan `/chain 56`. PancakeSwap tidak punya kontrak yang kompatibel dengan Uniswap V4 (padanannya "Infinity", arsitektur berbeda total), jadi jalur v4 otomatis mati di BSC.
+Di BSC pool **PancakeSwap dan Uniswap** dicari bersamaan dan ditandai asal DEX-nya; tiap pool dieksekusi memakai kontrak DEX-nya sendiri. Robinhood hanya punya Uniswap. Padanan v4 di PancakeSwap ("Infinity") arsitekturnya berbeda total dan belum didukung — label [v4] di BSC berarti Uniswap V4.
 
 Dua antarmuka, satu mesin (`chain.py`) — bisa dipakai bergantian, riwayat PnL-nya sama:
 

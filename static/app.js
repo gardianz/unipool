@@ -682,7 +682,7 @@ async function discover() {
     $('#pools').innerHTML = r.pools.map(p => `
       <div class="poolrow" data-key="${p.key}">
         <span class="badge v${p.ver}">v${p.ver}</span>
-        <div><b>${r.token.symbol} / ${p.quote_sym}</b>
+        <div><b>${r.token.symbol} / ${p.quote_sym}</b>${p.dex ? ` <span class="dim" style="font-size:11px">${p.dex}</span>` : ''}
           <div class="dim" style="font-size:11px">fee ${p.fee_pct.toFixed(2)}%${
             p.foreign_quote ? ` · <span title="Quote pool ini bukan ${S.dex === 'PancakeSwap' ? 'WBNB' : 'WETH'}/stable — nilai USD ikut harga ${p.quote_sym}, masuk/keluar lewat swap 2 langkah">⚠ quote ${p.quote_sym}</span>` : ''
           }${p.thin ? ' · <span title="TVL sangat kecil — slippage besar, harga gampang digeser">⚠ TVL tipis</span>' : ''}</div></div>

@@ -578,12 +578,15 @@ async def on_address(update: Update, _):
                         "amount_pct": s["amount_pct"], "amount_fixed": s["amount_fixed"],
                         "gap": int(s.get("gap", 1)), "vol": None, "rec": None}
         ver = p.get("ver", 3)
+        # tanda DEX cuma muncul di chain ber-DEX ganda (BSC: P=PancakeSwap, U=Uniswap)
+        dtag = (p.get("dex") or "")[:1] if len(ch.dex_names(cid)) > 1 else ""
         rows.append(
-            f"{i:>2} {f'v{ver} ' + p['quote_sym'][:5]:<7} {p['fee'] / 10000:>5.2f}% "
+            f"{i:>2} {f'v{ver}{dtag} ' + p['quote_sym'][:5]:<7} {p['fee'] / 10000:>5.2f}% "
             f"{fmt_short(p['tvl_usd']):>6} {fmt_pct_short(p.get('apr_pct')):>5} "
             f"{fmt_short(p.get('vol24_usd')):>5} {fmt_short(v30):>5}")
         buttons.append([InlineKeyboardButton(
-            f"{i}. [v{ver}] {p['quote_sym']} {p['fee'] / 10000:.2f}% · {ch.fmt_usd(p['tvl_usd'])}",
+            f"{i}. [{esc(p.get('dex') or '')} v{ver}] {p['quote_sym']} "
+            f"{p['fee'] / 10000:.2f}% · {ch.fmt_usd(p['tvl_usd'])}",
             callback_data=f"pool|{key}")])
     buttons.append([InlineKeyboardButton("✖ Cancel", callback_data="cancel")])
     # pool yang harganya menyimpang jauh dibuang — sebutkan, jangan hilang diam-diam
@@ -597,7 +600,7 @@ async def on_address(update: Update, _):
                     f"yang dipakai menyeret harganya balik ke pasar.")
     text = (f"Found {len(pools)} pool(s) untuk <b>{esc(tsym)}</b> ({_t.time() - t0:.1f}s):\n"
             f"<pre>{esc(chr(10).join(rows))}</pre>\n"
-            f"<i>TVL/volume USD · APR estimasi · vol dari dexscreener &amp; GeckoTerminal "
+            f"<i>P=PancakeSwap · U=Uniswap · TVL/volume USD · APR estimasi · vol dari dexscreener &amp; GeckoTerminal "
             f"(– = pool belum terindeks)</i>{off_line}\n\nPilih pool:")
     await edit(status, text, InlineKeyboardMarkup(buttons))
 
@@ -731,8 +734,8 @@ def build_preview_v2(ctx_data: dict) -> str:
     return (
         f"<b>Confirm add liquidity · {esc(cfg['name'])} · v2</b>\n"
         f"CA: <code>{esc(ctx_data['token']['address'])}</code>\n"
-        f"{esc(tsym)}/{esc(p['quote_sym'])} {p['fee'] / 10000:.2f}% · "
-        f"TVL {ch.fmt_usd(p['tvl_usd'])} · {vol_txt}\n"
+        f"{esc(p.get('dex') or ch.dex_name(cid))} · {esc(tsym)}/{esc(p['quote_sym'])} "
+        f"{p['fee'] / 10000:.2f}% · TVL {ch.fmt_usd(p['tvl_usd'])} · {vol_txt}\n"
         f"📈 <a href=\"https://gmgn.ai/{cfg['gmgn']}/token/{ctx_data['token']['address']}\">GMGN</a> · "
         f"<a href=\"https://dexscreener.com/{cfg['dexscreener']}/{p['pool']}\">DexScreener</a>\n\n"
         f"Value deposited: {ch.fmt_amount(amount)} {esc(p['quote_sym'])} ({ch.fmt_usd(usd)} · {esc(amount_desc)})\n"

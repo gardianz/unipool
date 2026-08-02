@@ -51,10 +51,26 @@ wrapped, daftar quote), RPC, dan quirk chain tinggal di dict itu. Menambah chain
 menambah satu entri, bukan menyebar `if chain_id ==` di kode. Contoh quirk yang sudah
 ada: `v4_swap_hop_field` (UniversalRouter Robinhood punya field ekstra di struct swap).
 
-**DEX berbeda per chain**: Robinhood = Uniswap (v2/v3/v4), BSC = PancakeSwap (v2/v3).
-Bacanya lewat helper, jangan hardcode: `dex_name()`, `has_v4()`, `versions_label()`,
-`fee_tiers()`. Field pembeda: `dex`, `fee_tiers`, `uni_api`, `v2_fee`,
-`v2_swap_num`/`v2_swap_den`, dan ada/tidaknya key `v4_*`.
+**Satu chain bisa punya beberapa DEX.** Robinhood = Uniswap saja; BSC = PancakeSwap
+(utama) **+ Uniswap** di `CHAINS[56]["dexes"]`. Kunci di sub-dict itu menimpa kunci
+chain untuk pool asal DEX tersebut.
+
+Konsekuensi paling penting: **alamat kontrak milik POOL, bukan chain**. Di jalur
+transaksi selalu `pool_cfg(chain_id, pool_info)` / `dex_cfg(chain_id, dex)`, jangan
+`CHAINS[chain_id]` — NPM PancakeSwap dipakai untuk pool Uniswap tidak akan error,
+dana justru mendarat di pool DEX lain dengan token+fee yang sama.
+
+Helper: `dex_names()`, `dex_cfg()`, `pool_cfg()`, `has_v4(cid, dex)`, `any_has_v4()`,
+`fee_tiers(cid, dex)`, `v4_dex()`/`v4_cfg()`, `uni_api_dex()`,
+`which_dex_v2()`/`which_dex_v3()` (menentukan pemilik pool dari factory on-chain).
+
+**`pid` v3 bernamespace** di DEX non-utama: `"uniswap:99"` (tokenId dua NPM bisa
+bertabrakan). DEX utama tetap `"99"` supaya `history.json` lama terbaca. Lihat
+`make_pid()`/`pid_dex()`/`parse_pid()`. v2 tidak dinamespace — alamat pair unik,
+pemiliknya dicari lewat `which_dex_v2()`.
+
+`assert_pool_orientation(w3, pool_info, chain_id)` ikut memverifikasi pool memang
+milik factory DEX yang tertulis di dict.
 
 Jebakan yang sudah terbukti saat menambah PancakeSwap — jangan diulang:
 
