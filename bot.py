@@ -589,9 +589,13 @@ async def on_address(update: Update, _):
             f"{p['fee'] / 10000:.2f}% · {ch.fmt_usd(p['tvl_usd'])}",
             callback_data=f"pool|{key}")])
     buttons.append([InlineKeyboardButton("✖ Cancel", callback_data="cancel")])
-    # pool yang harganya menyimpang jauh dibuang — sebutkan, jangan hilang diam-diam
+    # pool yang disaring — sebutkan, jangan hilang diam-diam
+    dead = res.get("dropped_dead") or []
     off = res.get("dropped_offprice") or []
     off_line = ""
+    if dead:
+        off_line += (f"\n🔇 {len(dead)} pool disembunyikan — tanpa TVL/volume 24 jam "
+                     f"(pool mati; yang TVL-nya masih ≥5% pool terdalam tetap ditampilkan).")
     if off:
         det = ", ".join(f"[v{d.get('ver', 3)}] {esc(d['quote_sym'])} {d['deviation'] * 100:+.0f}%"
                         for d in off[:3])

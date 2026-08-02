@@ -1306,6 +1306,31 @@ def _fill_v4_tvl(chain_id: int, pools: list, limit: int = 8) -> None:
         list(ex.map(fix, cand))
 
 
+def _drop_dead_pools(pools: list, keep_ratio: float = 0.05) -> tuple[list, list]:
+    """Buang pool yang tidak benar-benar hidup: tanpa TVL, atau tanpa volume 24 jam.
+
+    Pool ber-quote aneh TIDAK dibuang selama ada TVL+volume — justru itu yang dicari.
+    Yang dibuang adalah ekor mati: pool v4 hasil indexer yang tak pernah
+    diperdagangkan (78 pool token memes menyusut jadi 16).
+
+    Katup pengaman: volume kosong belum tentu berarti mati — sering cuma tidak
+    terindeks. Pool tanpa volume tetap dipertahankan kalau TVL-nya masih ≥5% pool
+    terdalam. Tanpa ini, pool Uniswap v4 CAKE/USDT ber-TVL $922k ikut terbuang."""
+    alive = [p.get("tvl_usd") or 0 for p in pools if (p.get("tvl_usd") or 0) > 0]
+    if not alive:
+        return pools, []
+    floor = max(alive) * keep_ratio
+    kept, dropped = [], []
+    for p in pools:
+        tvl = p.get("tvl_usd") or 0
+        vol = p.get("vol24_usd") or 0
+        if tvl > 0 and (vol > 0 or tvl >= floor):
+            kept.append(p)
+        else:
+            dropped.append(p)
+    return kept, dropped
+
+
 def _drop_offprice_pools(pools: list, token_dec: int, token_addr: str) -> tuple[list, list]:
     """Buang pool yang harganya menyimpang jauh dari pool terdalam.
 
@@ -1402,8 +1427,12 @@ def discover_any(chain_id: int, token_addr: str) -> dict:
         res["pools"].sort(key=lambda p: p.get("tvl_usd") or 0, reverse=True)
     except Exception:
         pass
+    # Urutan penting: buang pool mati DULU, baru filter harga — patokan harga harus
+    # diambil dari pool yang benar-benar diperdagangkan.
+    res["pools"], res["dropped_dead"] = _drop_dead_pools(res["pools"])
     res["pools"], res["dropped_offprice"] = _drop_offprice_pools(
         res["pools"], (res.get("token") or {}).get("decimals", 18), token_addr)
+    res["pools"].sort(key=lambda p: p.get("tvl_usd") or 0, reverse=True)
     return res
 
 

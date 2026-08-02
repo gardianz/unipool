@@ -189,6 +189,22 @@ paramnya `tokenAddress` bukan `search`. Tidak terdokumentasi di swagger publik;
 ditemukan dari bundel JS defi.krystal.app. Fragile — semua pemanggilnya harus tetap
 jalan kalau API-nya mati, dan angkanya tidak pernah jadi dasar membangun transaksi.
 
+### Saringan pool yang ditampilkan
+
+Berlapis, urutannya penting (semua di ujung `discover_any()`):
+
+1. `_drop_dead_pools()` — wajib punya TVL **dan** volume 24 jam. Pool ber-quote aneh
+   TIDAK dibuang selama ada volume (justru itu yang dicari); yang hilang adalah ekor
+   mati dari indexer (token memes: 78 pool → 16). **Katup pengaman**: volume kosong
+   sering cuma tidak terindeks, jadi pool tanpa volume tetap ditampilkan kalau TVL-nya
+   ≥5% pool terdalam — tanpa itu pool Uniswap v4 CAKE/USDT ber-TVL $922k ikut terbuang.
+2. `_drop_offprice_pools()` — dijalankan SESUDAH (1) supaya patokan harganya diambil
+   dari pool yang benar-benar diperdagangkan.
+3. Urut TVL menurun.
+
+Jumlah yang disembunyikan selalu disebut di UI (bot & web), jangan sampai pool hilang
+diam-diam.
+
 ### Ambang TVL
 
 Tidak ada lagi lantai TVL dolar di discovery — pool kecil tetap ditampilkan dan

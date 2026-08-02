@@ -691,6 +691,10 @@ async function discover() {
         <div class="cell"><small>APR</small>${p.apr_pct ? nf(p.apr_pct, 1) + '%' : '—'}</div>
         <div class="cell"><small>Fee tier</small>${p.fee_pct.toFixed(2)}%</div>
       </div>`).join('');
+    if (r.dropped_dead) {
+      $('#pools').insertAdjacentHTML('beforeend',
+        `<div class="dim" style="padding:6px 4px;font-size:12px">🔇 ${r.dropped_dead} pool disembunyikan — tanpa TVL/volume 24 jam.</div>`);
+    }
     const off = r.dropped_offprice || [];
     if (off.length) {
       const det = off.slice(0, 3).map(d => `v${d.ver} ${d.quote_sym} ${(d.deviation * 100).toFixed(0)}%`).join(', ');
