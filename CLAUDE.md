@@ -168,6 +168,18 @@ Dua jebakan yang sudah kena sekali:
   dan pool lolos tanpa dicek. `_fill_missing_sqrtp()` mengisinya on-chain, tapi
   **dibatasi 12 pool ber-TVL teratas** — membaca slot0 untuk ratusan pool terlalu mahal.
 
+### Sumber angka TVL
+
+Urutan daftar pool DAN patokan filter harga sama-sama bergantung TVL, jadi angkanya
+harus sedekat mungkin ke kenyataan:
+
+- v2 & v3 hasil scan RPC: dari saldo nyata kedua sisi di kontrak pool.
+- v3 dari indexer Uniswap: `totalLiquidityUsd` bisa meleset jauh (terukur $24,4k
+  untuk pool yang saldonya $40,7k), jadi `_fill_onchain_tvl()` menghitung ulang dari
+  `balanceOf` — dibatasi 12 pool teratas, ditandai `tvl_src="chain"`.
+- v4: saldo per-pool TIDAK bisa dibaca (semua currency ditahan satu PoolManager),
+  jadi dipakai likuiditas dexscreener kalau ada; sisanya angka indexer apa adanya.
+
 ### Ambang TVL
 
 Tidak ada lagi lantai TVL dolar di discovery — pool kecil tetap ditampilkan dan

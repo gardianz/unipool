@@ -1194,6 +1194,48 @@ def _fill_missing_sqrtp(chain_id: int, pools: list, limit: int = 12) -> None:
         list(ex.map(fetch, need))
 
 
+def _fill_onchain_tvl(chain_id: int, pools: list, token: str, token_dec: int,
+                      limit: int = 12) -> None:
+    """Hitung ulang TVL pool v3 dari SALDO NYATA di kontrak pool.
+
+    Angka TVL dari indexer Uniswap (`totalLiquidityUsd`) sering meleset jauh —
+    terukur $24,4k untuk pool yang saldonya benar-benar $40,7k. Karena TVL yang
+    menentukan urutan daftar DAN jadi patokan filter harga, angkanya harus dari
+    chain. Dibatasi pool teratas: dua balanceOf per pool terlalu mahal untuk ratusan."""
+    token = Web3.to_checksum_address(token)
+    # Sisi meme harus benar-benar token yang dicari; kalau token itu justru jadi sisi
+    # quote (mis. mencari USDG), rumus di bawah menghitung saldo token lain dan TVL-nya
+    # ngawur — sama seperti jebakan di _pool_price_usd.
+    tl = token.lower()
+    cand = [p for p in sorted(pools, key=lambda p: p.get("tvl_usd") or 0, reverse=True)
+            if p.get("ver", 3) == 3 and p.get("basis") == "uniswap" and p.get("sqrtp")
+            and str(p.get("token0") if p.get("quote_is_token1") else p.get("token1") or "").lower() == tl
+            ][:limit]
+    if not cand:
+        return
+    w3 = get_w3(chain_id)
+
+    def fix(p):
+        try:
+            qdec, qusd = p["quote_decimals"], p.get("quote_usd") or 0
+            if qusd <= 0:
+                return
+            q_bal = erc20(w3, p["quote_addr"]).functions.balanceOf(
+                Web3.to_checksum_address(p["pool"])).call() / 10 ** qdec
+            m_bal = erc20(w3, token).functions.balanceOf(
+                Web3.to_checksum_address(p["pool"])).call() / 10 ** token_dec
+            raw = (p["sqrtp"] / Q96) ** 2
+            meme_in_q = (raw if p.get("quote_is_token1") else (1 / raw if raw else 0)) \
+                * 10 ** (token_dec - qdec)
+            p["tvl_usd"] = q_bal * qusd + m_bal * meme_in_q * qusd
+            p["tvl_src"] = "chain"
+        except Exception:
+            pass
+
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        list(ex.map(fix, cand))
+
+
 def _drop_offprice_pools(pools: list, token_dec: int, token_addr: str) -> tuple[list, list]:
     """Buang pool yang harganya menyimpang jauh dari pool terdalam.
 
@@ -1254,8 +1296,24 @@ def discover_any(chain_id: int, token_addr: str) -> dict:
     # (slippage besar, harga gampang digeser, fee kemungkinan tak menutup gas).
     for p in res["pools"]:
         p["thin"] = (p.get("tvl_usd") or 0) < 50
+    tdec = (res.get("token") or {}).get("decimals", 18)
     try:
         _fill_missing_sqrtp(chain_id, res["pools"])
+        _fill_onchain_tvl(chain_id, res["pools"], token_addr, tdec)
+        # TVL v4 tidak bisa dibaca dari saldo pool (semua currency ditahan
+        # PoolManager yang sama) → pakai likuiditas riil dexscreener kalau ada
+        dexliq = {}
+        for pr in _dex_pairs(chain_id, token_addr):
+            lq = float((pr.get("liquidity") or {}).get("usd") or 0)
+            if lq > 0:
+                dexliq[str(pr.get("pairAddress") or "").lower()] = lq
+        for p in res["pools"]:
+            if p.get("ver") == 4:
+                real = dexliq.get(str(p["pool"]).lower())
+                if real:
+                    p["tvl_usd"] = real
+                    p["tvl_src"] = "dexscreener"
+        res["pools"].sort(key=lambda p: p.get("tvl_usd") or 0, reverse=True)
     except Exception:
         pass
     res["pools"], res["dropped_offprice"] = _drop_offprice_pools(
