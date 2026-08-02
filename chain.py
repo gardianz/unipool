@@ -1194,6 +1194,45 @@ def _fill_missing_sqrtp(chain_id: int, pools: list, limit: int = 12) -> None:
         list(ex.map(fetch, need))
 
 
+# Endpoint yang dipakai web defi.krystal.app sendiri (ditemukan dari bundel JS-nya).
+# CATATAN: yang v1 cuma melayani Solana — untuk EVM harus v2, itu sebabnya
+# /all/v1/lp_explorer/top_pools menjawab "chain id 56 not supported".
+# Dipakai HANYA untuk angka tampilan (TVL/volume/APR). Tidak pernah jadi dasar
+# membangun transaksi: alamat pool tetap diverifikasi ke factory on-chain.
+_KRYSTAL_POOLS = "https://api.krystal.app/all/v2/lp_explorer/top_pools"
+
+
+def krystal_pools(chain_id: int, token: str, _cache={}, ttl: int = 120) -> dict:
+    """{pool_address_lower: {tvl_usd, vol24_usd, apr_pct}} dari API Krystal.
+    Dict kosong kalau gagal — pemanggil harus tetap jalan tanpa ini.
+
+    Berguna khusus untuk pool v4: saldo per-pool tidak bisa dibaca on-chain
+    (semua currency ditahan satu PoolManager), jadi tanpa sumber luar TVL-nya
+    cuma tebakan indexer yang terbukti meleset (kita $43,4k vs nyata $2,3k)."""
+    key = (chain_id, str(token).lower())
+    hit = _cache.get(key)
+    if hit and time.time() - hit[1] < ttl:
+        return hit[0]
+    out = {}
+    try:
+        r = requests.get(_KRYSTAL_POOLS, timeout=8, headers={"accept": "application/json"},
+                         params={"chainId": chain_id, "tokenAddress": str(token).lower()})
+        for p in (r.json().get("result") or []):
+            s = p.get("stat24h") or {}
+            addr = str(p.get("poolAddress") or "").lower()
+            if not addr:
+                continue
+            out[addr] = {
+                "tvl_usd": float(p.get("tvlUsd") or 0),
+                "vol24_usd": float(s.get("volumeUsd") or 0) or None,
+                "apr_pct": float(s.get("apr")) if s.get("apr") is not None else None,
+            }
+    except Exception:
+        return hit[0] if hit else {}
+    _cache[key] = (out, time.time())
+    return out
+
+
 def _fill_onchain_tvl(chain_id: int, pools: list, token: str, token_dec: int,
                       limit: int = 12) -> None:
     """Hitung ulang TVL pool v3 dari SALDO NYATA di kontrak pool.
@@ -1233,6 +1272,37 @@ def _fill_onchain_tvl(chain_id: int, pools: list, token: str, token_dec: int,
             pass
 
     with ThreadPoolExecutor(max_workers=6) as ex:
+        list(ex.map(fix, cand))
+
+
+def _fill_v4_tvl(chain_id: int, pools: list, limit: int = 8) -> None:
+    """TVL pool v4 dari reserve VIRTUAL sisi quote (liquidity × harga), dibaca lewat
+    StateView. Dipakai hanya kalau tidak ada sumber luar (Krystal/dexscreener):
+    saldo per-pool v4 tak bisa dibaca karena semua currency ditahan satu PoolManager.
+    Angkanya menghitung likuiditas aktif di tick sekarang saja, jadi bisa lebih kecil
+    dari TVL sebenarnya — tapi jauh lebih dekat daripada angka indexer."""
+    cand = [p for p in sorted(pools, key=lambda p: p.get("tvl_usd") or 0, reverse=True)
+            if p.get("ver") == 4 and p.get("tvl_src") not in ("krystal", "dexscreener")][:limit]
+    if not cand or not verify_v4(get_w3(chain_id), chain_id):
+        return
+    w3 = get_w3(chain_id)
+    sv = _v4c(w3, chain_id, "v4_stateview", V4_STATEVIEW_ABI)
+
+    def fix(p):
+        try:
+            pid = p.get("pool_id") or bytes.fromhex(str(p["pool"]).removeprefix("0x"))
+            sqrtp, _tick, _, _ = sv.functions.getSlot0(pid).call()
+            liq = sv.functions.getLiquidity(pid).call()
+            if not sqrtp or not liq:
+                p["tvl_usd"] = 0.0
+                return
+            q_virt = (liq * sqrtp // Q96) if p.get("quote_is_token1") else (liq * Q96 // sqrtp)
+            p["tvl_usd"] = q_virt / 10 ** p["quote_decimals"] * (p.get("quote_usd") or 0) * 2
+            p["tvl_src"] = "chain-virtual"
+        except Exception:
+            pass
+
+    with ThreadPoolExecutor(max_workers=4) as ex:
         list(ex.map(fix, cand))
 
 
@@ -1307,12 +1377,28 @@ def discover_any(chain_id: int, token_addr: str) -> dict:
             lq = float((pr.get("liquidity") or {}).get("usd") or 0)
             if lq > 0:
                 dexliq[str(pr.get("pairAddress") or "").lower()] = lq
+        # Krystal mengukur pool v4 dengan benar (dexscreener sering tak meng-index
+        # poolId v4 sama sekali) → dipakai duluan, dexscreener jadi cadangan.
+        kr = krystal_pools(chain_id, token_addr)
         for p in res["pools"]:
+            k = kr.get(str(p["pool"]).lower())
+            if k and k.get("tvl_usd"):
+                # untuk v3/v2 hitungan on-chain kita sudah tepat; Krystal cuma
+                # menambal volume/APR. Untuk v4 TVL-nya ikut Krystal.
+                if p.get("ver") == 4 or p.get("tvl_src") != "chain":
+                    p["tvl_usd"] = k["tvl_usd"]
+                    p["tvl_src"] = "krystal"
+                if k.get("vol24_usd") is not None:
+                    p["vol24_usd"] = k["vol24_usd"]
+                if k.get("apr_pct") is not None:
+                    p["apr_pct"] = k["apr_pct"]
+                continue
             if p.get("ver") == 4:
                 real = dexliq.get(str(p["pool"]).lower())
                 if real:
                     p["tvl_usd"] = real
                     p["tvl_src"] = "dexscreener"
+        _fill_v4_tvl(chain_id, res["pools"])
         res["pools"].sort(key=lambda p: p.get("tvl_usd") or 0, reverse=True)
     except Exception:
         pass

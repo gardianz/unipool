@@ -177,8 +177,17 @@ harus sedekat mungkin ke kenyataan:
 - v3 dari indexer Uniswap: `totalLiquidityUsd` bisa meleset jauh (terukur $24,4k
   untuk pool yang saldonya $40,7k), jadi `_fill_onchain_tvl()` menghitung ulang dari
   `balanceOf` — dibatasi 12 pool teratas, ditandai `tvl_src="chain"`.
-- v4: saldo per-pool TIDAK bisa dibaca (semua currency ditahan satu PoolManager),
-  jadi dipakai likuiditas dexscreener kalau ada; sisanya angka indexer apa adanya.
+- v4: saldo per-pool TIDAK bisa dibaca (semua currency ditahan satu PoolManager).
+  Urutan sumbernya: **Krystal** (`krystal_pools()`, endpoint yang dipakai web mereka
+  sendiri) → dexscreener → `_fill_v4_tvl()` yang menghitung reserve virtual dari
+  `liquidity` × harga lewat StateView. Angka indexer tidak dipakai lagi: terukur
+  $43,9k untuk pool yang nyatanya ~$3k.
+
+**Endpoint Krystal**: `GET api.krystal.app/all/v2/lp_explorer/top_pools?chainId=&tokenAddress=`
+— **v2**, yang v1 cuma melayani Solana (menjawab "chain id 56 not supported"), dan
+paramnya `tokenAddress` bukan `search`. Tidak terdokumentasi di swagger publik;
+ditemukan dari bundel JS defi.krystal.app. Fragile — semua pemanggilnya harus tetap
+jalan kalau API-nya mati, dan angkanya tidak pernah jadi dasar membangun transaksi.
 
 ### Ambang TVL
 
