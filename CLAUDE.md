@@ -135,6 +135,23 @@ Aturan yang gampang dilanggar kalau tidak hati-hati:
 - `discover_foreign_pools` dijalankan **berurutan** setelah scan utama. Pernah dicoba
   paralel: di RPC publik keduanya berebut dan malah kena rate-limit (19s vs 10s).
 
+### Filter harga menyimpang
+
+`_drop_offprice_pools()` membuang pool yang harganya lewat `PRICE_DEVIATION_MAX`
+(25%) dari pool **terdalam** token itu — patokannya TVL terbesar, bukan angka
+mutlak. Pool debu bisa berharga 2× pasar justru karena tak terarbitrase (untungnya
+lebih kecil dari gas); LP di situ = modal user yang dipakai menyeret harganya balik.
+
+Dua jebakan yang sudah kena sekali:
+
+- **Harga harus milik token yang DICARI.** Sisi non-quote tidak selalu token itu:
+  kalau yang dicari justru jadi sisi quote (mis. mencari USDG), pool itu menghargai
+  token lain dan angkanya tak sebanding. `_pool_price_usd` mengembalikan `None`
+  untuk kasus itu. Tanpa penjagaan ini, pool v4 USDG ber-TVL $1,6jt ikut terbuang.
+- **Jalur indexer Uniswap tidak mengirim `sqrtPrice`**, jadi harganya tak terhitung
+  dan pool lolos tanpa dicek. `_fill_missing_sqrtp()` mengisinya on-chain, tapi
+  **dibatasi 12 pool ber-TVL teratas** — membaca slot0 untuk ratusan pool terlalu mahal.
+
 ### Ambang TVL
 
 Tidak ada lagi lantai TVL dolar di discovery — pool kecil tetap ditampilkan dan

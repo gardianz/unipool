@@ -691,6 +691,12 @@ async function discover() {
         <div class="cell"><small>APR</small>${p.apr_pct ? nf(p.apr_pct, 1) + '%' : '—'}</div>
         <div class="cell"><small>Fee tier</small>${p.fee_pct.toFixed(2)}%</div>
       </div>`).join('');
+    const off = r.dropped_offprice || [];
+    if (off.length) {
+      const det = off.slice(0, 3).map(d => `v${d.ver} ${d.quote_sym} ${(d.deviation * 100).toFixed(0)}%`).join(', ');
+      $('#pools').insertAdjacentHTML('beforeend',
+        `<div class="dim" style="padding:8px 4px;font-size:12px">⚠️ ${off.length} pool disembunyikan — harga menyimpang jauh dari pool terdalam (${det}). Pool begitu tidak terarbitrase; LP di situ = modalmu yang menyeret harganya balik ke pasar.</div>`);
+    }
     for (const el of $('#pools').querySelectorAll('.poolrow')) {
       el.onclick = () => openPool(el.dataset.key).catch(e => toast(e.message, 'err'));
     }

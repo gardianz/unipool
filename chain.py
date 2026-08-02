@@ -1066,6 +1066,88 @@ def uni_discover(cid: int, token: str) -> dict | None:
     return {"token": tinfo, "pools": out}
 
 
+# Selisih harga maksimum sebuah pool terhadap pool TERDALAM token yang sama.
+# Pool yang lewat batas ini dibuang dari daftar: bukan peluang, tapi jebakan —
+# harganya menyimpang justru KARENA tak ada yang mengarbitrase (untungnya lebih
+# kecil dari gas). Kalau di-LP, arbitraser-lah yang akhirnya menyeret harga pool
+# itu ke harga pasar memakai modal kita. Kasus nyata: House/USDT v3 berisi ~$148
+# harganya 100,3% di atas House/WBNB v2 yang bervolume $2,5jt.
+PRICE_DEVIATION_MAX = 0.25
+
+
+def _pool_price_usd(p: dict, token_dec: int, token_addr: str) -> float | None:
+    """Harga USD 1 unit token yang DICARI menurut pool ini. None kalau tak bisa
+    dihitung (data tak lengkap, atau token yang dicari justru jadi sisi quote di
+    pool ini — harganya jadi harga token lain, tidak sebanding antar pool)."""
+    qdec, qusd = p.get("quote_decimals"), p.get("quote_usd") or 0
+    if qdec is None or qusd <= 0:
+        return None
+    t = str(token_addr).lower()
+    meme = str(p.get("token0") if p.get("quote_is_token1") else p.get("token1") or "").lower()
+    if meme != t:
+        return None
+    if p.get("ver") == 2:
+        rq, rm = p.get("reserve_quote") or 0, p.get("reserve_meme") or 0
+        if rq <= 0 or rm <= 0:
+            return None
+        return (rq / 10 ** qdec) / (rm / 10 ** token_dec) * qusd
+    sq = p.get("sqrtp") or 0
+    if sq <= 0:
+        return None
+    raw = (sq / Q96) ** 2                       # token1 per token0, satuan wei
+    price_q = raw if p.get("quote_is_token1") else (1 / raw if raw else 0)
+    return price_q * 10 ** (token_dec - qdec) * qusd
+
+
+def _fill_missing_sqrtp(chain_id: int, pools: list, limit: int = 12) -> None:
+    """Isi sqrtPrice pool yang belum punya (jalur indexer Uniswap tidak mengirimnya).
+    Dibatasi ke pool ber-TVL teratas: itu yang ditampilkan UI dan yang mungkin
+    dipilih user, sementara membaca slot0 untuk ratusan pool jelas terlalu mahal."""
+    need = [p for p in sorted(pools, key=lambda p: p.get("tvl_usd") or 0, reverse=True)
+            if not p.get("sqrtp") and p.get("ver", 3) in (3, 4)][:limit]
+    if not need:
+        return
+    w3 = get_w3(chain_id)
+
+    def fetch(p):
+        try:
+            if p.get("ver") == 4:
+                pid = p.get("pool_id") or bytes.fromhex(str(p["pool"]).removeprefix("0x"))
+                p["sqrtp"] = v4_slot0(w3, chain_id, pid)[0]
+            else:
+                pool = w3.eth.contract(address=Web3.to_checksum_address(p["pool"]), abi=POOL_ABI)
+                p["sqrtp"] = pool.functions.slot0().call()[0]
+        except Exception:
+            pass
+
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        list(ex.map(fetch, need))
+
+
+def _drop_offprice_pools(pools: list, token_dec: int, token_addr: str) -> tuple[list, list]:
+    """Buang pool yang harganya menyimpang jauh dari pool terdalam.
+
+    Patokannya pool ber-TVL terbesar, bukan angka mutlak: pool terdalam yang
+    paling sering diarbitrase, jadi harganya paling dekat ke pasar. Pool yang
+    harganya tak bisa dihitung dibiarkan lewat (tidak ada dasar untuk membuang)."""
+    for p in pools:
+        p["price_usd"] = _pool_price_usd(p, token_dec, token_addr)
+    priced = [p for p in pools if p.get("price_usd")]
+    if len(priced) < 2:
+        return pools, []
+    ref = max(priced, key=lambda p: p.get("tvl_usd") or 0)
+    rp = ref["price_usd"]
+    kept, dropped = [], []
+    for p in pools:
+        x = p.get("price_usd")
+        if p is not ref and x and rp and abs(x / rp - 1) > PRICE_DEVIATION_MAX:
+            p["deviation"] = x / rp - 1
+            dropped.append(p)
+        else:
+            kept.append(p)
+    return kept, dropped
+
+
 def discover_any(chain_id: int, token_addr: str) -> dict:
     """Discovery pool untuk SEMUA UI (bot & web): API Uniswap dulu (lengkap, cepat,
     termasuk v4 fee non-standar), fallback scan RPC kalau API mati / nihil.
@@ -1094,6 +1176,12 @@ def discover_any(chain_id: int, token_addr: str) -> dict:
     # (slippage besar, harga gampang digeser, fee kemungkinan tak menutup gas).
     for p in res["pools"]:
         p["thin"] = (p.get("tvl_usd") or 0) < 50
+    try:
+        _fill_missing_sqrtp(chain_id, res["pools"])
+    except Exception:
+        pass
+    res["pools"], res["dropped_offprice"] = _drop_offprice_pools(
+        res["pools"], (res.get("token") or {}).get("decimals", 18), token_addr)
     return res
 
 

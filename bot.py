@@ -586,10 +586,19 @@ async def on_address(update: Update, _):
             f"{i}. [v{ver}] {p['quote_sym']} {p['fee'] / 10000:.2f}% · {ch.fmt_usd(p['tvl_usd'])}",
             callback_data=f"pool|{key}")])
     buttons.append([InlineKeyboardButton("✖ Cancel", callback_data="cancel")])
+    # pool yang harganya menyimpang jauh dibuang — sebutkan, jangan hilang diam-diam
+    off = res.get("dropped_offprice") or []
+    off_line = ""
+    if off:
+        det = ", ".join(f"[v{d.get('ver', 3)}] {esc(d['quote_sym'])} {d['deviation'] * 100:+.0f}%"
+                        for d in off[:3])
+        off_line = (f"\n⚠️ {len(off)} pool disembunyikan — harganya menyimpang jauh dari pool "
+                    f"terdalam ({det}). Pool begitu tak terarbitrase; LP di situ = modalmu "
+                    f"yang dipakai menyeret harganya balik ke pasar.")
     text = (f"Found {len(pools)} pool(s) untuk <b>{esc(tsym)}</b> ({_t.time() - t0:.1f}s):\n"
             f"<pre>{esc(chr(10).join(rows))}</pre>\n"
             f"<i>TVL/volume USD · APR estimasi · vol dari dexscreener &amp; GeckoTerminal "
-            f"(– = pool belum terindeks)</i>\n\nPilih pool:")
+            f"(– = pool belum terindeks)</i>{off_line}\n\nPilih pool:")
     await edit(status, text, InlineKeyboardMarkup(buttons))
 
 

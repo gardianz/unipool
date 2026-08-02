@@ -299,7 +299,12 @@ def api_discover(_q, b) -> dict:
             # quote di luar daftar tetap & pool bernilai kecil: klien menampilkan peringatan
             "foreign_quote": bool(p.get("foreign_quote")), "thin": bool(p.get("thin")),
         })
-    return {"token": res["token"], "pools": out}
+    off = res.get("dropped_offprice") or []
+    return {"token": res["token"], "pools": out,
+            # pool ber-harga menyimpang jauh dibuang di server; klien cuma diberi
+            # ringkasannya supaya tahu kenapa jumlahnya lebih sedikit
+            "dropped_offprice": [{"ver": d.get("ver", 3), "quote_sym": d["quote_sym"],
+                                  "deviation": d.get("deviation")} for d in off]}
 
 
 def _pool(b) -> tuple[int, dict, dict]:
