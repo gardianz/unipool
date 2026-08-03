@@ -59,8 +59,9 @@ def esc(s) -> str:
 
 
 @functools.lru_cache(maxsize=1)
-def all_pks() -> tuple[str, ...]:
-    """Semua private key dari .env: PRIVATE_KEY (W1), PRIVATE_KEY_2 (W2), dst."""
+def env_pks() -> tuple[str, ...]:
+    """Private key dari .env: PRIVATE_KEY (W1), PRIVATE_KEY_2 (W2), dst.
+    Ini milik operator mesin — tidak bisa dihapus lewat bot."""
     keys = []
     raw = os.environ.get("PRIVATE_KEY", "").strip()
     if raw:
@@ -73,6 +74,31 @@ def all_pks() -> tuple[str, ...]:
         keys.append(raw)
         i += 1
     return tuple(k if k.startswith("0x") else "0x" + k for k in keys)
+
+
+def all_pks() -> tuple[str, ...]:
+    """Wallet .env DULU (urutannya tetap, supaya W1 tidak berubah arti), lalu
+    wallet yang ditambahkan lewat bot. TIDAK di-cache: brankas bisa berubah
+    saat runtime lewat menu tambah/hapus."""
+    keys = list(env_pks())
+    seen = {k.lower() for k in keys}
+    for w in store.wallets():
+        k = w["pk"] if w["pk"].startswith("0x") else "0x" + w["pk"]
+        if k.lower() not in seen:
+            keys.append(k)
+            seen.add(k.lower())
+    return tuple(keys)
+
+
+def is_env_pk(key: str) -> bool:
+    return any(k.lower() == str(key).lower() for k in env_pks())
+
+
+def wallet_name(key: str) -> str:
+    for w in store.wallets():
+        if w["pk"].lower() == str(key).lower():
+            return w.get("name") or ""
+    return ""
 
 
 def active_wallet_idx() -> int:
@@ -220,6 +246,7 @@ def menu_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📊 Posisi LP", callback_data="menu|list"),
          InlineKeyboardButton("🎯 Pesanan", callback_data="menu|orders")],
         [InlineKeyboardButton("👛 Dompet", callback_data="menu|wallet"),
+         InlineKeyboardButton("🔑 Wallet", callback_data="menu|wallets"),
          InlineKeyboardButton("⚙️ Pengaturan", callback_data="menu|settings")],
         [InlineKeyboardButton("⛓ Chain", callback_data="menu|chain"),
          InlineKeyboardButton("❓ Bantuan", callback_data="menu|help")],
@@ -499,6 +526,154 @@ def wallet_kb(page: int = 0, pages: int = 1) -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton("🔄 Segarkan", callback_data=f"wal|{page}")])
     rows.append(BACK_ROW)
     return InlineKeyboardMarkup(rows)
+
+
+# ---------- Kelola wallet (tambah / buat / ekspor / hapus) ----------
+def wallets_text() -> str:
+    cur = active_wallet_idx()
+    lines = ["👛 <b>Kelola wallet</b>\n"]
+    for i, k in enumerate(all_pks()):
+        src = ".env" if is_env_pk(k) else "brankas bot"
+        nm = wallet_name(k)
+        lines.append(f"{'▸ ' if i == cur else '   '}<b>W{i + 1}</b>{' ' + esc(nm) if nm else ''} "
+                     f"<code>{esc(_addr_of(k))}</code>\n     <i>{src}</i>")
+    lines.append(
+        "\n⚠️ Wallet dari <code>.env</code> tidak bisa dihapus lewat bot — ubah filenya "
+        "lalu restart. Wallet tambahan disimpan di <code>wallets.json</code> "
+        "(permission 600, tidak ikut git).")
+    return "\n".join(lines)
+
+
+def wallets_kb() -> InlineKeyboardMarkup:
+    rows = []
+    pks = all_pks()
+    cur = active_wallet_idx()
+    for i in range(0, min(len(pks), 8), 4):
+        rows.append([InlineKeyboardButton(("✓ " if j == cur else "") + f"W{j + 1}",
+                                          callback_data=f"wsel|{j}")
+                     for j in range(i, min(i + 4, len(pks), 8))])
+    rows.append([InlineKeyboardButton("➕ Impor key", callback_data="wal2|import"),
+                 InlineKeyboardButton("🆕 Buat baru", callback_data="wal2|new")])
+    rows.append([InlineKeyboardButton("🔑 Ekspor key", callback_data="wal2|exportmenu"),
+                 InlineKeyboardButton("🗑 Hapus", callback_data="wal2|delmenu")])
+    rows.append([InlineKeyboardButton("‹ Menu", callback_data="menu|home")])
+    return InlineKeyboardMarkup(rows)
+
+
+def wallet_pick_kb(action: str) -> InlineKeyboardMarkup:
+    """Daftar wallet untuk dipilih (ekspor/hapus). Wallet .env tidak bisa dihapus."""
+    rows = []
+    for i, k in enumerate(all_pks()):
+        if action == "del" and is_env_pk(k):
+            continue
+        rows.append([InlineKeyboardButton(f"W{i + 1} · {_addr_of(k)[:8]}…{_addr_of(k)[-4:]}",
+                                          callback_data=f"wal2|{action}|{i}")])
+    rows.append([InlineKeyboardButton("‹ Batal", callback_data="wal2|back")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def _autodelete(msg, secs: int = 60):
+    """Hapus pesan berisi rahasia setelah beberapa detik."""
+    try:
+        await asyncio.sleep(secs)
+        await msg.delete()
+    except Exception:
+        pass
+
+
+async def handle_wallets_cb(update: Update, q, data: str):
+    """Router menu wallet. Setiap aksi yang menyentuh private key butuh konfirmasi."""
+    parts = data.split("|")
+    act = parts[1]
+    if act == "import":
+        AWAITING[update.effective_chat.id] = {"kind": "wallet_import", "key": ""}
+        await edit(q.message,
+                   "🔑 <b>Impor wallet</b>\n\nBalas pesan ini dengan private key "
+                   "(64 hex, boleh pakai awalan <code>0x</code>).\n\n"
+                   "⚠️ Pesanmu akan otomatis dihapus setelah dibaca, tapi key tetap "
+                   "sempat melewati server Telegram. Jangan impor wallet utama.",
+                   InlineKeyboardMarkup([[InlineKeyboardButton("‹ Batal", callback_data="wal2|back")]]))
+        return
+    if act == "new":
+        from web3 import Web3
+        acct = Web3().eth.account.create()
+        key = acct.key.hex()
+        key = key if key.startswith("0x") else "0x" + key
+        store.add_wallet(key, "baru")
+        await edit(q.message,
+                   f"✅ <b>Wallet baru dibuat</b>\n<code>{esc(acct.address)}</code>\n\n"
+                   f"<i>Private key TIDAK ditampilkan di sini. Pakai tombol Ekspor kalau "
+                   f"benar-benar perlu mencadangkannya.</i>", wallets_kb())
+        return
+    if act in ("exportmenu", "delmenu"):
+        kind = "export" if act == "exportmenu" else "del"
+        pks = all_pks()
+        if kind == "del" and all(is_env_pk(k) for k in pks):
+            await edit(q.message, "Tidak ada wallet yang bisa dihapus — semuanya dari "
+                                  "<code>.env</code>.", wallets_kb())
+            return
+        title = ("🔑 Pilih wallet yang mau <b>diekspor</b>:" if kind == "export"
+                 else "🗑 Pilih wallet yang mau <b>dihapus</b>:")
+        await edit(q.message, title, wallet_pick_kb(kind))
+        return
+    if act in ("export", "del") and len(parts) == 3:
+        i = int(parts[2])
+        pks = all_pks()
+        if i >= len(pks):
+            await edit(q.message, "⚠️ Wallet sudah berubah. Buka menu lagi.", wallets_kb())
+            return
+        addr = _addr_of(pks[i])
+        if act == "export":
+            await edit(q.message,
+                       f"🔑 <b>Ekspor W{i + 1}</b>\n<code>{esc(addr)}</code>\n\n"
+                       f"⚠️ Private key akan dikirim sebagai pesan chat. Siapa pun yang "
+                       f"bisa membuka Telegram-mu (atau backup-nya) bisa mengambil seluruh "
+                       f"dana wallet ini. Pesannya dihapus otomatis 60 detik.",
+                       InlineKeyboardMarkup([[
+                           InlineKeyboardButton("Ya, tampilkan", callback_data=f"wal2|export2|{i}"),
+                           InlineKeyboardButton("‹ Batal", callback_data="wal2|back")]]))
+        else:
+            await edit(q.message,
+                       f"🗑 <b>Hapus W{i + 1}?</b>\n<code>{esc(addr)}</code>\n\n"
+                       f"⚠️ Key-nya dibuang dari <code>wallets.json</code>. Kalau belum "
+                       f"kamu cadangkan, dana di wallet ini TIDAK BISA diakses lagi. "
+                       f"Ekspor dulu kalau ragu.",
+                       InlineKeyboardMarkup([[
+                           InlineKeyboardButton("Ya, hapus", callback_data=f"wal2|del2|{i}"),
+                           InlineKeyboardButton("‹ Batal", callback_data="wal2|back")]]))
+        return
+    if act == "export2" and len(parts) == 3:
+        i = int(parts[2])
+        pks = all_pks()
+        if i >= len(pks):
+            await edit(q.message, "⚠️ Wallet sudah berubah.", wallets_kb())
+            return
+        m = await q.message.reply_text(
+            f"<code>{esc(pks[i])}</code>\n\n⏳ dihapus 60 detik lagi",
+            parse_mode=ParseMode.HTML)
+        asyncio.create_task(_autodelete(m, 60))
+        await edit(q.message, wallets_text(), wallets_kb())
+        return
+    if act == "del2" and len(parts) == 3:
+        i = int(parts[2])
+        pks = all_pks()
+        if i >= len(pks) or is_env_pk(pks[i]):
+            await edit(q.message, "⚠️ Wallet itu dari .env — tidak bisa dihapus lewat bot.",
+                       wallets_kb())
+            return
+        store.remove_wallet(pks[i])
+        s = store.load_settings()          # jangan tinggalkan wallet_idx menunjuk entah ke mana
+        s["wallet_idx"] = 0
+        store.save_settings(s)
+        await edit(q.message, "✅ Wallet dihapus.", wallets_kb())
+        return
+    await edit(q.message, wallets_text(), wallets_kb())
+
+
+async def cmd_wallets(update: Update, _):
+    if not authorized(update):
+        return
+    await reply(update, wallets_text(), wallets_kb())
 
 
 async def cmd_wallet(update: Update, _, status_msg=None, page: int = 0):
@@ -1065,6 +1240,29 @@ async def handle_awaiting(update: Update) -> bool:
     st = AWAITING.get(chat_id)
     if not st:
         return False
+    if st["kind"] == "wallet_import":
+        raw = (update.message.text or "").strip()
+        # Hapus pesan berisi private key SECEPATNYA — kalau tidak, key-nya mengendap
+        # di riwayat chat Telegram selamanya.
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+        AWAITING.pop(chat_id, None)
+        key = raw if raw.startswith("0x") else "0x" + raw
+        try:
+            addr = _addr_of(key)
+        except Exception:
+            await reply(update, "❌ Private key tidak valid. Harus 64 karakter hex.")
+            return True
+        if not store.add_wallet(key):
+            await reply(update, f"⚠️ Wallet <code>{esc(addr)}</code> sudah ada.", wallets_kb())
+            return True
+        await reply(update,
+                    f"✅ Wallet ditambahkan: <code>{esc(addr)}</code>\n"
+                    f"<i>Pesan berisi key sudah dihapus dari chat. Key tersimpan di "
+                    f"wallets.json (permission 600).</i>", wallets_kb())
+        return True
     if st["kind"] == "setval":
         parts = (update.message.text or "").strip().lower().split()
         if len(parts) != 2:
@@ -1858,6 +2056,12 @@ async def on_callback(update: Update, _):
     if data == "menu|wallet":
         await cmd_wallet(update, None, status_msg=q.message)
         return
+    if data == "menu|wallets" or data == "wal2|back":
+        await edit(q.message, wallets_text(), wallets_kb())
+        return
+    if data.startswith("wal2|"):
+        await handle_wallets_cb(update, q, data)
+        return
     if data == "menu|settings":
         await edit(q.message, settings_text(), settings_kb())
         return
@@ -2347,6 +2551,7 @@ async def post_init(app):
             BotCommand("list", "Posisi LP + PnL + chart/close"),
             BotCommand("orders", "Pesanan TP/SL (auto-close di market cap)"),
             BotCommand("wallet", "Saldo semua token + nilai USD"),
+            BotCommand("wallets", "Kelola wallet: impor/buat/ekspor/hapus"),
             BotCommand("settings", "Pengaturan via tombol"),
             BotCommand("chain", "Ganti chain aktif"),
             BotCommand("help", "Bantuan & daftar perintah"),
@@ -2388,6 +2593,7 @@ def main():
     app.add_handler(CommandHandler("set", cmd_set))
     app.add_handler(CommandHandler("chain", cmd_chain))
     app.add_handler(CommandHandler("wallet", cmd_wallet))
+    app.add_handler(CommandHandler("wallets", cmd_wallets))
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("orders", cmd_orders))
     app.add_handler(CallbackQueryHandler(on_callback))

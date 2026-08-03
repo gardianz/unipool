@@ -17,3 +17,6 @@ __pycache__/
 
 # cache set posisi aktif (dibangun ulang otomatis)
 .active_positions.json
+
+# brankas wallet tambahan — private key polos, JANGAN di-commit
+wallets.json

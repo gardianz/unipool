@@ -3,6 +3,7 @@ store.py — Penyimpanan JSON sederhana: settings bot + riwayat deposit/withdraw
 untuk hitung PnL portfolio ala /list.
 """
 import json
+import os
 import time
 import uuid
 from pathlib import Path
@@ -37,6 +38,68 @@ def _write(path: Path, data):
     tmp = path.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, indent=2))
     tmp.replace(path)
+
+
+# ---------- Brankas wallet (di luar .env) ----------
+# Wallet yang ditambahkan lewat bot disimpan di sini, TERPISAH dari .env supaya
+# .env tetap jadi milik operator mesin. File ini berisi private key polos: mode
+# 0600 dan wajib ada di .gitignore. Siapa pun yang bisa membaca file ini bisa
+# memindahkan seluruh dana wallet-wallet itu.
+WALLETS_FILE = BASE / "wallets.json"
+
+
+def _write_secret(path: Path, data):
+    """Tulis file rahasia: permission 0600 dipasang SEBELUM isi terlihat di FS."""
+    tmp = path.with_suffix(".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f, indent=2)
+    os.chmod(tmp, 0o600)
+    tmp.replace(path)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def wallets() -> list[dict]:
+    """[{name, pk}] — wallet tambahan di luar .env."""
+    d = _read(WALLETS_FILE, {"wallets": []})
+    out = []
+    for w in d.get("wallets", []):
+        if isinstance(w, dict) and w.get("pk"):
+            out.append({"name": str(w.get("name") or ""), "pk": str(w["pk"])})
+    return out
+
+
+def add_wallet(pk: str, name: str = "") -> bool:
+    """False kalau private key itu sudah ada (tidak digandakan)."""
+    pk = pk if pk.startswith("0x") else "0x" + pk
+    ws = wallets()
+    if any(w["pk"].lower() == pk.lower() for w in ws):
+        return False
+    ws.append({"name": name, "pk": pk})
+    _write_secret(WALLETS_FILE, {"wallets": ws})
+    return True
+
+
+def remove_wallet(pk: str) -> bool:
+    ws = wallets()
+    keep = [w for w in ws if w["pk"].lower() != str(pk).lower()]
+    if len(keep) == len(ws):
+        return False
+    _write_secret(WALLETS_FILE, {"wallets": keep})
+    return True
+
+
+def rename_wallet(pk: str, name: str) -> bool:
+    ws = wallets()
+    for w in ws:
+        if w["pk"].lower() == str(pk).lower():
+            w["name"] = name
+            _write_secret(WALLETS_FILE, {"wallets": ws})
+            return True
+    return False
 
 
 def load_settings() -> dict:

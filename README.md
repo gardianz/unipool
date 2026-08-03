@@ -31,6 +31,7 @@ Dua antarmuka, satu mesin (`chain.py`) — bisa dipakai bergantian, riwayat PnL-
 - 📈 **Chart** — tombol langsung ke GMGN & DexScreener per posisi/pool
 - ⚖️ **Rebalance satu tombol** — close (fee ikut terambil) → swap komposisi → mint ulang dengan lebar range sama dipusatkan di harga sekarang; pilih Wide/Lower/Upper; hanya dana hasil posisi itu yang dipakai; tombolnya juga muncul di alert keluar range
 - 🔔 **Alert** otomatis saat posisi keluar/masuk range
+- 🔑 **Kelola wallet dari bot** — impor private key, buat wallet baru, ekspor, hapus (`/wallets`). Wallet tambahan disimpan di `wallets.json` (permission 600, di-gitignore) terpisah dari `.env`; wallet `.env` tidak bisa dihapus lewat bot. Pesan berisi key dihapus otomatis: yang kamu kirim langsung setelah dibaca, hasil ekspor setelah 60 detik
 - 🧭 **Menu navigasi** — `/start` membuka dashboard (saldo + tombol Posisi/Dompet/Pengaturan/Chain); semua setting bisa diubah lewat tombol tanpa hafal perintah
 - 🛡️ **Failover RPC** multi-endpoint + bypass blokir DNS ISP Indonesia (DoH + koneksi IP langsung, sertifikat tetap diverifikasi)
 - 💰 Harga token berlapis: pool v3 → pair v2 → API dexscreener
@@ -137,6 +138,7 @@ Log `LP bot jalan. Wallet: 0x...` = siap. Buka chat bot kamu di Telegram, kirim 
 | paste `0x...` | cari pool token di chain aktif |
 | `/list` | posisi + PnL + tombol chart/close |
 | `/wallet` | saldo semua token + nilai USD + CA |
+| `/wallets` | kelola wallet: impor key, buat baru, ekspor, hapus |
 | `/settings` | lihat semua setting |
 | `/set width 30` | default lebar range % |
 | `/set amount_pct 50` | deposit % saldo quote |

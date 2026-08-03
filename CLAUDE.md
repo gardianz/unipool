@@ -41,7 +41,8 @@ kedua UI ikut berubah.
 - **`web.py`** — server `http.server` stdlib (tanpa framework) + API JSON. Meng-`import bot`
   untuk `pk()`, `_addr_of()`, `compute_amount()` — jadi `bot.py` harus tetap aman di-import
   tanpa efek samping (jangan taruh kode jalan di luar `main()`).
-- **`store.py`** — state JSON: settings, event PnL, registry posisi v2/v4, order TP/SL.
+- **`store.py`** — state JSON: settings, event PnL, registry posisi v2/v4, order TP/SL,
+  brankas wallet (`wallets.json`, ditulis mode 0600 lewat `_write_secret()`).
 - **`static/`** — `index.html` + `app.js` + `lightweight-charts.js` (di-vendor, offline).
 
 ### `CHAINS` di chain.py:26 adalah sumber kebenaran per-chain
@@ -267,6 +268,16 @@ per-posisi di jalur refresh.
 Ada bypass khusus blokir DNS ISP Indonesia: resolve via DNS-over-HTTPS lalu konek ke IP
 langsung dengan SNI dipertahankan (`_SNIAdapter`, `_forced_ip_w3`) — sertifikat tetap
 diverifikasi, jangan dilonggarkan.
+
+### Wallet: .env + brankas
+
+`all_pks()` = wallet `.env` (urutannya TETAP, supaya arti "W1" tidak bergeser) lalu
+wallet dari `store.wallets()`. Sengaja TIDAK di-cache — brankas berubah saat runtime.
+`env_pks()` yang di-cache. Wallet `.env` tidak bisa dihapus lewat bot (`is_env_pk()`).
+
+Private key lewat chat itu permanen di riwayat Telegram, jadi: pesan impor dihapus
+begitu dibaca, hasil ekspor dihapus otomatis 60 detik (`_autodelete()`), dan ekspor
+maupun hapus selalu dua langkah dengan peringatan. Jangan hilangkan penjagaan itu.
 
 ## Batasan yang disengaja
 
