@@ -1246,6 +1246,15 @@ def krystal_pools(chain_id: int, token: str) -> dict:
 # Pool v4 fee bebas memakai spacing bebas, tapi polanya konsisten: spacing ≈ fee/50
 # (fee 40000→800, 12500→250, 18888→378). Tier klasik tetap dicoba juga.
 _V4_SPACING_FIXED = (1, 10, 50, 60, 200)
+# Krystal menandai ETH native dengan sentinel 0xEeee…, Uniswap v4 memakai address(0).
+# Tanpa dinormalkan, PoolKey yang disusun tidak akan pernah menghasilkan poolId yang
+# sama dan SEMUA pool ber-quote ETH native ikut terbuang (terjadi di FRONG: pool
+# $618k hilang dari daftar).
+_NATIVE_SENTINELS = {"0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", V4_NATIVE}
+
+
+def _norm_currency(a: str) -> str:
+    return V4_NATIVE if str(a).lower() in _NATIVE_SENTINELS else Web3.to_checksum_address(a)
 
 
 def _spacing_candidates(fee: int) -> list[int]:
@@ -1253,6 +1262,26 @@ def _spacing_candidates(fee: int) -> list[int]:
     cands = {int(round(base)), int(base), int(base) + 1, *_V4_SPACING_FIXED,
              *(s for f, s in V4_FEE_SPACINGS if f == fee)}
     return [s for s in sorted(cands) if 1 <= s <= 32767]
+
+
+def _v4_key_from_indexer(chain_id: int, token: str, pool_id_hex: str) -> tuple | None:
+    """PoolKey dari indexer Uniswap: fee DAN tickSpacing dikirim apa adanya, jadi
+    tidak perlu menebak. Tetap dibuktikan lewat hash sebelum dipakai."""
+    want = str(pool_id_hex).lower()
+    try:
+        for ap in (uni_pools(chain_id, token) or []):
+            if str(ap.get("poolId", "")).lower() != want:
+                continue
+            hooks = _norm_currency((ap.get("hooks") or {}).get("address") or V4_NATIVE)
+            if int(hooks, 16) != 0:
+                return None
+            key = (*sort_tokens(_norm_currency(ap["token0"]), _norm_currency(ap["token1"])),
+                   int(ap["fee"]), int(ap["tickSpacing"]), Web3.to_checksum_address(V4_NATIVE))
+            if "0x" + v4_pool_id(key).hex().removeprefix("0x") == want:
+                return key
+    except Exception:
+        return None
+    return None
 
 
 def _v4_key_from_krystal(entry: dict, pool_id_hex: str) -> tuple | None:
@@ -1266,8 +1295,8 @@ def _v4_key_from_krystal(entry: dict, pool_id_hex: str) -> tuple | None:
         hooks = Web3.to_checksum_address(entry.get("hooks") or V4_NATIVE)
         if int(hooks, 16) != 0:
             return None                     # pool ber-hooks tidak didukung
-        c0, c1 = sort_tokens(Web3.to_checksum_address(entry["token0"]["address"]),
-                             Web3.to_checksum_address(entry["token1"]["address"]))
+        c0, c1 = sort_tokens(_norm_currency(entry["token0"]["address"]),
+                             _norm_currency(entry["token1"]["address"]))
         want = str(pool_id_hex).lower()
         fees = []
         if entry.get("dynamicFee"):
@@ -1318,7 +1347,10 @@ def discover_krystal(chain_id: int, token: str) -> list[dict]:
             if ver == 4:
                 # dari data Krystal dulu (tanpa RPC, dibuktikan lewat hash); log
                 # Initialize jadi cadangan karena getLogs rentang lebar sering ditolak
-                key = _v4_key_from_krystal(entry, addr) or _v4_key_from_init(w3, chain_id, addr)
+                # indexer (fee+spacing eksak) → data Krystal (tebak spacing) → log
+                key = (_v4_key_from_indexer(chain_id, token, addr)
+                       or _v4_key_from_krystal(entry, addr)
+                       or _v4_key_from_init(w3, chain_id, addr))
                 if not key:
                     return None
                 c0, c1 = Web3.to_checksum_address(key[0]), Web3.to_checksum_address(key[1])
@@ -1335,7 +1367,8 @@ def discover_krystal(chain_id: int, token: str) -> list[dict]:
                         "quote_sym": qsym, "quote_addr": q, "quote_decimals": qdec,
                         "quote_usd": qusd, "quote_is_token1": q.lower() == c1.lower(),
                         "token0": c0, "token1": c1, "sqrtp": sqrtp, "tick": None,
-                        "foreign_quote": q.lower() not in quotes_lc, **stats}
+                        "foreign_quote": q.lower() not in quotes_lc and q.lower() != V4_NATIVE,
+                        **stats}
             pc = w3.eth.contract(address=Web3.to_checksum_address(addr),
                                  abi=POOL_ABI if ver == 3 else V2_PAIR_ABI)
             t0, t1 = pc.functions.token0().call(), pc.functions.token1().call()
@@ -1390,8 +1423,11 @@ def discover_krystal(chain_id: int, token: str) -> list[dict]:
 
 
 def _quote_meta(w3: Web3, chain_id: int, q: str, quotes_lc: dict) -> tuple[str, float, int]:
-    """(simbol, harga USD, desimal) sisi quote — quote tetap maupun auto-deteksi."""
+    """(simbol, harga USD, desimal) sisi quote — quote tetap, native, atau auto-deteksi."""
     ql = str(q).lower()
+    if ql == V4_NATIVE:      # ETH native di v4: harganya = harga wrapped
+        cfg = CHAINS[chain_id]
+        return cfg["native_symbol"], quote_usd_price(w3, chain_id, cfg["wrapped_symbol"]), 18
     qdec = token_info(w3, Web3.to_checksum_address(q))["decimals"]
     if ql in quotes_lc:
         sym = quotes_lc[ql]

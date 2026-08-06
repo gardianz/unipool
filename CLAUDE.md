@@ -201,6 +201,17 @@ daftar Krystal, titik — tidak disaring ulang oleh `_drop_dead_pools`/`_drop_of
 Kalau Krystal tidak punya token itu (pair aneh: RTX/NVDAB, HOUSE/BTCB) barulah discovery
 sendiri jalan — dengan seluruh saringannya. `res["source"]` menyebut jalur mana yang dipakai.
 
+Dua jebakan yang sudah kena di jalur ini:
+
+- **Sentinel ETH native beda.** Krystal memakai `0xEeee…Eeee`, Uniswap v4 memakai
+  `address(0)`. Tanpa `_norm_currency()`, PoolKey tak pernah menghasilkan poolId yang
+  sama dan **semua** pool ber-quote ETH native terbuang — di FRONG itu berarti pool
+  $618k hilang dari daftar.
+- **Jangan menebak fee/spacing kalau ada sumber eksak.** Urutannya
+  `_v4_key_from_indexer()` (indexer Uniswap mengirim fee DAN tickSpacing) →
+  `_v4_key_from_krystal()` (tebak spacing dari pola fee/50) → `_v4_key_from_init()`
+  (log, sering ditolak RPC publik). Semuanya tetap dibuktikan lewat hash.
+
 Tetap berlaku: data Krystal **tidak pernah** otoritatif untuk transaksi. Tiap pool
 diverifikasi on-chain di `discover_krystal()` — v2/v3 dicek ke factory DEX-nya,
 v4 lewat `_v4_key_from_krystal()` yang menyusun PoolKey lalu membuktikannya dengan
