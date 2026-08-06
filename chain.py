@@ -954,31 +954,6 @@ def dex_volumes(chain_id: int, token_addr: str) -> dict:
             for p in _dex_pairs(chain_id, token_addr)}
 
 
-def dex_vol30(chain_id: int, pool_addr: str, _cache={}) -> float | None:
-    """Volume ~30 hari (jumlah candle harian GeckoTerminal; pool muda = sejak listing).
-    None kalau tidak terindeks / rate limit."""
-    cfg = CHAINS[chain_id]
-    slug = cfg.get("gecko")
-    if not slug:
-        return None
-    key = (chain_id, pool_addr.lower())
-    hit = _cache.get(key)
-    if hit and time.time() - hit[1] < 900:
-        return hit[0]
-    try:
-        r = requests.get(
-            f"https://api.geckoterminal.com/api/v2/networks/{slug}/pools/{pool_addr}/ohlcv/day",
-            params={"limit": 30}, timeout=10)
-        if r.status_code != 200:
-            return None  # 429/404 — jangan cache, coba lagi nanti
-        candles = r.json().get("data", {}).get("attributes", {}).get("ohlcv_list", [])
-        vol = float(sum(c[5] for c in candles)) if candles else None
-    except Exception:
-        return None
-    _cache[key] = (vol, time.time())
-    return vol
-
-
 # ---------- Discovery pool via API resmi Uniswap (ListPools) ----------
 # Sumber yang sama dengan app.uniswap.org & dengan daftar posisi, jadi konsisten.
 # Read-only, tanpa API key. Penting: pool v4 di chain ini banyak yang pakai fee &

@@ -147,6 +147,13 @@ def fmt_short(v) -> str:
     return f"{v:.1f}"
 
 
+def fmt_ratio(vol, tvl) -> str:
+    """Rasio volume 24 jam terhadap TVL: 2.8k% · 660% · 47% · –."""
+    if not vol or not tvl:
+        return "–"
+    return fmt_pct_short(vol / tvl * 100)
+
+
 def fmt_pct_short(v) -> str:
     """Persen ringkas: 52k% · 3.0k% · 55% · –."""
     if not v:
@@ -738,14 +745,13 @@ async def on_address(update: Update, _):
         return
 
     top = pools[:10]
-    # vol 30 hari via GeckoTerminal — sequential (rate limit ketat), gagal = tampil "–"
-    vol30s = await asyncio.to_thread(lambda: [ch.dex_vol30(cid, p["pool"]) for p in top])
-
     tsym = res["token"]["symbol"]
     # Tabel monospace (<pre>) — 42 kolom, muat di layar HP tanpa wrap.
-    rows = [f"{'#':>2} {'pool':<7} {'fee':>6} {'TVL':>6} {'APR':>5} {'1D':>5} {'30D':>5}"]
+    # V/TVL = volume 24 jam ÷ TVL. Ini yang menunjukkan pool benar-benar dipakai:
+    # TVL besar tapi rasio kecil = modal nganggur, fee-nya tipis.
+    rows = [f"{'#':>2} {'pool':<7} {'fee':>6} {'TVL':>6} {'APR':>5} {'1D':>5} {'V/TVL':>6}"]
     buttons = []
-    for i, (p, v30) in enumerate(zip(top, vol30s), 1):
+    for i, p in enumerate(top, 1):
         key = uuid.uuid4().hex[:10]
         PENDING[key] = {"chain": cid, "token": res["token"], "pool_info": p,
                         "mode": "v2" if p.get("ver") == 2 else "lower",
@@ -759,7 +765,7 @@ async def on_address(update: Update, _):
         rows.append(
             f"{i:>2} {f'v{ver}{dtag}{warn} ' + p['quote_sym'][:5]:<7} {p['fee'] / 10000:>5.2f}% "
             f"{fmt_short(p['tvl_usd']):>6} {fmt_pct_short(p.get('apr_pct')):>5} "
-            f"{fmt_short(p.get('vol24_usd')):>5} {fmt_short(v30):>5}")
+            f"{fmt_short(p.get('vol24_usd')):>5} {fmt_ratio(p.get('vol24_usd'), p.get('tvl_usd')):>6}")
         buttons.append([InlineKeyboardButton(
             f"{i}. [{esc(p.get('dex') or '')} v{ver}] {p['quote_sym']} "
             f"{p['fee'] / 10000:.2f}% · {ch.fmt_usd(p['tvl_usd'])}",
@@ -780,8 +786,9 @@ async def on_address(update: Update, _):
                     f"yang dipakai menyeret harganya balik ke pasar.")
     text = (f"Found {len(pools)} pool(s) untuk <b>{esc(tsym)}</b> ({_t.time() - t0:.1f}s):\n"
             f"<pre>{esc(chr(10).join(rows))}</pre>\n"
-            f"<i>P=PancakeSwap · U=Uniswap · ! = harga menyimpang · TVL/volume USD · APR estimasi · vol dari dexscreener &amp; GeckoTerminal "
-            f"(– = pool belum terindeks)</i>{off_line}\n\nPilih pool:")
+            f"<i>P=PancakeSwap · U=Uniswap · ! = harga menyimpang · TVL/volume USD · "
+            f"APR estimasi · V/TVL = volume 24j ÷ TVL (makin tinggi makin produktif) "
+            f"· – = belum terindeks</i>{off_line}\n\nPilih pool:")
     await edit(status, text, InlineKeyboardMarkup(buttons))
 
 

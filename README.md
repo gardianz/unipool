@@ -34,6 +34,7 @@ Dua antarmuka, satu mesin (`chain.py`) — bisa dipakai bergantian, riwayat PnL-
 - 🔑 **Kelola wallet dari bot** — impor private key, buat wallet baru, ekspor, hapus (`/wallets`). Wallet tambahan disimpan di `wallets.json` (permission 600, di-gitignore) terpisah dari `.env`; wallet `.env` tidak bisa dihapus lewat bot. Pesan berisi key dihapus otomatis: yang kamu kirim langsung setelah dibaca, hasil ekspor setelah 60 detik
 - 🧭 **Menu navigasi** — `/start` membuka dashboard (saldo + tombol Posisi/Dompet/Pengaturan/Chain); semua setting bisa diubah lewat tombol tanpa hafal perintah
 - 🛡️ **Failover RPC** multi-endpoint + bypass blokir DNS ISP Indonesia (DoH + koneksi IP langsung, sertifikat tetap diverifikasi)
+- 📐 **V/TVL** di daftar pool — volume 24 jam ÷ TVL, kolom yang sama dengan Krystal. TVL besar tapi rasio kecil = modal nganggur, fee-nya tipis
 - 💰 Harga token berlapis: pool v3 → pair v2 → API dexscreener
 - 🖥️ **UI web** (`web.py`) — chart candle real-time, atur range dengan **drag garis MIN/MAX**, peta likuiditas, mint/add/reduce/collect/close/rebalance dari browser
 
