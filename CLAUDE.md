@@ -98,6 +98,12 @@ Satu dict "pool_info" dipakai lintas seluruh kode dengan field `ver` (2/3/4) plu
 `pool`, `fee`, `quote_addr`, `quote_sym`, `quote_is_token1`, `token0/1`, `tick_spacing`.
 Pool v4 juga membawa `pool_id` dan `key` (PoolKey tuple).
 
+`pool_info["pool"]` itu **alamat kontrak** untuk v2/v3 tapi **poolId 32-byte** untuk v4.
+Jangan pernah men-`to_checksum_address()` nilai itu tanpa cek `ver` — pernah bikin mode
+Upper mati di semua pool v4 (`Unknown format '0x…'`). Untuk v4 pakai `pool_id` +
+`v4_slot0()`; desimal currency pakai `_v4_currency_info()` karena sisi ETH native
+(address(0)) tidak punya kontrak ERC20.
+
 Posisi diidentifikasi oleh **`pid`**: `"183469"` = v3, `"v4:12"` = v4, `"v2:0xpair"` = v2
 (`parse_pid()`). Aksi generik lewat `add_any` / `reduce_any` / `collect_any` / `close_any` /
 `rebalance_position` — jangan panggil varian per-versi langsung dari UI.

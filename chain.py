@@ -2604,14 +2604,35 @@ def token_supply(w3: Web3, addr: str, _cache={}) -> float:
 
 
 def _meme_usd(w3: Web3, chain_id: int, pool_info: dict) -> float:
-    """Harga USD 1 meme via harga pool × harga USD quote."""
-    pool = w3.eth.contract(address=Web3.to_checksum_address(pool_info["pool"]), abi=POOL_ABI)
-    sp = pool.functions.slot0().call()[0]
-    raw = (sp / Q96) ** 2  # token1 per token0
+    """Harga USD 1 meme via harga pool × harga USD quote.
+
+    WAJIB sadar versi: pool_info["pool"] itu ALAMAT kontrak untuk v2/v3, tapi
+    poolId 32-byte untuk v4. Dulu fungsi ini selalu memperlakukannya sebagai alamat,
+    jadi mode Upper di pool v4 mana pun mati dengan "Unknown format '0x…'" (66 hex
+    dipaksa jadi alamat 20 byte)."""
+    ver = pool_info.get("ver", 3)
     q_is_t1 = pool_info["quote_is_token1"]
     meme = pool_info["token0"] if q_is_t1 else pool_info["token1"]
-    mdec = token_info(w3, meme)["decimals"]
     qdec = pool_info["quote_decimals"]
+
+    if ver == 2:
+        rq, rm = _v2_pair_reserves(w3, pool_info["pool"], pool_info["quote_addr"])
+        if rm <= 0:
+            return 0.0
+        mdec = _v4_currency_info(w3, chain_id, meme)["decimals"]
+        return (rq / 10 ** qdec) / (rm / 10 ** mdec) * pool_info["quote_usd"]
+
+    if ver == 4:
+        pid = pool_info.get("pool_id") or bytes.fromhex(str(pool_info["pool"]).removeprefix("0x"))
+        sp = v4_slot0(w3, chain_id, pid)[0]
+    else:
+        pool = w3.eth.contract(address=Web3.to_checksum_address(pool_info["pool"]), abi=POOL_ABI)
+        sp = pool.functions.slot0().call()[0]
+    if not sp:
+        return 0.0
+    raw = (sp / Q96) ** 2  # token1 per token0
+    # currency v4 bisa ETH native (address(0)) — token_info gagal untuk itu
+    mdec = _v4_currency_info(w3, chain_id, meme)["decimals"]
     meme_in_q = raw * 10 ** (mdec - qdec) if q_is_t1 else (1 / raw) * 10 ** (mdec - qdec)
     return meme_in_q * pool_info["quote_usd"]
 
