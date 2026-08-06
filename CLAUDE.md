@@ -102,6 +102,18 @@ Posisi diidentifikasi oleh **`pid`**: `"183469"` = v3, `"v4:12"` = v4, `"v2:0xpa
 (`parse_pid()`). Aksi generik lewat `add_any` / `reduce_any` / `collect_any` / `close_any` /
 `rebalance_position` — jangan panggil varian per-versi langsung dari UI.
 
+### Pembukuan rebalance tidak boleh bolong
+
+`do_rebalance` (bot) dan `api_action` (web) memotret posisi lama SEBELUM eksekusi
+untuk mencatat event `close` + `fees`. Kalau snapshot gagal dibaca (RPC lag), dulu
+tidak ada event close sama sekali padahal event `mint` posisi baru tetap dicatat —
+deposit lama menggantung "masih terbuka" dan PnL portfolio menggelembung palsu.
+
+Sekarang `rebalance_position()` mengembalikan `closed_usd` (nilai yang benar-benar
+keluar dari posisi, dihitung dari delta saldo SEBELUM swap komposisi) dan dipakai
+sebagai cadangan. `closed_usd` sudah termasuk fee — jadi di jalur cadangan itu
+**jangan** menambah event `fees` lagi, nanti dobel.
+
 ### Registry posisi (kenapa `history.json` penting)
 
 Posisi v3 bisa dienumerasi on-chain (ERC721Enumerable), tapi **PositionManager v4 tidak

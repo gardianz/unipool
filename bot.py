@@ -1911,10 +1911,20 @@ async def do_rebalance(update: Update, pid: str, mode: str):
 
     ver, old_ref = ch.parse_pid(pid)
     ev_old = old_ref if ver == 3 else str(pid)
+    # Pembukuan tidak boleh bolong: kalau snapshot posisi lama gagal dibaca (RPC lag),
+    # event close tetap dicatat dari nilai hasil close yang sebenarnya. Tanpa ini,
+    # deposit posisi lama menggantung sebagai "masih terbuka" sementara posisi baru
+    # terhitung modal segar — PnL portfolio menggelembung palsu.
     if pos:
-        store.record_event(cid, "close", ev_old, pos["value_usd"], "rebalance out", wallet=wallet_address())
+        store.record_event(cid, "close", ev_old, pos["value_usd"], "rebalance out",
+                           wallet=wallet_address())
         if pos["unclaimed_usd"] > 0:
             store.record_event(cid, "fees", ev_old, pos["unclaimed_usd"], wallet=wallet_address())
+    elif r.get("closed_usd"):
+        # closed_usd sudah mencakup principal + fee, jadi TIDAK ditambah event fees
+        # terpisah — kalau tidak, fee-nya terhitung dua kali.
+        store.record_event(cid, "close", ev_old, r["closed_usd"],
+                           "rebalance out (snapshot gagal)", wallet=wallet_address())
     new_pid = f"v4:{r['token_id']}" if ver == 4 else r["token_id"]
     if ver == 4:
         store.drop_ref(cid, wallet_address(), "v4", str(old_ref))

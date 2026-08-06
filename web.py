@@ -830,10 +830,15 @@ def api_action(_q, b) -> dict:
         extra["swaps"] = [{"sym": sy, "tx": h, "url": ch.tx_link(cid, h)}
                           for sy, h in r.get("swaps", []) if str(h).startswith("0x")]
     elif act == "rebalance":
+        # sama seperti bot: pembukuan tidak boleh bolong kalau snapshot gagal dibaca
         if pos:
             store.record_event(cid, "close", tid, pos["value_usd"], "rebalance out", wallet=addr)
             if pos["unclaimed_usd"] > 0:
                 store.record_event(cid, "fees", tid, pos["unclaimed_usd"], wallet=addr)
+        elif r.get("closed_usd"):
+            # closed_usd = principal + fee, jangan tambah event fees terpisah
+            store.record_event(cid, "close", tid, r["closed_usd"],
+                               "rebalance out (snapshot gagal)", wallet=addr)
         new_pid = f"v4:{r['token_id']}" if ver == 4 else r["token_id"]
         if ver == 4:
             store.drop_ref(cid, addr, "v4", str(ref))

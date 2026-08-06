@@ -4870,6 +4870,16 @@ def rebalance_position(chain_id: int, pk: str, pid, mode: str, slippage_pct: flo
         if excess_q > total_q // 100 and mprice_q > 0:
             do_swap(meme, quote, int(excess_q / mprice_q))
 
+    # Nilai USD yang BENAR-BENAR keluar dari posisi (principal + fee — burn v4 dan
+    # decrease+collect v3 sama-sama menarik keduanya). Dipakai pemanggil sebagai
+    # cadangan pencatatan PnL kalau snapshot posisi lama gagal dibaca.
+    closed_usd = 0.0
+    try:
+        closed_usd = ((q_delta + (m_delta * mprice_q if mprice_q else 0)) / 10 ** qdec
+                      * pool_info["quote_usd"])
+    except Exception:
+        closed_usd = 0.0
+
     # ---- baca ulang delta setelah swap → budget mint (hanya proceeds) ----
     time.sleep(1)
     q_delta = max(0, _wallet_balance(w3, quote, account.address) - pre_q)
@@ -4893,6 +4903,7 @@ def rebalance_position(chain_id: int, pk: str, pid, mode: str, slippage_pct: flo
     return {"ver": ver, "old_ref": ref, "steps": steps,
             "closed_got0": closed["got0"], "closed_got1": closed["got1"],
             "closed_sym0": closed["sym0"], "closed_sym1": closed["sym1"],
+            "closed_usd": closed_usd,
             "token_id": r["token_id"], "mode": mode,
             "tick_lower": r["tick_lower"], "tick_upper": r["tick_upper"],
             "cur_tick": r["cur_tick"], "deposited": r["deposited"],
