@@ -1568,8 +1568,21 @@ def discover_any(chain_id: int, token_addr: str) -> dict:
                 dev = p["price_usd"] / ref["price_usd"] - 1
                 if p is not ref and abs(dev) > PRICE_DEVIATION_MAX:
                     p["deviation"] = dev
+        # Krystal terbukti melewatkan pool ber-quote aneh (RUBY/RDDT $40k tidak ada
+        # di daftar mereka padahal itu pool terbesarnya). Jadi pencari pair aneh TETAP
+        # dijalankan dan hasilnya digabung — persis aturan "pair aneh pakai discovery
+        # sendiri". Angka pool yang Krystal punya tetap dari Krystal.
+        try:
+            seen = {str(p["pool"]).lower() for p in res["pools"]}
+            extra = [p for p in discover_foreign_pools(get_w3(chain_id), chain_id,
+                                                       token_addr, seen)
+                     if (p.get("tvl_usd") or 0) > 0]
+            res["pools"] += extra
+        except Exception:
+            pass
         res["pools"].sort(key=lambda p: p.get("tvl_usd") or 0, reverse=True)
         res["dropped_dead"], res["dropped_offprice"] = [], []
+        res["hook_pools"] = count_hook_pools(chain_id, token_addr)
         return res
 
     # Token tidak ada di Krystal (pair aneh) → discovery sendiri.
@@ -1646,6 +1659,7 @@ def discover_any(chain_id: int, token_addr: str) -> dict:
     res["pools"], res["dropped_offprice"] = _drop_offprice_pools(
         res["pools"], (res.get("token") or {}).get("decimals", 18), token_addr)
     res["pools"].sort(key=lambda p: p.get("tvl_usd") or 0, reverse=True)
+    res["hook_pools"] = count_hook_pools(chain_id, token_addr)
     return res
 
 
@@ -1976,6 +1990,46 @@ def discover_dex_pools(w3: Web3, chain_id: int, token: str,
 
 
 # ---------- Discovery pool ber-quote di luar daftar tetap ----------
+def count_hook_pools(chain_id: int, token: str) -> int:
+    """Berapa pool v4 ber-hooks yang ADA tapi sengaja tidak didukung.
+
+    Hook = kontrak arbitrer yang ikut jalan di tiap swap/mint/burn, bisa memotong
+    hasil atau memblokir penarikan. Bot menolaknya, tapi jumlahnya harus disebutkan
+    ke user — kalau tidak, pool besar bisa hilang dari daftar tanpa penjelasan
+    (kasus nyata: RUBY/RDDT ber-TVL $40k)."""
+    n = 0
+    seen = set()
+    try:
+        for e in (uni_pools(chain_id, token) or []):
+            if str(e.get("protocolVersion")) != "PROTOCOL_VERSION_V4":
+                continue
+            h = str((e.get("hooks") or {}).get("address") or V4_NATIVE)
+            pid = str(e.get("poolId", "")).lower()
+            if pid and pid not in seen and int(h, 16) != 0:
+                seen.add(pid)
+                n += 1
+    except Exception:
+        pass
+    try:
+        for e in krystal_raw(chain_id, token):
+            h = str(e.get("hooks") or V4_NATIVE)
+            pid = str(e.get("poolAddress", "")).lower()
+            if pid and pid not in seen and h and int(h, 16) != 0:
+                seen.add(pid)
+                n += 1
+    except Exception:
+        pass
+    return n
+
+
+def _dexliq_of(chain_id: int, token: str, addr: str) -> float:
+    """Likuiditas USD satu pool menurut dexscreener (v4 tak bisa dihitung on-chain)."""
+    for pr in _dex_pairs(chain_id, token):
+        if str(pr.get("pairAddress") or "").lower() == str(addr).lower():
+            return float((pr.get("liquidity") or {}).get("usd") or 0)
+    return 0.0
+
+
 def _foreign_counter(pr: dict, token_lc: str) -> tuple[str, str] | None:
     """(alamat, simbol) sisi lawan dari entri dexscreener. None kalau tidak jelas."""
     for side, other in (("baseToken", "quoteToken"), ("quoteToken", "baseToken")):
@@ -2011,7 +2065,7 @@ def discover_foreign_pools(w3: Web3, chain_id: int, token: str, skip: set,
     cands, seen = [], set()
     for pr in pairs:
         addr = str(pr.get("pairAddress") or "")
-        if not addr.startswith("0x") or len(addr) != 42 or addr.lower() in skip:
+        if not addr.startswith("0x") or len(addr) not in (42, 66) or addr.lower() in skip:
             continue
         c = _foreign_counter(pr, token_lc)
         if not c or c[0].lower() in quotes_lc or c[0].lower() == token_lc:
@@ -2020,10 +2074,20 @@ def discover_foreign_pools(w3: Web3, chain_id: int, token: str, skip: set,
             continue
         seen.add(addr.lower())
         labels = pr.get("labels") or []
-        ver = 3 if "v3" in labels else 2 if ("v2" in labels or not labels) else None
-        if ver is None:       # v4 dsb — di luar jangkauan jalur ini
+        if "v4" in labels:
+            # poolId 32-byte, bukan alamat. PoolKey dipulihkan & dibuktikan lewat hash.
+            ver = 4 if (any_has_v4(chain_id) and len(addr) == 66) else None
+        elif "v3" in labels:
+            ver = 3
+        elif "v2" in labels or not labels:
+            ver = 2
+        else:
+            ver = None
+        if ver is None:
             continue
-        cands.append((ver, Web3.to_checksum_address(addr), Web3.to_checksum_address(c[0]), c[1],
+        # v4: addr itu poolId 32-byte — JANGAN di-checksum (lihat catatan di CLAUDE.md)
+        addr_n = addr.lower() if ver == 4 else Web3.to_checksum_address(addr)
+        cands.append((ver, addr_n, Web3.to_checksum_address(c[0]), c[1],
                       float((pr.get("volume") or {}).get("h24") or 0)))
         if len(cands) >= max_pools:
             break
@@ -2031,6 +2095,35 @@ def discover_foreign_pools(w3: Web3, chain_id: int, token: str, skip: set,
     def build(item):
         ver, addr, counter, csym, vol24 = item
         try:
+            if ver == 4:
+                key = (_v4_key_from_indexer(chain_id, token, addr)
+                       or _v4_key_from_init(w3, chain_id, addr))
+                if not key:
+                    return None
+                c0, c1 = Web3.to_checksum_address(key[0]), Web3.to_checksum_address(key[1])
+                q = c1 if c0.lower() == token.lower() else c0
+                if quote_backing_usd(w3, chain_id, q) <= 0:
+                    return None
+                qsym, qusd, qdec = _quote_meta(w3, chain_id, q, {a.lower(): sname
+                                                                 for sname, a in cfg["quotes"].items()})
+                if qusd <= 0:
+                    return None
+                pid = v4_pool_id(key)
+                sqrtp = v4_slot0(w3, chain_id, pid)[0]
+                p = {"ver": 4, "dex": v4_dex(chain_id),
+                     "pool": "0x" + pid.hex().removeprefix("0x"), "pool_id": pid, "key": key,
+                     "fee": key[2], "tick_spacing": key[3], "sqrtp": sqrtp, "tick": None,
+                     "quote_sym": qsym, "quote_addr": q, "quote_decimals": qdec,
+                     "quote_usd": qusd, "quote_is_token1": q.lower() == c1.lower(),
+                     "token0": c0, "token1": c1, "tvl_usd": 0.0,
+                     "vol24_usd": vol24 or None, "foreign_quote": q.lower() != V4_NATIVE}
+                lq = _dexliq_of(chain_id, token, addr)
+                if lq:
+                    p["tvl_usd"] = lq
+                    p["tvl_src"] = "dexscreener"
+                v, tvl = p.get("vol24_usd"), p["tvl_usd"]
+                p["apr_pct"] = (v * p["fee"] / 1e6 / tvl * 365 * 100) if (v and tvl) else None
+                return p
             # Syaratnya bukan sekadar "punya harga" (token_usd_price bisa jatuh ke
             # dexscreener untuk token apa pun), tapi punya sokongan likuiditas
             # on-chain terhadap quote tetap — itu yang membuat nilainya bisa

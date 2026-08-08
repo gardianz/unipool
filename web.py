@@ -303,6 +303,7 @@ def api_discover(_q, b) -> dict:
     off = res.get("dropped_offprice") or []
     return {"token": res["token"], "pools": out,
             "dropped_dead": len(res.get("dropped_dead") or []),
+            "hook_pools": res.get("hook_pools") or 0,
             # pool ber-harga menyimpang jauh dibuang di server; klien cuma diberi
             # ringkasannya supaya tahu kenapa jumlahnya lebih sedikit
             "dropped_offprice": [{"ver": d.get("ver", 3), "quote_sym": d["quote_sym"],

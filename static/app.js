@@ -692,6 +692,10 @@ async function discover() {
         <div class="cell"><small>APR</small>${p.apr_pct ? nf(p.apr_pct, 1) + '%' : '—'}</div>
         <div class="cell"><small>Fee tier</small>${p.fee_pct.toFixed(2)}%</div>
       </div>`).join('');
+    if (r.hook_pools) {
+      $('#pools').insertAdjacentHTML('beforeend',
+        `<div class="dim" style="padding:6px 4px;font-size:12px">🪝 ${r.hook_pools} pool v4 ber-hooks tidak ditampilkan — hook = kontrak arbitrer yang bisa menahan dana. Sengaja tidak didukung.</div>`);
+    }
     if (r.dropped_dead) {
       $('#pools').insertAdjacentHTML('beforeend',
         `<div class="dim" style="padding:6px 4px;font-size:12px">🔇 ${r.dropped_dead} pool disembunyikan — tanpa TVL/volume 24 jam.</div>`);

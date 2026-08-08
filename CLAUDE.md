@@ -330,7 +330,9 @@ maupun hapus selalu dua langkah dengan peringatan. Jangan hilangkan penjagaan it
 
 ## Batasan yang disengaja
 
-- Pool v4 **ber-hooks dilewati** (hook = kode arbitrer, risiko rug).
+- Pool v4 **ber-hooks dilewati** (hook = kode arbitrer, risiko rug). Jumlahnya
+  DISEBUTKAN di UI lewat `count_hook_pools()` — dulu pool semacam itu hilang diam-diam
+  dan dikira bug (kasus nyata: RUBY/RDDT ber-TVL $40k, hook `0x778b0c4e…`).
 - **v4 mati di BSC**: PancakeSwap tidak punya kontrak kompatibel-v4; padanannya
   "Infinity" (Vault + CLPoolManager) arsitekturnya beda total dan belum didukung.
   `has_v4(56)` False, dan `verify_v4`/`discover_v4_pools` fail-closed tanpa key `v4_*`.

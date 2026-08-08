@@ -773,9 +773,14 @@ async def on_address(update: Update, _):
             callback_data=f"pool|{key}")])
     buttons.append([InlineKeyboardButton("✖ Cancel", callback_data="cancel")])
     # pool yang disaring — sebutkan, jangan hilang diam-diam
+    hooks_n = res.get("hook_pools") or 0
     dead = res.get("dropped_dead") or []
     off = res.get("dropped_offprice") or []
     off_line = ""
+    if hooks_n:
+        off_line += (f"\n🪝 {hooks_n} pool v4 <b>ber-hooks</b> tidak ditampilkan — hook itu "
+                     f"kontrak arbitrer yang ikut jalan tiap swap/mint/burn dan bisa "
+                     f"menahan dana. Sengaja tidak didukung.")
     if dead:
         off_line += (f"\n🔇 {len(dead)} pool disembunyikan — tanpa TVL/volume 24 jam "
                      f"(pool mati; yang TVL-nya masih ≥5% pool terdalam tetap ditampilkan).")
