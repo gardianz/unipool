@@ -10,6 +10,7 @@ import asyncio
 import functools
 import html
 import logging
+import math
 import os
 import re
 import sys
@@ -887,6 +888,13 @@ def pool_warnings(cid: int, p: dict) -> str:
             f"swap 2 langkah (fee &amp; slippage dobel).")
     if p.get("thin"):
         lines.append("⚠️ TVL pool sangat kecil — slippage besar dan harga gampang digeser.")
+    # Pool ber-fee besar punya tick spacing lebar; tepi range WAJIB kelipatan spacing,
+    # jadi range tidak bisa dipasang rapat ke harga. Sebutkan supaya tidak dikira bug.
+    bp = box_pct(p)
+    if p.get("ver") in (3, 4) and bp >= 1:
+        lines.append(
+            f"📐 Kisi pool ini <b>{bp:g}%</b> — tepi range wajib kelipatan tick spacing, "
+            f"jadi tidak bisa lebih rapat dari itu. Tombol 🎯 Rapat memakai satu kotak kisi.")
     if p.get("deviation"):
         lines.append(
             f"⚠️ Harga pool ini <b>{p['deviation'] * 100:+.0f}%</b> dari pool terdalam. "
@@ -1090,6 +1098,20 @@ def build_preview(ctx_data: dict) -> str:
     )
 
 
+# Lebar minta-sekecil-mungkin. calc_strategy_range membulatkan tepi KE LUAR ke
+# kelipatan tick spacing, jadi meminta lebar ~1 tick selalu menghasilkan tepat SATU
+# kotak kisi — range terapat yang legal di pool mana pun. Meminta selebar satu kotak
+# justru meluber jadi dua, karena harga sekarang ada di tengah kotak.
+TIGHT_PCT = 0.01
+
+
+def box_pct(pool_info: dict) -> float:
+    """Lebar satu kotak tick-spacing dalam persen — presisi terbaik pool ini.
+    Pool fee 5% biasanya spacing 1000 (≈10,5%), fee 0,05% spacing 10 (≈0,1%)."""
+    sp = int(pool_info.get("tick_spacing") or ch.TICK_SPACING.get(pool_info.get("fee"), 60) or 60)
+    return round((math.exp(0.0001 * sp) - 1) * 100, 4)
+
+
 def confirm_kb(key: str, ctx_data: dict) -> InlineKeyboardMarkup:
     mode = ctx_data["mode"]
     rec = ctx_data["rec"]
@@ -1130,6 +1152,7 @@ def confirm_kb(key: str, ctx_data: dict) -> InlineKeyboardMarkup:
          InlineKeyboardButton("❌ Cancel", callback_data=f"cancelp|{key}")],
         [sbtn(m) for m in ("stable", "wide", "lower", "upper")],
         [wbtn(lo, up) for lo, up in STRAT_PRESETS[mode]],
+        [InlineKeyboardButton("🎯 Rapat (1 kotak kisi)", callback_data=f"tight|{key}")],
         [abtn(a) for a in (25, 50, 75, 100)],
         [InlineKeyboardButton("✏️ Custom Range…", callback_data=f"askrng|{key}"),
          InlineKeyboardButton("✏️ Custom Amount…", callback_data=f"askamt|{key}")],
@@ -1165,6 +1188,12 @@ def parse_range_input(text: str, mode: str, mc_now: float) -> tuple[float, float
     """Parse balasan range: persen ('40', '40 120') atau market cap ('mc 300k 800k',
     '300k 800k'). Return (low_pct, up_pct)."""
     t = text.lower().replace("$", "").replace("%", "").replace("–", " ").replace("-", " ").strip()
+    # "r 40 120" / "range 40 120" — bentuk yang dipakai kalau diketik sebagai pesan
+    # biasa. Diterima juga di sini supaya user tidak perlu ingat dua format.
+    for pfx in ("range ", "r "):
+        if t.startswith(pfx):
+            t = t[len(pfx):].strip()
+            break
     is_mc = t.startswith("mc")
     if is_mc:
         t = t[2:].strip()
@@ -2120,6 +2149,18 @@ async def on_callback(update: Update, _):
     if data.startswith("pool|"):
         # pilih pool → kartu konfirmasi (belum mint)
         await show_confirm(q.message, data.split("|", 1)[1])
+        return
+    if data.startswith("tight|"):
+        key = data.split("|", 1)[1]
+        ctx = PENDING.get(key)
+        if not ctx:
+            await edit(q.message, "⚠️ Tombol kadaluarsa (bot sempat restart). Paste alamat lagi.")
+            return
+        # Range selebar SATU kotak tick-spacing, menempel harga (gap 0). Lebih rapat
+        # dari ini mustahil: tepi range wajib kelipatan spacing.
+        ctx["low_pct"] = ctx["up_pct"] = TIGHT_PCT
+        ctx["gap"] = 0
+        await show_confirm(q.message, key)
         return
     if data.startswith(("wd|", "amt|", "st|")):
         parts = data.split("|")

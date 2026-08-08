@@ -25,6 +25,7 @@ Dua antarmuka, satu mesin (`chain.py`) — bisa dipakai bergantian, riwayat PnL-
 - 💧 **V2** — add liquidity full-range 50/50 (swap otomatis setengah budget), reduce/close via router; fee auto-compound ke posisi (Uniswap 0.3%, PancakeSwap 0.25%)
 - 🛡️ **Anti pool beracun** — probe swap bolak-balik ~$100 (Quoter v4 / matematika reserves v2): pool dust atau harga dimanipulasi dibuang dari daftar; semua alamat kontrak v2/v4 diverifikasi silang on-chain sebelum tx pertama (fail-closed)
 - 🎯 **4 strategi range**: Stable (±6%), Wide (dua sisi), Lower (setor quote saja, nampung kalau harga turun), Upper (setor token saja, jual bertahap kalau naik) + rekomendasi otomatis
+- 🎯 **Tombol Rapat** — range selebar satu kotak tick spacing, serapat yang diizinkan pool. Kartu konfirmasi menyebut presisi kisinya (pool fee 5% biasanya 10,5%; fee 0,05% sekitar 0,1%)
 - ✏️ **Custom range** via persen atau **market cap** (`mc 300k 800k`), custom amount (persen saldo / nilai pasti)
 - 🔁 **Auto-wrap** ETH→WETH, **auto-swap** komposisi dua sisi (token existing di wallet dipakai duluan); pair non-WETH (mis. USDG) otomatis dibeli dari saldo WETH/ETH saat mint
 - 📊 **/list** — nilai posisi, fee unclaimed, PnL per posisi & portfolio, status IN/OUT range
