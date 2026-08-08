@@ -108,6 +108,14 @@ Posisi diidentifikasi oleh **`pid`**: `"183469"` = v3, `"v4:12"` = v4, `"v2:0xpa
 (`parse_pid()`). Aksi generik lewat `add_any` / `reduce_any` / `collect_any` / `close_any` /
 `rebalance_position` — jangan panggil varian per-versi langsung dari UI.
 
+### Auto-swap saat close cuma menjual HASIL close
+
+`close_position`/`close_v4`/`reduce_v2` memotret saldo kedua sisi sebelum eksekusi,
+lalu auto-swap hanya menjual selisihnya. Dulu ketiganya menjual **seluruh saldo**
+token itu di wallet — token yang user pegang untuk keperluan lain ikut terjual.
+Kalau selisihnya tak terbaca (RPC lag), lebih baik lewati daripada menebak: saldo
+lama tidak boleh disentuh.
+
 ### Pembukuan rebalance tidak boleh bolong
 
 `do_rebalance` (bot) dan `api_action` (web) memotret posisi lama SEBELUM eksekusi

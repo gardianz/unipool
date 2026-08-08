@@ -3454,19 +3454,24 @@ def close_position(chain_id: int, pk: str, token_id: int, slippage_pct: float,
         for taddr, got, pre, info in ((t0, got0, pre0, i0), (t1, got1, pre1, i1)):
             if Web3.to_checksum_address(taddr) == wrapped:
                 continue
-            # jual SELURUH saldo token (termasuk sisa lama). Saldo dibaca dengan
-            # polling: replika RPC bisa masih 0 sesaat setelah collect (toleransi
-            # 90% untuk token fee-on-transfer).
+            # Jual HANYA hasil close ini, bukan seluruh saldo: token yang sudah ada
+            # di wallet sebelum close itu milik user untuk keperluan lain, jangan
+            # ikut dijual. Saldo dibaca dengan polling karena replika RPC bisa masih
+            # 0 sesaat setelah collect (toleransi 90% untuk token fee-on-transfer).
             expected = pre + int(got * 0.9)
             bal = poll_balance(w3, taddr, account.address, max(expected, 1))
             if bal == 0:
                 swaps.append((info["symbol"], "SWAP GAGAL: saldo terbaca 0 (RPC lag) — jual manual/close lagi"))
                 continue
+            proceeds = bal - pre if pre else bal
+            if proceeds <= 0:
+                swaps.append((info["symbol"], "dilewati: hasil close tidak terbaca, saldo lama tidak disentuh"))
+                continue
             try:
                 # swap_any: pool langsung kalau ada, kalau tidak 2-hop lewat stable —
                 # sisi pool ber-quote auto-deteksi (mis. NVDAB) tidak punya pool
                 # langsung ke wrapped, tanpa ini auto-swap-nya selalu gagal.
-                for _lbl, sh in swap_any(chain_id, pk, taddr, wrapped, bal, slippage_pct):
+                for _lbl, sh in swap_any(chain_id, pk, taddr, wrapped, proceeds, slippage_pct):
                     swaps.append((info["symbol"], sh))
             except Exception as e:
                 swaps.append((info["symbol"], f"SWAP GAGAL: {e}"))
@@ -3802,6 +3807,11 @@ def reduce_v2(chain_id: int, pk: str, pair_addr: str, pct: int, slippage_pct: fl
     slip = (100 - slippage_pct) / 100
     deadline = int(time.time()) + DEADLINE_SECS
 
+    # saldo kedua sisi SEBELUM remove — dipakai supaya auto-swap cuma menjual hasil
+    # penarikan, bukan token yang memang sudah ada di wallet
+    _pt0, _pt1 = pc.functions.token0().call(), pc.functions.token1().call()
+    pre_bal = {_pt0.lower(): erc20(w3, _pt0).functions.balanceOf(account.address).call(),
+               _pt1.lower(): erc20(w3, _pt1).functions.balanceOf(account.address).call()}
     lp = erc20(w3, pair).functions.balanceOf(account.address).call()
     if lp == 0:
         raise RuntimeError("Saldo LP 0.")
@@ -3846,7 +3856,8 @@ def reduce_v2(chain_id: int, pk: str, pair_addr: str, pct: int, slippage_pct: fl
                 continue
             taddr = Web3.to_checksum_address(taddr)
             bal = erc20(w3, taddr).functions.balanceOf(account.address).call()
-            if bal == 0:
+            bal -= pre_bal.get(taddr.lower(), 0)      # hasil penarikan saja
+            if bal <= 0:
                 continue
             other = Web3.to_checksum_address(t1 if taddr == Web3.to_checksum_address(t0) else t0)
             err = None
@@ -4606,6 +4617,8 @@ def close_v4(chain_id: int, pk: str, tid: int, slippage_pct: float, autoswap: bo
         got_meme = u0 + f0 if q_is_t1 else u1 + f1
         expected = pre_meme + int(got_meme * 0.9)
         bal = poll_balance(w3, meme, account.address, max(int(expected), 1))
+        # hanya hasil close yang dijual; saldo meme yang sudah ada sebelumnya milik user
+        bal = (bal - pre_meme) if pre_meme else bal
         msym = (i0 if q_is_t1 else i1)["symbol"]
         if bal == 0:
             swaps.append((msym, "SWAP GAGAL: saldo terbaca 0 (RPC lag) — jual manual"))
