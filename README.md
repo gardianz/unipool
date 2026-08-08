@@ -27,6 +27,7 @@ Dua antarmuka, satu mesin (`chain.py`) — bisa dipakai bergantian, riwayat PnL-
 - 🎯 **4 strategi range**: Stable (±6%), Wide (dua sisi), Lower (setor quote saja, nampung kalau harga turun), Upper (setor token saja, jual bertahap kalau naik) + rekomendasi otomatis
 - 🎯 **Tombol Rapat** — mendorong tepi range agar mencakup harga sekarang supaya posisi **langsung aktif**, tapi bentuk strategi dipertahankan: Lower −50% + Rapat tetap ~99,9% quote, cuma beli sedikit meme. Serapat yang diizinkan kisi pool. Kartu konfirmasi menyebut presisi kisinya (pool fee 5% biasanya 10,5%; fee 0,05% sekitar 0,1%)
 - ✏️ **Custom range** via persen atau **market cap** (`mc 300k 800k`), custom amount (persen saldo / nilai pasti)
+- 💼 **Modal gabungan** — "50% saldo" menghitung ETH + WETH + USDG sekaligus, bukan cuma token quote pool. WETH di-unwrap, quote lain dijual otomatis **seperlunya** saat mint
 - 🔁 **Auto-wrap** ETH→WETH, **auto-swap** komposisi dua sisi (token existing di wallet dipakai duluan); pair non-WETH (mis. USDG) otomatis dibeli dari saldo WETH/ETH saat mint
 - 📊 **/list** — nilai posisi, fee unclaimed, PnL per posisi & portfolio, status IN/OUT range
 - 📈 **Chart** — tombol langsung ke GMGN & DexScreener per posisi/pool

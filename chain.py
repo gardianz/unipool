@@ -4261,7 +4261,46 @@ def v4_swap(chain_id: int, pk: str, key: tuple, token_in: str, amount_in: int,
     return h
 
 
-def ensure_native_balance(w3: Web3, chain_id: int, pk: str, need_wei: int) -> list[tuple[str, str]]:
+def other_quote_capital(w3: Web3, chain_id: int, addr: str, quote_addr: str,
+                        margin: float = 0.97) -> int:
+    """Saldo quote LAIN di wallet, dinyatakan dalam satuan quote pool ini.
+
+    Dipakai supaya "50% saldo" berarti 50% dari seluruh modal yang bisa dipakai
+    (mis. ETH + WETH + USDG untuk pool ber-quote ETH), bukan cuma satu token.
+    margin memotong perkiraan untuk fee & slippage swap — jangan dihilangkan,
+    kalau kelebihan hitung mint-nya gagal di tengah jalan."""
+    cfg = CHAINS[chain_id]
+    q = str(quote_addr).lower()
+    wrapped = str(cfg["wrapped"]).lower()
+    qdec = 18 if q == V4_NATIVE else token_info(w3, Web3.to_checksum_address(quote_addr))["decimals"]
+    qsym = cfg["wrapped_symbol"] if q in (V4_NATIVE, wrapped) else None
+    qusd = (quote_usd_price(w3, chain_id, qsym) if qsym
+            else token_usd_price(w3, chain_id, quote_addr))
+    if qusd <= 0:
+        return 0
+    total = 0
+    for sym, addr_o in cfg["quotes"].items():
+        ol = str(addr_o).lower()
+        # native & wrapped diurus terpisah (1:1, tinggal wrap/unwrap)
+        if ol == q or ol == wrapped:
+            continue
+        try:
+            c = erc20(w3, addr_o)
+            bal = c.functions.balanceOf(Web3.to_checksum_address(addr)).call()
+            if bal <= 0:
+                continue
+            odec = token_info(w3, Web3.to_checksum_address(addr_o))["decimals"]
+            ousd = quote_usd_price(w3, chain_id, sym)
+            if ousd <= 0:
+                continue
+            total += int(bal / 10 ** odec * ousd / qusd * 10 ** qdec * margin)
+        except Exception:
+            continue
+    return total
+
+
+def ensure_native_balance(w3: Web3, chain_id: int, pk: str, need_wei: int,
+                          slippage_pct: float = 5.0) -> list[tuple[str, str]]:
     """Pastikan saldo NATIVE cukup — kalau kurang, unwrap WETH secukupnya.
 
     WETH itu 1:1 dengan native, jadi memperlakukannya sebagai modal terpisah cuma
@@ -4277,11 +4316,48 @@ def ensure_native_balance(w3: Web3, chain_id: int, pk: str, need_wei: int) -> li
     wbal = erc20(w3, wrapped).functions.balanceOf(account.address).call()
     if wbal <= 0:
         return txs
-    amt = min(wbal, deficit)
     weth = w3.eth.contract(address=wrapped, abi=WETH_ABI)
-    h = send_tx(w3, pk, {"to": wrapped, "data": calldata(weth.functions.withdraw(amt))})
-    wait_ok(w3, h, "unwrap")
-    txs.append(("unwrap", h))
+    if wbal > 0:
+        amt = min(wbal, deficit)
+        h = send_tx(w3, pk, {"to": wrapped, "data": calldata(weth.functions.withdraw(amt))})
+        wait_ok(w3, h, "unwrap")
+        txs.append(("unwrap", h))
+        deficit -= amt
+    if deficit <= 0:
+        return txs
+    # Masih kurang → jual quote lain (mis. USDG) jadi wrapped, lalu unwrap.
+    # Hanya sebanyak kekurangannya, bukan seluruh saldo.
+    cfg = CHAINS[chain_id]
+    w_usd = quote_usd_price(w3, chain_id, cfg["wrapped_symbol"])
+    for sym, oaddr in cfg["quotes"].items():
+        if deficit <= 0:
+            break
+        if str(oaddr).lower() == wrapped:
+            continue
+        try:
+            c = erc20(w3, oaddr)
+            obal = c.functions.balanceOf(account.address).call()
+            if obal <= 0:
+                continue
+            odec = token_info(w3, Web3.to_checksum_address(oaddr))["decimals"]
+            ousd = quote_usd_price(w3, chain_id, sym)
+            if ousd <= 0 or w_usd <= 0:
+                continue
+            need_o = int(deficit / 1e18 * w_usd / ousd * 10 ** odec * 1.03)   # +3% biaya swap
+            spend = min(obal, need_o)
+            if spend <= 0:
+                continue
+            before = erc20(w3, wrapped).functions.balanceOf(account.address).call()
+            txs += swap_any(chain_id, pk, oaddr, wrapped, spend, slippage_pct)
+            got = poll_balance(w3, wrapped, account.address, before + 1) - before
+            if got <= 0:
+                continue
+            h = send_tx(w3, pk, {"to": wrapped, "data": calldata(weth.functions.withdraw(got))})
+            wait_ok(w3, h, "unwrap")
+            txs.append(("unwrap", h))
+            deficit -= got
+        except Exception:
+            continue
     return txs
 
 
@@ -4291,7 +4367,7 @@ def _v4_ensure_funds(w3: Web3, chain_id: int, pk: str, currency: str, need_wei: 
     if currency.lower() == V4_NATIVE:
         account = w3.eth.account.from_key(pk)
         gas_reserve = gas_reserve_wei(chain_id, w3)
-        txs = ensure_native_balance(w3, chain_id, pk, need_wei + gas_reserve)
+        txs = ensure_native_balance(w3, chain_id, pk, need_wei + gas_reserve, slippage_pct)
         bal = w3.eth.get_balance(account.address)
         if bal < need_wei + gas_reserve:
             raise RuntimeError(

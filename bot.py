@@ -828,17 +828,20 @@ def compute_amount(ctx_data: dict) -> float:
         return (bal * ctx_data["amount_pct"] / 100) / 10 ** mdec
     gas_reserve = ch.gas_reserve_wei(cid, w3)
     if p["quote_addr"].lower() == ch.V4_NATIVE:
-        # Pool v4 ber-quote ETH native: modal = native + WETH. WETH itu 1:1 dengan
-        # native dan di-unwrap otomatis saat mint (ensure_native_balance), jadi
-        # mengabaikannya cuma bikin bot bilang "saldo kurang" padahal dananya ada.
+        # Pool v4 ber-quote ETH native. Modal = native + WETH (1:1, tinggal unwrap)
+        # + quote lain seperti USDG (dijual otomatis saat mint lewat
+        # ensure_native_balance). Semuanya benar-benar bisa diambil — kalau cuma
+        # dihitung tanpa jalur eksekusi, mint-nya gagal di tengah.
         bal = max(0, w3.eth.get_balance(addr) - gas_reserve)
         try:
             bal += ch.erc20(w3, cfg["wrapped"]).functions.balanceOf(addr).call()
         except Exception:
             pass
+        bal += ch.other_quote_capital(w3, cid, addr, p["quote_addr"])
         return (bal * ctx_data["amount_pct"] / 100) / 10 ** p["quote_decimals"]
     q = ch.erc20(w3, p["quote_addr"])
     bal = q.functions.balanceOf(addr).call()
+    bal += ch.other_quote_capital(w3, cid, addr, p["quote_addr"])
     if p["quote_addr"].lower() == cfg["wrapped"].lower():
         bal += max(0, w3.eth.get_balance(addr) - gas_reserve)
     else:
