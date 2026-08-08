@@ -108,6 +108,18 @@ Posisi diidentifikasi oleh **`pid`**: `"183469"` = v3, `"v4:12"` = v4, `"v2:0xpa
 (`parse_pid()`). Aksi generik lewat `add_any` / `reduce_any` / `collect_any` / `close_any` /
 `rebalance_position` — jangan panggil varian per-versi langsung dari UI.
 
+### Pemilihan rute swap: bukan fee terendah, tapi biaya terendah
+
+`find_pool_dex(..., amount_in_wei)` memberi skor tiap pool
+`(1 − fee) × kedalaman/(kedalaman + jumlah)`. Fee terendah saja SALAH sebagai
+patokan: pool 0,01% ber-kedalaman 0,18 WETH kalah telak dari pool 0,30%
+ber-kedalaman 221 begitu swap-nya ≥0,1 WETH — price impact menelan selisih fee.
+Tanpa `amount_in_wei` (mis. saat cuma membaca harga) fungsi ini tetap memilih pool
+terdalam seperti sebelumnya.
+
+Skor ini pendekatan constant-product, jadi perkiraan — bukan hasil quoter. Cukup
+untuk memilih rute, jangan dipakai sebagai angka yang ditampilkan ke user.
+
 ### Auto-swap saat close cuma menjual HASIL close
 
 `close_position`/`close_v4`/`reduce_v2` memotret saldo kedua sisi sebelum eksekusi,

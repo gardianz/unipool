@@ -2210,13 +2210,22 @@ def pool_volatility_daily(w3: Web3, pool_addr: str) -> float | None:
 
 
 # ---------- Aksi: wrap, approve, mint ----------
-def find_pool_dex(w3: Web3, chain_id: int, a: str, b: str) -> tuple[str | None, int, str | None]:
-    """Cari pool v3 pasangan (a, b) di SEMUA DEX chain ini — pilih yang saldo sisi-a
-    terbesar (pool dust bisa nyimpan harga ngaco). Return (pool_addr, fee, dex).
-    DEX-nya ikut dikembalikan karena router yang dipakai harus router pool itu."""
+def find_pool_dex(w3: Web3, chain_id: int, a: str, b: str,
+                  amount_in_wei: int = 0) -> tuple[str | None, int, str | None]:
+    """Cari pool v3 pasangan (a, b) di SEMUA DEX chain ini. Return (pool, fee, dex).
+
+    Tanpa `amount_in_wei`: pilih pool terdalam (dipakai untuk baca harga — pool dust
+    bisa menyimpan harga ngaco).
+
+    Dengan `amount_in_wei`: pilih yang paling MURAH untuk jumlah itu. Fee terendah
+    saja bukan patokan — pool 0,05% yang tipis bisa jauh lebih mahal daripada pool
+    0,3% yang dalam, karena price impact-nya menelan selisih fee. Skornya
+    (1 − fee) × kedalaman/(kedalaman + jumlah): pendekatan constant-product, jadi
+    perkiraan, tapi memperhitungkan dua-duanya. Untuk jumlah kecil skor ini otomatis
+    dimenangkan fee terendah; untuk jumlah besar dimenangkan pool terdalam."""
     a = Web3.to_checksum_address(a)
     t0, t1 = sort_tokens(a, Web3.to_checksum_address(b))
-    best, best_fee, best_bal, best_dex = None, 0, -1, None
+    best, best_fee, best_score, best_dex = None, 0, -1.0, None
     for dname in dex_names(chain_id):
         factory = w3.eth.contract(
             address=Web3.to_checksum_address(dex_cfg(chain_id, dname)["factory"]), abi=FACTORY_ABI)
@@ -2231,8 +2240,14 @@ def find_pool_dex(w3: Web3, chain_id: int, a: str, b: str) -> tuple[str | None, 
                 bal = erc20(w3, a).functions.balanceOf(addr).call()
             except Exception:
                 continue
-            if bal > best_bal:
-                best, best_fee, best_bal, best_dex = addr, f, bal, dname
+            if bal <= 0:
+                continue
+            if amount_in_wei > 0:
+                score = (1 - f / 1e6) * (bal / (bal + amount_in_wei))
+            else:
+                score = float(bal)
+            if score > best_score:
+                best, best_fee, best_score, best_dex = addr, f, score, dname
     return best, best_fee, best_dex
 
 
@@ -2289,7 +2304,7 @@ def ensure_quote_balance(w3: Web3, chain_id: int, pk: str, quote_addr: str, need
         return txs
 
     # quote bukan wrapped: tutup kekurangan dengan swap wrapped → quote
-    route = swap_route(w3, chain_id, wrapped, quote)
+    route = swap_route(w3, chain_id, wrapped, quote)   # jumlah belum diketahui di sini
     if route is None:
         raise RuntimeError(
             f"Saldo quote kurang dan tidak ada rute {cfg['wrapped_symbol']}→quote untuk auto-swap.")
@@ -3311,7 +3326,7 @@ def swap_to_token(chain_id: int, pk: str, token_in: str, token_out: str, fee: in
         except Exception:
             pool_addr = None
     if not pool_addr:
-        pool_addr, fee, dex = find_pool_dex(w3, chain_id, token_in, token_out)
+        pool_addr, fee, dex = find_pool_dex(w3, chain_id, token_in, token_out, amount_in_wei)
         if not pool_addr:
             raise RuntimeError("Pool untuk swap tidak ditemukan.")
     cfg = dex_cfg(chain_id, dex)
@@ -3359,7 +3374,8 @@ def _hop_candidates(chain_id: int) -> list[str]:
     return [Web3.to_checksum_address(a) for a in mids]
 
 
-def swap_route(w3: Web3, chain_id: int, token_in: str, token_out: str) -> list[tuple] | None:
+def swap_route(w3: Web3, chain_id: int, token_in: str, token_out: str,
+               amount_in_wei: int = 0) -> list[tuple] | None:
     """Rute swap v3: [(token_in, token_out, fee)] kalau ada pool langsung, atau dua
     hop lewat stable/wrapped. None kalau tidak ada rute.
 
@@ -3370,13 +3386,13 @@ def swap_route(w3: Web3, chain_id: int, token_in: str, token_out: str) -> list[t
     token_out = Web3.to_checksum_address(token_out)
     if token_in == token_out:
         return []
-    pool, fee, dx = find_pool_dex(w3, chain_id, token_in, token_out)
+    pool, fee, dx = find_pool_dex(w3, chain_id, token_in, token_out, amount_in_wei)
     if pool:
         return [(token_in, token_out, fee, dx)]
     for mid in _hop_candidates(chain_id):
         if mid in (token_in, token_out):
             continue
-        p1, f1, d1 = find_pool_dex(w3, chain_id, token_in, mid)
+        p1, f1, d1 = find_pool_dex(w3, chain_id, token_in, mid, amount_in_wei)
         if not p1:
             continue
         p2, f2, d2 = find_pool_dex(w3, chain_id, mid, token_out)
@@ -3393,7 +3409,7 @@ def swap_any(chain_id: int, pk: str, token_in: str, token_out: str,
     if amount_in_wei <= 0:
         return []
     w3 = get_w3(chain_id)
-    route = swap_route(w3, chain_id, token_in, token_out)
+    route = swap_route(w3, chain_id, token_in, token_out, amount_in_wei)
     if route is None:
         si = token_info(w3, Web3.to_checksum_address(token_in))["symbol"]
         so = token_info(w3, Web3.to_checksum_address(token_out))["symbol"]

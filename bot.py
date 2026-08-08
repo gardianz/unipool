@@ -894,7 +894,8 @@ def pool_warnings(cid: int, p: dict) -> str:
     if p.get("ver") in (3, 4) and bp >= 1:
         lines.append(
             f"📐 Kisi pool ini <b>{bp:g}%</b> — tepi range wajib kelipatan tick spacing, "
-            f"jadi tidak bisa lebih rapat dari itu. Tombol 🎯 Rapat memakai satu kotak kisi.")
+            f"jadi tidak bisa lebih rapat dari itu. Tombol 🎯 Rapat memakai satu kotak "
+            f"kisi yang mencakup harga: langsung aktif, dua sisi.")
     if p.get("deviation"):
         lines.append(
             f"⚠️ Harga pool ini <b>{p['deviation'] * 100:+.0f}%</b> dari pool terdalam. "
@@ -1152,7 +1153,7 @@ def confirm_kb(key: str, ctx_data: dict) -> InlineKeyboardMarkup:
          InlineKeyboardButton("❌ Cancel", callback_data=f"cancelp|{key}")],
         [sbtn(m) for m in ("stable", "wide", "lower", "upper")],
         [wbtn(lo, up) for lo, up in STRAT_PRESETS[mode]],
-        [InlineKeyboardButton("🎯 Rapat (1 kotak kisi)", callback_data=f"tight|{key}")],
+        [InlineKeyboardButton("🎯 Rapat — langsung aktif (2 sisi)", callback_data=f"tight|{key}")],
         [abtn(a) for a in (25, 50, 75, 100)],
         [InlineKeyboardButton("✏️ Custom Range…", callback_data=f"askrng|{key}"),
          InlineKeyboardButton("✏️ Custom Amount…", callback_data=f"askamt|{key}")],
@@ -2156,8 +2157,12 @@ async def on_callback(update: Update, _):
         if not ctx:
             await edit(q.message, "⚠️ Tombol kadaluarsa (bot sempat restart). Paste alamat lagi.")
             return
-        # Range selebar SATU kotak tick-spacing, menempel harga (gap 0). Lebih rapat
-        # dari ini mustahil: tepi range wajib kelipatan spacing.
+        # Rapat = kotak kisi yang MENCAKUP harga sekarang → posisi langsung aktif
+        # dan langsung makan fee. Karena mencakup harga, otomatis dua sisi: sisi meme
+        # dibeli lewat auto-swap saat mint. Mode dipaksa ke "stable" supaya mesin mint
+        # memakai jalur dua-sisi; lebih rapat dari satu kotak mustahil (tepi range
+        # wajib kelipatan tick spacing).
+        ctx["mode"] = "stable"
         ctx["low_pct"] = ctx["up_pct"] = TIGHT_PCT
         ctx["gap"] = 0
         await show_confirm(q.message, key)
