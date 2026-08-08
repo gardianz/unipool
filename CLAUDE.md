@@ -336,6 +336,9 @@ maupun hapus selalu dua langkah dengan peringatan. Jangan hilangkan penjagaan it
 - **v4 mati di BSC**: PancakeSwap tidak punya kontrak kompatibel-v4; padanannya
   "Infinity" (Vault + CLPoolManager) arsitekturnya beda total dan belum didukung.
   `has_v4(56)` False, dan `verify_v4`/`discover_v4_pools` fail-closed tanpa key `v4_*`.
+- Pool v4 ber-quote **ETH native**: WETH ikut dihitung sebagai modal dan di-unwrap
+  otomatis lewat `ensure_native_balance()` (WETH 1:1 native). Dulu diabaikan, jadi
+  wallet berisi 0,2 WETH tetap dibilang "saldo kurang".
 - Token fee-on-transfer tidak didukung di jalur v2.
 - Fee v2 auto-compound → tidak ada aksi "collect" untuk v2.
 - `WEB_HOST` non-localhost menolak start tanpa `WEB_TOKEN`; jangan sarankan `0.0.0.0`.

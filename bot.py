@@ -828,9 +828,14 @@ def compute_amount(ctx_data: dict) -> float:
         return (bal * ctx_data["amount_pct"] / 100) / 10 ** mdec
     gas_reserve = ch.gas_reserve_wei(cid, w3)
     if p["quote_addr"].lower() == ch.V4_NATIVE:
-        # pool v4 ber-quote ETH native: modal = saldo native + WETH (bisa di-unwrap? tidak —
-        # cukup native; WETH tidak dihitung biar tidak overcommit)
+        # Pool v4 ber-quote ETH native: modal = native + WETH. WETH itu 1:1 dengan
+        # native dan di-unwrap otomatis saat mint (ensure_native_balance), jadi
+        # mengabaikannya cuma bikin bot bilang "saldo kurang" padahal dananya ada.
         bal = max(0, w3.eth.get_balance(addr) - gas_reserve)
+        try:
+            bal += ch.erc20(w3, cfg["wrapped"]).functions.balanceOf(addr).call()
+        except Exception:
+            pass
         return (bal * ctx_data["amount_pct"] / 100) / 10 ** p["quote_decimals"]
     q = ch.erc20(w3, p["quote_addr"])
     bal = q.functions.balanceOf(addr).call()
@@ -1778,6 +1783,10 @@ async def do_add_exec(update: Update, pid: str, val: float, is_pct: bool):
             gas_reserve = ch.gas_reserve_wei(cid, w3)
             if quote.lower() == ch.V4_NATIVE:
                 bal = max(0, w3.eth.get_balance(wallet_address()) - gas_reserve)
+                try:    # WETH 1:1, di-unwrap otomatis saat eksekusi
+                    bal += ch.erc20(w3, cfg["wrapped"]).functions.balanceOf(wallet_address()).call()
+                except Exception:
+                    pass
                 qdec = 18
             else:
                 qc = ch.erc20(w3, quote)
@@ -2162,13 +2171,21 @@ async def on_callback(update: Update, _):
         if not ctx:
             await edit(q.message, "⚠️ Tombol kadaluarsa (bot sempat restart). Paste alamat lagi.")
             return
-        # Rapat = kotak kisi yang MENCAKUP harga sekarang → posisi langsung aktif
-        # dan langsung makan fee. Karena mencakup harga, otomatis dua sisi: sisi meme
-        # dibeli lewat auto-swap saat mint. Mode dipaksa ke "stable" supaya mesin mint
-        # memakai jalur dua-sisi; lebih rapat dari satu kotak mustahil (tepi range
-        # wajib kelipatan tick spacing).
-        ctx["mode"] = "stable"
-        ctx["low_pct"] = ctx["up_pct"] = TIGHT_PCT
+        # Rapat = buat range MENCAKUP harga sekarang supaya posisi langsung aktif,
+        # TAPI bentuk mode yang dipilih dipertahankan:
+        #   Lower  → lebar bawah tetap, tepi atas cuma 1 kotak di atas harga
+        #            (mayoritas quote, sedikit meme dibeli otomatis)
+        #   Upper  → kebalikannya
+        #   Stable/Wide → satu kotak di kedua sisi
+        # Mesin mint memakai jalur dua-sisi ("wide"), jadi mode disetel ke situ.
+        m = ctx["mode"]
+        if m == "lower":
+            ctx["up_pct"] = TIGHT_PCT          # low_pct dibiarkan apa adanya
+        elif m == "upper":
+            ctx["low_pct"] = TIGHT_PCT
+        else:
+            ctx["low_pct"] = ctx["up_pct"] = TIGHT_PCT
+        ctx["mode"] = "stable" if m in ("stable", "wide") else "wide"
         ctx["gap"] = 0
         await show_confirm(q.message, key)
         return

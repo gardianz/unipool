@@ -257,6 +257,8 @@ ERC20_ABI = [
 
 WETH_ABI = ERC20_ABI + [
     {"constant": False, "inputs": [], "name": "deposit", "outputs": [], "type": "function", "stateMutability": "payable"},
+    {"constant": False, "inputs": [{"name": "wad", "type": "uint256"}], "name": "withdraw",
+     "outputs": [], "type": "function", "stateMutability": "nonpayable"},
 ]
 
 FACTORY_ABI = [
@@ -4259,17 +4261,43 @@ def v4_swap(chain_id: int, pk: str, key: tuple, token_in: str, amount_in: int,
     return h
 
 
+def ensure_native_balance(w3: Web3, chain_id: int, pk: str, need_wei: int) -> list[tuple[str, str]]:
+    """Pastikan saldo NATIVE cukup — kalau kurang, unwrap WETH secukupnya.
+
+    WETH itu 1:1 dengan native, jadi memperlakukannya sebagai modal terpisah cuma
+    menyulitkan user: wallet berisi 0,2 WETH tapi bot bilang "saldo kurang" untuk
+    pool ber-quote ETH native."""
+    account = w3.eth.account.from_key(pk)
+    txs = []
+    bal = w3.eth.get_balance(account.address)
+    if bal >= need_wei:
+        return txs
+    deficit = need_wei - bal
+    wrapped = Web3.to_checksum_address(CHAINS[chain_id]["wrapped"])
+    wbal = erc20(w3, wrapped).functions.balanceOf(account.address).call()
+    if wbal <= 0:
+        return txs
+    amt = min(wbal, deficit)
+    weth = w3.eth.contract(address=wrapped, abi=WETH_ABI)
+    h = send_tx(w3, pk, {"to": wrapped, "data": calldata(weth.functions.withdraw(amt))})
+    wait_ok(w3, h, "unwrap")
+    txs.append(("unwrap", h))
+    return txs
+
+
 def _v4_ensure_funds(w3: Web3, chain_id: int, pk: str, currency: str, need_wei: int,
                      slippage_pct: float) -> list[tuple[str, str]]:
-    """Native → cukup cek saldo (tanpa wrap). ERC20 → jalur ensure_quote_balance biasa."""
+    """Native → unwrap WETH kalau perlu. ERC20 → jalur ensure_quote_balance biasa."""
     if currency.lower() == V4_NATIVE:
         account = w3.eth.account.from_key(pk)
-        bal = w3.eth.get_balance(account.address)
         gas_reserve = gas_reserve_wei(chain_id, w3)
+        txs = ensure_native_balance(w3, chain_id, pk, need_wei + gas_reserve)
+        bal = w3.eth.get_balance(account.address)
         if bal < need_wei + gas_reserve:
             raise RuntimeError(
-                f"Saldo native kurang: punya {bal / 1e18:.6f}, butuh {need_wei / 1e18:.6f} + gas")
-        return []
+                f"Saldo native+WETH kurang: punya {bal / 1e18:.6f}, "
+                f"butuh {need_wei / 1e18:.6f} + gas")
+        return txs
     return ensure_quote_balance(w3, chain_id, pk, currency, need_wei, slippage_pct)
 
 
