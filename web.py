@@ -787,7 +787,9 @@ def api_action(_q, b) -> dict:
     addr = bot._addr_of(bot.pk())
     ver, ref = ch.parse_pid(pid)
     tid = ev_id(pid)
-    pos = None if act == "add" else _snapshot(cid, pid)
+    # Add v4 juga perlu snapshot: fee unclaimed ikut terpakai sebagai modal (SETTLE_PAIR
+    # mengkreditkan feesAccrued), jadi harus dicatat sebagai fee — lihat _reinvested_fee_usd.
+    pos = _snapshot(cid, pid) if act != "add" or ver == 4 else None
     extra = {}
 
     with TX_LOCK:
@@ -807,6 +809,12 @@ def api_action(_q, b) -> dict:
 
     if act == "add":
         store.record_event(cid, "mint", tid, r["added_usd"], "add", wallet=addr)
+        # v4: added_usd sudah termasuk fee yang direinvestasi, jadi imbangi dengan
+        # event fees — kalau tidak, fee tercatat sebagai setoran baru dan PnL rugi palsu.
+        if ver == 4 and pos and pos.get("unclaimed_usd", 0) > 0:
+            store.record_event(cid, "fees", tid, pos["unclaimed_usd"],
+                               "reinvest saat add", wallet=addr)
+            extra["fees_usd"] = pos["unclaimed_usd"]
     elif act == "reduce":
         pct = int(b["pct"])
         if pos:

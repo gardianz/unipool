@@ -140,6 +140,27 @@ token itu di wallet — token yang user pegang untuk keperluan lain ikut terjual
 Kalau selisihnya tak terbaca (RPC lag), lebih baik lewati daripada menebak: saldo
 lama tidak boleh disentuh.
 
+### Add v4 memakai fee unclaimed sebagai modal
+
+`INCREASE_LIQUIDITY` v4 mengkreditkan `feesAccrued` terhadap tagihan `SETTLE_PAIR`:
+wallet cuma membayar **selisihnya**, tapi likuiditas bertambah sebesar penuh. Terukur
+di tx `0x443a4846…`: bot melaporkan 412,523 USDG + 185.967 POOLS masuk, yang benar-benar
+keluar dari wallet 398,769 USDG + 167.222 POOLS — selisihnya persis fee unclaimed.
+
+`added_usd` menghitung yang penuh (v4 dari `amounts_from_liquidity`, v3 dari event
+`IncreaseLiquidity`), jadi jalur add **wajib** mencatat event `fees` penyeimbang
+(`_reinvested_fee_usd()` di bot, `ver == 4` di `api_action`). Tanpa itu fee tercatat
+sebagai setoran baru dan PnL rugi palsu sebesar fee tersebut.
+
+Beda per versi, jangan disamaratakan:
+
+- **v4 add** — fee terpakai jadi modal, unclaimed reset ke $0. Perlu event `fees`.
+- **v3 add** — `increaseLiquidity` membiarkan fee mengendap di `tokensOwed`, tetap
+  unclaimed. **Jangan** catat event `fees` (nanti dobel saat benar-benar diklaim).
+- **v2** — tidak punya fee unclaimed (auto-compound).
+- **reduce/close** (v3 `decrease+collect`, v4 `DECREASE`+`TAKE_PAIR`) — fee ditarik
+  **penuh ke wallet** berapa pun pct-nya, jadi event `fees` dicatat 100%, bukan pro-rata.
+
 ### Pembukuan rebalance tidak boleh bolong
 
 `do_rebalance` (bot) dan `api_action` (web) memotret posisi lama SEBELUM eksekusi

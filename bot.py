@@ -1826,6 +1826,29 @@ async def ask_add(update: Update, pid: str):
     AWAITING[update.effective_chat.id] = {"kind": "addamt", "key": str(pid)}
 
 
+def _reinvested_fee_usd(cid: int, pid: str) -> float:
+    """Fee unclaimed yang akan IKUT TERPAKAI sebagai modal saat add — v4 saja.
+
+    v4 `INCREASE_LIQUIDITY` mengkreditkan feesAccrued terhadap tagihan `SETTLE_PAIR`,
+    jadi wallet cuma membayar selisihnya tapi likuiditas bertambah sebesar penuh
+    (terbukti di tx: dilaporkan 412,523 USDG, keluar dari wallet 398,769 — selisihnya
+    persis fee unclaimed). `added_usd` menghitung yang penuh, jadi tanpa event `fees`
+    penyeimbang, fee itu tercatat sebagai setoran baru dan PnL kelihatan rugi
+    sebesar fee tersebut.
+
+    v3 tidak kena: `increaseLiquidity` membiarkan fee mengendap di `tokensOwed`
+    (tetap unclaimed). v2 tidak punya fee unclaimed sama sekali.
+    Gagal baca = 0 (lebih baik tidak mencatat daripada menebak angka).
+    """
+    if ch.parse_pid(str(pid))[0] != 4:
+        return 0.0
+    try:
+        pos = next((x for x in list_positions_all(cid) if x["pid"] == str(pid)), None)
+        return max(0.0, float(pos["unclaimed_usd"])) if pos else 0.0
+    except Exception:
+        return 0.0
+
+
 async def do_add_exec(update: Update, pid: str, val: float, is_pct: bool):
     s = store.load_settings()
     cid = s["chain"]
@@ -1833,6 +1856,7 @@ async def do_add_exec(update: Update, pid: str, val: float, is_pct: bool):
 
     def work():
         budget = val
+        pre_fee = _reinvested_fee_usd(cid, pid)
         if is_pct:
             w3 = ch.get_w3(cid)
             cfg = ch.CHAINS[cid]
@@ -1864,21 +1888,27 @@ async def do_add_exec(update: Update, pid: str, val: float, is_pct: bool):
                     except Exception:
                         pass
             budget = (bal * val / 100) / 10 ** qdec
-        return ch.add_any(cid, pk(), pid, budget, s["slippage_pct"])
+        return ch.add_any(cid, pk(), pid, budget, s["slippage_pct"]), pre_fee
 
     async with TX_LOCK:
         try:
-            r = await asyncio.to_thread(work)
+            r, pre_fee = await asyncio.to_thread(work)
         except Exception as e:
             await edit(status, f"❌ Add gagal: {esc(e)}")
             return
     ev_tid = ch.parse_pid(pid)[1] if str(pid).isdigit() else str(pid)
     store.record_event(cid, "mint", ev_tid, r["added_usd"], "add", wallet=wallet_address())
+    if pre_fee > 0:
+        store.record_event(cid, "fees", ev_tid, pre_fee, "reinvest saat add",
+                           wallet=wallet_address())
     lines = [f"✅ <b>Added {disp_pid(pid)}</b> (~{ch.fmt_usd(r['added_usd'])})"]
     if r.get("quote_in") is not None:
         lines.append(f"Masuk: {ch.fmt_amount(r['quote_in'])} {r['quote_sym']}"
                      f" + {ch.fmt_amount(r['meme_in'])} {r['meme_sym']}"
                      f" <i>(meme dari wallet dipakai duluan)</i>")
+    if pre_fee > 0:
+        lines.append(f"♻️ Fee unclaimed {ch.fmt_usd(pre_fee)} ikut jadi modal "
+                     f"(tidak keluar ke wallet) — dihitung sebagai fee, bukan setoran baru.")
     for label, h in r["steps"]:
         lines.append(f"{label}: {ch.tx_link(cid, h)}")
     lines.append(ch.pos_link_any(cid, pid))
