@@ -108,6 +108,18 @@ Posisi diidentifikasi oleh **`pid`**: `"183469"` = v3, `"v4:12"` = v4, `"v2:0xpa
 (`parse_pid()`). Aksi generik lewat `add_any` / `reduce_any` / `collect_any` / `close_any` /
 `rebalance_position` — jangan panggil varian per-versi langsung dari UI.
 
+### minOut swap: dari quoter/fee, JANGAN dari harga spot
+
+Harga spot tidak memotong fee pool. Di pool ber-fee besar, slippage user habis
+dimakan fee sehingga swap **pasti** revert: pool fee 5% + slippage 5% → minOut
+mendarat ~0,16% di atas hasil nyata (terbukti `V4TooLittleReceived`: minta
+1.851,17 BULL, dapat 1.848,24).
+
+- v4: `v4_swap()` memakai `quoteExactInputSingle` dari v4 quoter — hasilnya sudah
+  memperhitungkan fee DAN price impact. Fee dinamis (`fee >= 0x800000`) tidak punya
+  nilai statis, jadi kalau quoter gagal fee dianggap 0 dan slippage user yang menahan.
+- v3: `swap_to_token()` mengalikan estimasi spot dengan `(1 − fee/1e6)`.
+
 ### Pemilihan rute swap: bukan fee terendah, tapi biaya terendah
 
 `find_pool_dex(..., amount_in_wei)` memberi skor tiap pool

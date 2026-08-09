@@ -3433,6 +3433,9 @@ def swap_to_token(chain_id: int, pk: str, token_in: str, token_out: str, fee: in
         out_est = amount_in_wei * raw_price
     else:
         out_est = amount_in_wei / raw_price if raw_price else 0
+    # potong fee pool: harga spot belum menghitungnya, dan di pool ber-fee besar
+    # slippage user habis dimakan fee sehingga swap selalu revert
+    out_est *= (1 - fee / 1e6)
     min_out = int(out_est * (100 - slippage_pct) / 100)
 
     # Saldo token masuk WAJIB dicek di sini: kalau kurang, router balas
@@ -4227,8 +4230,23 @@ def v4_swap(chain_id: int, pk: str, key: tuple, token_in: str, amount_in: int,
     pid = v4_pool_id(key)
     sqrtp, _ = v4_slot0(w3, chain_id, pid)
     zero_for_one = token_in.lower() == key[0].lower()
-    raw = (sqrtp / Q96) ** 2  # c1 per c0
-    out_est = amount_in * raw if zero_for_one else (amount_in / raw if raw else 0)
+    # minOut WAJIB dihitung dari hasil quoter, bukan harga spot: harga spot tidak
+    # memotong fee pool. Di pool fee 5%, slippage 5% habis dimakan fee saja sehingga
+    # tidak ada toleransi untuk price impact — swap PASTI revert V4TooLittleReceived
+    # (terbukti: minta 1.851,17 BULL, dapat 1.848,24 = kurang 0,16%).
+    out_est = 0
+    try:
+        qt = _v4c(w3, chain_id, "v4_quoter", V4_QUOTER_ABI)
+        out_est = qt.functions.quoteExactInputSingle(
+            (tuple(key), zero_for_one, min(amount_in, MAX_UINT128), b"")).call()[0]
+    except Exception:
+        out_est = 0
+    if out_est <= 0:
+        # Quoter gagal (mis. fee dinamis) → harga spot dikurangi fee statis kalau ada.
+        raw = (sqrtp / Q96) ** 2  # c1 per c0
+        spot = amount_in * raw if zero_for_one else (amount_in / raw if raw else 0)
+        fee_ppm = key[2] if key[2] < 0x800000 else 0
+        out_est = spot * (1 - fee_ppm / 1e6)
     min_out = int(out_est * (100 - slippage_pct) / 100)
     if min_out <= 0:
         raise RuntimeError("Estimasi hasil swap v4 = 0.")
