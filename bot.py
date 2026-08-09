@@ -1290,6 +1290,23 @@ async def handle_awaiting(update: Update) -> bool:
     st = AWAITING.get(chat_id)
     if not st:
         return False
+    if st["kind"] == "reducepct":
+        raw = (update.message.text or "").strip().replace("%", "").replace(",", ".")
+        try:
+            pct = int(round(float(raw)))
+        except ValueError:
+            await reply(update, "❌ Isi angka 1–99. Contoh: <code>15</code>")
+            return True
+        if not 1 <= pct <= 99:
+            await reply(update, "❌ Rentang 1–99. Untuk 100% pakai tombol Close.")
+            return True
+        AWAITING.pop(chat_id, None)
+        pid = st["key"]
+        await reply(update, f"➖ Tarik <b>{pct}%</b> dari {disp_pid(pid)}?",
+                    InlineKeyboardMarkup([[
+                        InlineKeyboardButton(f"✅ Ya, tarik {pct}%", callback_data=f"redok|{pid}|{pct}"),
+                        InlineKeyboardButton("❌ Batal", callback_data="cancel")]]))
+        return True
     if st["kind"] == "wallet_import":
         raw = (update.message.text or "").strip()
         # Hapus pesan berisi private key SECEPATNYA — kalau tidak, key-nya mengendap
@@ -1757,10 +1774,50 @@ async def ask_add(update: Update, pid: str):
                              "<b>[v2]</b> yang sama — deposit baru otomatis menambah LP existing."))
         return
     s = store.load_settings()
-    qsym = ch.CHAINS[s["chain"]]["wrapped_symbol"]
+    cid = s["chain"]
+
+    def info():
+        """Quote posisi + modal yang benar-benar tersedia — bukan tebakan 'umumnya WETH'."""
+        pos = next((p for p in list_positions_all(cid) if p["pid"] == str(pid)), None)
+        if not pos:
+            return None
+        w3 = ch.get_w3(cid)
+        cfg = ch.CHAINS[cid]
+        quote = pos["token1"] if pos["quote_is_token1"] else pos["token0"]
+        qsym = pos.get("quote_sym") or "?"
+        addr = wallet_address()
+        gas_reserve = ch.gas_reserve_wei(cid, w3)
+        if str(quote).lower() == ch.V4_NATIVE:
+            qdec, bal = 18, max(0, w3.eth.get_balance(addr) - gas_reserve)
+            try:
+                bal += ch.erc20(w3, cfg["wrapped"]).functions.balanceOf(addr).call()
+            except Exception:
+                pass
+        else:
+            qc = ch.erc20(w3, quote)
+            qdec = qc.functions.decimals().call()
+            bal = qc.functions.balanceOf(addr).call()
+            if str(quote).lower() == cfg["wrapped"].lower():
+                bal += max(0, w3.eth.get_balance(addr) - gas_reserve)
+        bal += ch.other_quote_capital(w3, cid, addr, quote)
+        qusd = ch.quote_usd_price(w3, cid, qsym) if qsym in cfg["quotes"] or qsym in (
+            cfg["wrapped_symbol"], cfg["native_symbol"]) else ch.token_usd_price(w3, cid, quote)
+        return pos, qsym, bal / 10 ** qdec, qusd
+
+    try:
+        pos, qsym, avail, qusd = await asyncio.to_thread(info)
+        head = (f"Posisi sekarang: <b>{ch.fmt_usd(pos['value_usd'])}</b>"
+                f"{' · 🟢 IN range' if pos['in_range'] else ' · 🔴 OUT of range'}\n"
+                f"Modal tersedia: <b>{ch.fmt_amount(avail)} {esc(qsym)}</b> "
+                f"({ch.fmt_usd(avail * qusd)}) — termasuk saldo quote lain yang bisa ditukar\n"
+                f"Contoh: <code>30%</code> = {ch.fmt_amount(avail * 0.3)} {esc(qsym)} "
+                f"({ch.fmt_usd(avail * 0.3 * qusd)})\n\n")
+    except Exception:
+        head, qsym = "", "quote posisi"
     await update.effective_chat.send_message(
-        (f"➕ <b>Balas pesan ini</b> dengan jumlah dana untuk ditambah ke {disp_pid(pid)}:\n"
-         f"· nilai pasti: <code>0.005</code> (satuan quote posisi, umumnya {esc(qsym)})\n"
+        (f"➕ <b>Balas pesan ini</b> dengan jumlah dana untuk ditambah ke {disp_pid(pid)}:\n\n"
+         f"{head}"
+         f"· nilai pasti: <code>0.005</code> (satuan {esc(qsym)})\n"
          f"· persen saldo: <code>30%</code>\n\n"
          f"<i>Komposisi quote/meme dihitung otomatis mengikuti range posisi; "
          f"meme existing di wallet dipakai duluan.</i>"),
@@ -1833,14 +1890,46 @@ async def ask_reduce(update: Update, pid: str):
             "Untuk 100% pakai tombol Close.</i>")
     if str(pid).startswith("v2:"):
         note = "<i>Fee v2 sudah auto-compound di dalam nilai LP. Untuk 100% pakai Close.</i>"
+    s = store.load_settings()
+    cid = s["chain"]
+
+    def snap():
+        return next((p for p in list_positions_all(cid) if p["pid"] == str(pid)), None)
+
+    head = ""
+    try:
+        pos = await asyncio.to_thread(snap)
+        if pos:
+            msym = pos["sym0"] if pos["quote_is_token1"] else pos["sym1"]
+            qsym = pos.get("quote_sym") or "?"
+            head = (f"Nilai posisi: <b>{ch.fmt_usd(pos['value_usd'])}</b> · "
+                    f"fee unclaimed {ch.fmt_usd(pos['unclaimed_usd'])}\n"
+                    f"Isi: {ch.fmt_amount(pos['amount0'] if pos['quote_is_token1'] else pos['amount1'])} "
+                    f"{esc(msym)} + "
+                    f"{ch.fmt_amount(pos['amount1'] if pos['quote_is_token1'] else pos['amount0'])} "
+                    f"{esc(qsym)}\n"
+                    f"Tiap 10% ≈ {ch.fmt_usd(pos['value_usd'] / 10)}\n\n")
+    except Exception:
+        head = ""
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton(f"➖ {pct}%", callback_data=f"redok|{pid}|{pct}")
-         for pct in (25, 50, 75)],
+         for pct in (10, 25, 50, 75)],
+        [InlineKeyboardButton("✏️ Custom %…", callback_data=f"askred|{pid}")],
         [InlineKeyboardButton("❌ Cancel", callback_data="cancel")],
     ])
     await reply(update, (
-        f"➖ <b>Kurangi posisi {disp_pid(pid)}?</b>\n"
+        f"➖ <b>Kurangi posisi {disp_pid(pid)}?</b>\n\n{head}"
         f"Pilih persentase yang ditarik. Fee unclaimed ikut terambil.\n{note}"), kb)
+
+
+async def ask_reduce_custom(update: Update, pid: str):
+    await update.effective_chat.send_message(
+        (f"✏️ <b>Balas pesan ini</b> dengan persen yang mau ditarik dari {disp_pid(pid)}:\n"
+         f"· contoh: <code>15</code> atau <code>15%</code>\n"
+         f"· rentang 1–99 — untuk 100% pakai tombol Close"),
+        parse_mode=ParseMode.HTML,
+        reply_markup=ForceReply(selective=True, input_field_placeholder="contoh: 15"))
+    AWAITING[update.effective_chat.id] = {"kind": "reducepct", "key": str(pid)}
 
 
 async def do_reduce_exec(update: Update, pid: str, pct: int):
@@ -2250,6 +2339,9 @@ async def on_callback(update: Update, _):
         _, tid, mode = data.split("|")
         await q.edit_message_reply_markup(None)
         await do_rebalance(update, tid, mode)
+        return
+    if data.startswith("askred|"):
+        await ask_reduce_custom(update, data.split("|", 1)[1])
         return
     if data.startswith("red|"):
         await ask_reduce(update, data.split("|", 1)[1])
