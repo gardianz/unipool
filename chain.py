@@ -1950,7 +1950,7 @@ def discover_dex_pools(w3: Web3, chain_id: int, token: str,
                 key = _v4_key_from_init(w3, chain_id, addr)
                 if not key:
                     return None
-                qsym4, q_is_c1 = _v4_quote_side(chain_id, key[0], key[1])
+                qsym4, q_is_c1 = _v4_quote_side(chain_id, key[0], key[1])   # discovery: tanpa w3
                 if not qsym4:
                     return None
                 qaddr = key[1] if q_is_c1 else key[0]
@@ -4135,8 +4135,18 @@ def _v4_balance(w3: Web3, cur: str, addr: str) -> int:
     return erc20(w3, cur).functions.balanceOf(addr).call()
 
 
-def _v4_quote_side(chain_id: int, c0: str, c1: str) -> tuple[str | None, bool]:
-    """(quote_sym, quote_is_c1). Native ETH dihitung quote (dihargai = wrapped)."""
+def _v4_quote_side(chain_id: int, c0: str, c1: str, w3: Web3 | None = None) -> tuple[str | None, bool]:
+    """(quote_sym, quote_is_c1). Native ETH dihitung quote (dihargai = wrapped).
+
+    Dengan `w3`, pair yang tidak punya quote tetap ikut diselesaikan lewat
+    `resolve_quote_side()` — sisi yang punya sokongan likuiditas on-chain didaftarkan
+    sebagai quote runtime, persis seperti jalur v3/v2. Tanpa itu posisi v4 ber-quote
+    asing tampil bernilai $0,00 dan setiap aksinya ditolak "Pair tanpa quote yang
+    dikenal bot" (kasus nyata: PACK/NVDA #645408 — 1,08567 NVDA di dalamnya).
+
+    `w3` sengaja TIDAK dipakai di jalur discovery: `resolve_quote_side` membaca
+    likuiditas on-chain untuk kedua sisi, kalau dipanggil per pool hasil indexer
+    biayanya meledak. Discovery punya `discover_foreign_pools()` untuk kasus itu."""
     cfg = CHAINS[chain_id]
     quotes_lc = {a.lower(): s for s, a in cfg["quotes"].items()}
     if c1.lower() in quotes_lc:
@@ -4145,6 +4155,20 @@ def _v4_quote_side(chain_id: int, c0: str, c1: str) -> tuple[str | None, bool]:
         return quotes_lc[c0.lower()], False
     if c0.lower() == V4_NATIVE:
         return cfg["wrapped_symbol"], False   # harga native = harga wrapped
+    # Quote runtime yang SUDAH terdaftar dipakai langsung: resolve_quote_side membaca
+    # sokongan likuiditas kedua sisi (terukur 17 detik), terlalu mahal untuk diulang
+    # tiap refresh daftar posisi.
+    reg = _EXTRA_QUOTES.get(chain_id, {})
+    for s, a in reg.items():
+        if a.lower() == c1.lower():
+            return s, True
+        if a.lower() == c0.lower():
+            return s, False
+    if w3 is not None:
+        try:
+            return resolve_quote_side(w3, chain_id, c0, c1)
+        except Exception:
+            pass
     return None, True
 
 
@@ -4636,15 +4660,14 @@ def _v4_position_detail(w3: Web3, chain_id: int, tid: int, account_addr: str) ->
         i0 = _v4_currency_info(w3, chain_id, key[0])
         i1 = _v4_currency_info(w3, chain_id, key[1])
         a0_raw, a1_raw = amounts_from_liquidity(liq, sqrtp, tick_lo, tick_hi)
-        qsym, q_is_t1 = _v4_quote_side(chain_id, key[0], key[1])
+        qsym, q_is_t1 = _v4_quote_side(chain_id, key[0], key[1], w3)
 
         raw_price = (sqrtp / Q96) ** 2
         usd = unclaimed_usd = 0.0
         usd0 = usd1 = fees_usd0 = fees_usd1 = 0.0
         mc_lower = mc_upper = mc_now = None
         if qsym:
-            qusd = quote_usd_price(w3, chain_id, qsym if qsym in cfg["quotes"] or qsym in cfg["stable_syms"]
-                                   else cfg["wrapped_symbol"])
+            qusd = quote_usd_price(w3, chain_id, qsym)
             if q_is_t1:
                 qdec, mdec, meme_addr = i1["decimals"], i0["decimals"], key[0]
                 meme_in_q = raw_price * 10 ** (mdec - qdec)
@@ -4706,7 +4729,7 @@ def increase_v4(chain_id: int, pk: str, tid: int, budget_quote: float,
     key = tuple(key)
     tick_lo, tick_hi = _v4_tick_from_info(info)
     pid = v4_pool_id(key)
-    qsym, q_is_t1 = _v4_quote_side(chain_id, key[0], key[1])
+    qsym, q_is_t1 = _v4_quote_side(chain_id, key[0], key[1], w3)
     if not qsym:
         raise RuntimeError("Pair tanpa quote yang dikenal bot.")
     quote = key[1] if q_is_t1 else key[0]
@@ -4782,8 +4805,7 @@ def increase_v4(chain_id: int, pk: str, tid: int, budget_quote: float,
     if receipt is None:
         raise RuntimeError(f"Add v4 gagal 3×. Detail: {last_err}")
 
-    qusd = quote_usd_price(w3, chain_id, qsym if qsym in cfg["quotes"] or qsym in cfg["stable_syms"]
-                           else cfg["wrapped_symbol"])
+    qusd = quote_usd_price(w3, chain_id, qsym)
     uq, um = (u1, u0) if q_is_t1 else (u0, u1)
     added_usd = (uq + um * meme_price_q) / 10 ** qdec * qusd
     return {"steps": steps, "added_usd": added_usd, "quote_sym": qsym,
@@ -4880,7 +4902,7 @@ def close_v4(chain_id: int, pk: str, tid: int, slippage_pct: float, autoswap: bo
     slip = (100 - slippage_pct) / 100
     i0 = _v4_currency_info(w3, chain_id, key[0])
     i1 = _v4_currency_info(w3, chain_id, key[1])
-    qsym, q_is_t1 = _v4_quote_side(chain_id, key[0], key[1])
+    qsym, q_is_t1 = _v4_quote_side(chain_id, key[0], key[1], w3)
     meme = key[0] if q_is_t1 else key[1]
 
     pre_meme = erc20(w3, meme).functions.balanceOf(account.address).call() if meme.lower() != V4_NATIVE else 0
@@ -5105,7 +5127,7 @@ def rebalance_position(chain_id: int, pk: str, pid, mode: str, slippage_pct: flo
         liq = posm.functions.getPositionLiquidity(ref).call()
         if liq == 0:
             raise RuntimeError("Liquidity 0 — posisi sudah kosong.")
-        qsym, q_is_t1 = _v4_quote_side(chain_id, key[0], key[1])
+        qsym, q_is_t1 = _v4_quote_side(chain_id, key[0], key[1], w3)
         if not qsym:
             raise RuntimeError("Pair tanpa quote yang dikenal bot.")
         quote = key[1] if q_is_t1 else key[0]

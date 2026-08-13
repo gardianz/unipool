@@ -236,6 +236,20 @@ Aturan yang gampang dilanggar kalau tidak hati-hati:
 - **Sisi quote posisi ditentukan `resolve_quote_side()`**, dipakai `_position_detail`
   (v3) dan `_v2_position_detail` (v2). Sebelum ada ini, posisi ber-quote asing tampil
   bernilai 0 di v3 dan **hilang sama sekali** dari `/list` di v2.
+- **v4 lewat `_v4_quote_side(..., w3)`** — argumen `w3` itu yang menyalakan fallback
+  ke `resolve_quote_side`. Tanpa `w3` fungsi ini cuma mengenal quote tetap + native,
+  dan posisi v4 ber-quote asing rusak bertiga sekaligus: nilai **$0,00**, range tampil
+  sebagai harga mentah bukan market cap (blok `if qsym:` yang menghitung `mc_*` ikut
+  dilewati), dan setiap aksi ditolak *"Pair tanpa quote yang dikenal bot"* (kasus
+  nyata: PACK/NVDA #645408). Jalur **discovery sengaja tidak mengirim `w3`** —
+  `resolve_quote_side` membaca sokongan likuiditas kedua sisi (terukur ~20 detik),
+  terlalu mahal per pool hasil indexer; itu tugas `discover_foreign_pools()`.
+  Quote runtime yang sudah terdaftar dicek dari `_EXTRA_QUOTES` dulu supaya refresh
+  daftar posisi tidak membayar ongkos itu berulang (20s → 1,6s).
+- **Quote asing jangan dihargai sebagai wrapped.** Dua tempat di jalur v4 dulu memakai
+  `qsym if qsym in cfg["quotes"] … else cfg["wrapped_symbol"]` — quote asing pun
+  dihargai memakai harga ETH. `quote_usd_price()` sudah menangani quote runtime lewat
+  `_EXTRA_QUOTES`, jadi cukup `quote_usd_price(w3, chain_id, qsym)` polos.
 - **Rute swap harus lewat `swap_any()`/`swap_route()`**, bukan `swap_to_token()`
   langsung: quote auto-deteksi lazimnya tidak punya pool langsung ke wrapped (NVDAB
   cuma berpasangan dengan USDT), jadi perlu 2-hop. `reduce_v2` bahkan butuh tiga
