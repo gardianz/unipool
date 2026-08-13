@@ -2337,6 +2337,16 @@ def find_pool_dex(w3: Web3, chain_id: int, a: str, b: str,
                 continue
             if bal <= 0:
                 continue
+            try:
+                # Saldo bukan bukti pool bisa dipakai: pool bisa punya DEBU dan
+                # likuiditas aktif 0 — swap ke situ selalu revert '0x'. Terbukti di
+                # WETH/MSFT fee 3000 (Robinhood): saldo 53 wei, liquidity() 0, rute
+                # langsung ini menang atas 2-hop WETH→USDG→MSFT yang sebenarnya jalan,
+                # dan mint gagal di jalur auto-buy quote.
+                if w3.eth.contract(address=addr, abi=POOL_ABI).functions.liquidity().call() <= 0:
+                    continue
+            except Exception:
+                continue
             if amount_in_wei > 0:
                 score = (1 - f / 1e6) * (bal / (bal + amount_in_wei))
             else:
@@ -2396,6 +2406,38 @@ def ensure_quote_balance(w3: Web3, chain_id: int, pk: str, quote_addr: str, need
         h = send_tx(w3, pk, {"to": quote, "value": deficit, "data": calldata(weth.functions.deposit())})
         wait_ok(w3, h, "wrap")
         txs.append(("wrap", h))
+        return txs
+
+    # Modal gabungan: pakai quote lain yang SUDAH ada di wallet duluan. Untuk pool
+    # ber-quote asing (mis. MSFT) itu 1 hop dari USDG, sedangkan jalur wrapped di bawah
+    # butuh wrap + 2 hop — fee & slippage dobel, dan bisa gagal karena ETH-nya kurang
+    # padahal USDG-nya menumpuk. compute_amount sudah menghitung saldo ini sebagai modal,
+    # jadi eksekusinya wajib bisa mengambilnya.
+    qdec_t = token_info(w3, quote)["decimals"]
+    q_usd_t = token_usd_price(w3, chain_id, quote)
+    for sym, oaddr in cfg["quotes"].items():
+        if deficit <= 0:
+            break
+        oc = Web3.to_checksum_address(oaddr)
+        if oc == quote or oc == wrapped:
+            continue
+        try:
+            obal = erc20(w3, oc).functions.balanceOf(account.address).call()
+            ousd = quote_usd_price(w3, chain_id, sym)
+            if obal <= 0 or ousd <= 0 or q_usd_t <= 0:
+                continue
+            odec = token_info(w3, oc)["decimals"]
+            spend = min(obal, int(deficit / 10 ** qdec_t * q_usd_t / ousd * 10 ** odec * 1.03))
+            if spend <= 0:
+                continue
+            before = erc20(w3, quote).functions.balanceOf(account.address).call()
+            txs += swap_any(chain_id, pk, oc, quote, spend, slippage_pct)
+            got = poll_balance(w3, quote, account.address, before + 1) - before
+            if got > 0:
+                deficit -= got
+        except Exception:
+            continue
+    if deficit <= 0:
         return txs
 
     # quote bukan wrapped: tutup kekurangan dengan swap wrapped → quote
@@ -4336,11 +4378,15 @@ def ensure_native_balance(w3: Web3, chain_id: int, pk: str, need_wei: int,
         return txs
     weth = w3.eth.contract(address=wrapped, abi=WETH_ABI)
     if wbal > 0:
-        amt = min(wbal, deficit)
+        # Unwrap LEBIH dari kekurangan: tx unwrap (dan swap di bawah) membakar gas dari
+        # saldo native yang sama, jadi unwrap pas-pasan selalu mendarat kurang sebanyak
+        # gas yang baru saja dipakai — terukur "punya 0.130946, butuh 0.130789 + gas".
+        amt = min(wbal, deficit + gas_reserve_wei(chain_id, w3))
         h = send_tx(w3, pk, {"to": wrapped, "data": calldata(weth.functions.withdraw(amt))})
         wait_ok(w3, h, "unwrap")
         txs.append(("unwrap", h))
-        deficit -= amt
+        # kekurangan dihitung ulang dari saldo NYATA, bukan dikurangi angka rencana
+        deficit = need_wei - w3.eth.get_balance(account.address)
     if deficit <= 0:
         return txs
     # Masih kurang → jual quote lain (mis. USDG) jadi wrapped, lalu unwrap.
@@ -4350,7 +4396,7 @@ def ensure_native_balance(w3: Web3, chain_id: int, pk: str, need_wei: int,
     for sym, oaddr in cfg["quotes"].items():
         if deficit <= 0:
             break
-        if str(oaddr).lower() == wrapped:
+        if str(oaddr).lower() == wrapped.lower():   # wrapped di-checksum, oaddr belum tentu
             continue
         try:
             c = erc20(w3, oaddr)
@@ -4361,7 +4407,9 @@ def ensure_native_balance(w3: Web3, chain_id: int, pk: str, need_wei: int,
             ousd = quote_usd_price(w3, chain_id, sym)
             if ousd <= 0 or w_usd <= 0:
                 continue
-            need_o = int(deficit / 1e18 * w_usd / ousd * 10 ** odec * 1.03)   # +3% biaya swap
+            # +3% biaya swap, + cadangan gas: swap dan unwrap di bawah ikut membakar native
+            need_o = int((deficit + gas_reserve_wei(chain_id, w3))
+                         / 1e18 * w_usd / ousd * 10 ** odec * 1.03)
             spend = min(obal, need_o)
             if spend <= 0:
                 continue
@@ -4373,7 +4421,7 @@ def ensure_native_balance(w3: Web3, chain_id: int, pk: str, need_wei: int,
             h = send_tx(w3, pk, {"to": wrapped, "data": calldata(weth.functions.withdraw(got))})
             wait_ok(w3, h, "unwrap")
             txs.append(("unwrap", h))
-            deficit -= got
+            deficit = need_wei - w3.eth.get_balance(account.address)
         except Exception:
             continue
     return txs

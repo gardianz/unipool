@@ -132,6 +132,27 @@ terdalam seperti sebelumnya.
 Skor ini pendekatan constant-product, jadi perkiraan — bukan hasil quoter. Cukup
 untuk memilih rute, jangan dipakai sebagai angka yang ditampilkan ke user.
 
+**Saldo bukan bukti pool hidup.** Kandidat wajib lolos `liquidity() > 0`, bukan cuma
+`balanceOf > 0`. Pool berdebu (terukur **53 wei**) dengan likuiditas aktif 0 tetap
+lolos filter saldo, menang sebagai rute *langsung*, lalu setiap swap revert `0x`
+tanpa alasan — dan `swap_route` tidak pernah mencoba 2-hop yang sebenarnya jalan.
+Kasus nyata: WETH/MSFT fee 3000 di Robinhood mematikan mint pool ber-quote MSFT,
+padahal WETH→USDG→MSFT hidup. Efek sampingnya juga menyeret `wrapped_per_quote_wei()`
+membaca harga dari pool mati itu.
+
+### Modal gabungan wajib bisa diambil, bukan cuma dihitung
+
+`compute_amount` menghitung ETH + WETH + quote lain sebagai modal, jadi kedua jalur
+pengambilannya harus ikut:
+
+- `ensure_quote_balance()` menjual quote lain **langsung** ke quote target dulu
+  (USDG→MSFT = 1 hop) sebelum jalur wrapped (wrap + 2 hop, fee/slippage dobel dan
+  gagal kalau ETH-nya kurang padahal USDG menumpuk).
+- `ensure_native_balance()` mengunwrap **lebih** dari kekurangan sebesar cadangan gas:
+  tx unwrap/swap-nya sendiri membakar native, jadi unwrap pas-pasan selalu mendarat
+  kurang persis sebesar gas itu (terukur: "punya 0.130946, butuh 0.130789 + gas").
+  Sisa kekurangan selalu dihitung ulang dari saldo NYATA, bukan dikurangi angka rencana.
+
 ### Auto-swap saat close cuma menjual HASIL close
 
 `close_position`/`close_v4`/`reduce_v2` memotret saldo kedua sisi sebelum eksekusi,
