@@ -792,20 +792,75 @@ def poll_balance(w3: Web3, token: str, addr: str, min_expected: int,
     return bal
 
 
-def _rebroadcast(w3: Web3, raw) -> None:
-    """Siarkan ulang raw tx. Nonce dan tanda tangannya identik, jadi tidak mungkin
-    jadi tx kedua — paling banter dijawab "already known".
+def _peer_session() -> requests.Session:
+    """Sesi khusus siar ulang: TANPA retry, timeout pendek. `_rpc_session()` memakai
+    `Retry(total=6, backoff 0.6→9.6s)` — untuk endpoint mati itu ~40 detik per
+    request, dan terukur 116 detik hanya untuk membangun daftar peer chain 4663.
+    Di sini kegagalan justru harus murah: fungsi pemakainya jalan di dalam loop
+    tunggu tx."""
+    s = requests.Session()
+    a = HTTPAdapter(max_retries=0, pool_connections=4, pool_maxsize=4)
+    s.mount("https://", a)
+    s.mount("http://", a)
+    return s
 
-    Sengaja hanya ke node aktif. Pernah dicoba menyebar ke seluruh endpoint chain:
-    di chain 4663 endpoint kedua (blockscout eth-rpc) mati dan membangun daftarnya
-    memakan 116 detik retry, sementara satu-satunya yang hidup adalah node yang
-    sudah dipakai get_w3() — biayanya jauh melebihi manfaatnya."""
+
+def _peer_w3s(chain_id: int, skip_uri: str = "", _cache={}) -> list:
+    """Endpoint LAIN yang hidup di chain ini, untuk menyebar siar ulang tx.
+
+    RPC publik BSC lazim menerima tx lalu tidak mempropagasikannya; menyuntikkannya
+    ulang lewat endpoint berbeda itu yang menolong.
+
+    Sengaja TIDAK diprobe dulu. Blockscout eth-rpc Robinhood menjawab **429** untuk
+    `eth_chainId` (rate limit, bukan mati) — probe apa pun akan membuangnya, padahal
+    satu tx per 20 detik masih lolos di sana. Endpoint yang benar-benar mati gagal
+    murah (terukur 0,06 detik untuk host yang diblokir DNS ISP) karena sesinya tanpa
+    retry, jadi mencoba lebih murah daripada memilah. Tx yang nyasar ke chain lain
+    ditolak sendiri oleh tanda tangannya."""
+    key = (chain_id, skip_uri)
+    hit = _cache.get(key)
+    if hit:
+        return hit[0]
+    cfg = CHAINS[chain_id]
+    urls = []
+    if os.environ.get(cfg["rpc_env"]):
+        urls.append(os.environ[cfg["rpc_env"]])
+    akey = os.environ.get("ALCHEMY_API_KEY", "").strip()
+    if akey and cfg.get("alchemy"):
+        urls.append(f"https://{cfg['alchemy']}.g.alchemy.com/v2/{akey}")
+    urls += cfg["rpcs"]
+    out = []
+    for u in urls:
+        if skip_uri and u == skip_uri:
+            continue
+        try:
+            out.append(Web3(Web3.HTTPProvider(u, request_kwargs={"timeout": 4},
+                                              session=_peer_session())))
+        except Exception:
+            continue
+    _cache[key] = (out, time.time())
+    return out
+
+
+def _rebroadcast(w3: Web3, raw) -> None:
+    """Siarkan ulang raw tx ke node aktif DAN endpoint lain yang hidup. Nonce dan
+    tanda tangannya identik, jadi tidak mungkin jadi tx kedua — paling banter
+    dijawab "already known"."""
     if raw is None:
         return
     try:
         w3.eth.send_raw_transaction(raw)
     except Exception:
         pass
+    try:
+        peers = _peer_w3s(w3.eth.chain_id, getattr(w3.provider, "endpoint_uri", "") or "")
+    except Exception:
+        return
+    for p in peers:
+        try:
+            p.eth.send_raw_transaction(raw)
+        except Exception:
+            pass
 
 
 def wait_ok(w3: Web3, txhash: str, what: str, total_wait: int = 180):

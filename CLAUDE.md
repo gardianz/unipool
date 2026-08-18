@@ -365,19 +365,32 @@ key-nya. Pertahankan properti ini saat menambah endpoint.
 
 ### Tx hilang dari mempool, bukan kurang gas
 
-Base fee Robinhood terukur rata **0,02 gwei** dan stabil; `send_tx` mengirim tip
-0,1 gwei (5×) dengan cap `base*2 + tip`. Jadi kalau tx tidak masuk blok, sebabnya
-hampir pasti tx dibuang/tidak dipropagasikan node — bukan underpriced. Menaikkan
-gas tidak menolong; yang menolong **siar ulang berkala**.
+Terukur di kedua chain, tx yang dikirim bot **tidak** underpriced:
+
+| | base fee | floor tx termine | dikirim `send_tx` |
+|---|---|---|---|
+| Robinhood 4663 | 0,02 gwei (rata) | — | cap 0,14 gwei, tip 0,1 |
+| BSC 56 | 0 | min 0,05 · median 0,066 gwei | cap 0,20 gwei, tip 0,1 |
+
+Jadi kalau tx tidak masuk blok, sebabnya tx dibuang / tidak dipropagasikan node.
+Menaikkan gas tidak menolong; yang menolong **siar ulang berkala + lewat endpoint
+lain**.
 
 `wait_ok()` menunggu dalam potongan ~20 detik dan menyiarkan ulang raw tx yang sama
 tiap potongan (nonce & tanda tangan identik → mustahil dobel), total 180 detik.
 Sebelumnya siar ulangnya cuma sekali di detik ke-90.
 
-**Jangan menyebar siaran ke semua endpoint.** Sudah dicoba: di chain 4663 endpoint
-kedua (blockscout eth-rpc) mati dan membangun daftar peer-nya makan **116 detik**
-retry, sedangkan satu-satunya yang hidup adalah node yang sudah dipakai `get_w3()`
-(itu pun lewat bypass DoH/IP). Biayanya jauh melebihi manfaatnya.
+`_rebroadcast()` menyebar ke node aktif **dan** semua endpoint lain di `CHAINS`.
+Dua hal yang membuat ini murah, jangan dibalik:
+
+- **Sesi peer tanpa retry** (`_peer_session`, timeout 4 detik). `_rpc_session()`
+  memakai `Retry(total=6, backoff 0.6→9.6s)` — untuk endpoint mati itu ~40 detik per
+  request, dan sempat terukur **116 detik** hanya untuk membangun daftar peer 4663.
+  Dengan sesi cepat, satu ronde siar ulang ke semua endpoint = 4–6 detik.
+- **Peer tidak diprobe.** Blockscout eth-rpc Robinhood menjawab **429** untuk
+  `eth_chainId` (rate limit, bukan mati) — probe apa pun akan membuangnya, padahal
+  satu tx per 20 detik masih lolos. Endpoint yang benar-benar mati gagal murah
+  (0,06 detik untuk host yang diblokir DNS ISP).
 
 Kalau `wait_ok` menyerah, `_NONCE_NEXT`/`_LAST_TX` WAJIB di-reset — tanpa itu tx
 berikutnya lahir dengan lubang nonce dan ikut mati satu per satu.
