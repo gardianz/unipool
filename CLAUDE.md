@@ -400,6 +400,17 @@ lain**.
 tiap potongan (nonce & tanda tangan identik → mustahil dobel), total 180 detik.
 Sebelumnya siar ulangnya cuma sekali di detik ke-90.
 
+Tx disebar ke endpoint lain **sejak dikirim**, bukan menunggu ronde siar ulang
+pertama: `send_tx()` memanggil `_fanout_async()` (thread daemon, balik dalam ~2 ms).
+Terbukti perlu di BSC — tx wrap `0xdde477e4…` diterima `bsc-dataseed` dengan hash
+normal lalu tidak pernah dipropagasikan; 180 detik kemudian tx itu tidak dikenal
+node mana pun, bukan sekadar belum di-mine.
+
+Daftar RPC BSC diperluas ke 5 endpoint yang semuanya diverifikasi `eth_chainId == 56`
+**dan** mendukung `eth_sendRawTransaction`. `rpc.48.club` ditaruh pertama: dioperasikan
+operator validator BSC, jadi tx masuk jalur langsung ke pemilih blok. `1rpc.io/bnb`
+dibuang — jawabannya bukan JSON yang sah.
+
 `_rebroadcast()` menyebar ke node aktif **dan** semua endpoint lain di `CHAINS`.
 Dua hal yang membuat ini murah, jangan dibalik:
 
@@ -451,6 +462,14 @@ menyusul). `chain.py` menyimpan cache berumur di `_cache={}` default-arg untuk h
 immutable (`pool_addr_of`, `token_supply`, hasil verifikasi kontrak) dan `.active_positions.json`
 untuk set tokenId aktif. RPC free-tier gampang kena 429 — hindari menambah panggilan
 per-posisi di jalur refresh.
+
+### PoA: `get_block` di BSC
+
+BSC memakai extraData 280 byte, jauh di atas 32 byte yang divalidasi web3, jadi
+`eth_getBlock` **selalu** melempar `ExtraDataLengthError` tanpa middleware PoA —
+`price_history()` (chart) dan pembacaan timestamp blok di web.py mati diam-diam di
+chain itu. `_poa()` dipasang di `get_w3()` dan `_forced_ip_w3()`; aman untuk chain
+non-PoA karena middleware-nya cuma memangkas extraData yang kepanjangan.
 
 ### Jaringan
 

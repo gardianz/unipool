@@ -5,6 +5,7 @@ DEX per chain: Uniswap v2/v3/v4 di Robinhood (4663), PancakeSwap v2/v3 di BSC (5
 """
 import math
 import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
@@ -16,6 +17,14 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from web3 import Web3
 from web3.exceptions import ContractLogicError
+
+try:    # BSC itu PoA: extraData 280 byte, jauh di atas 32 byte yang divalidasi web3.
+    from web3.middleware import ExtraDataToPOAMiddleware as _POA   # web3 v7
+except ImportError:                                                # pragma: no cover
+    try:
+        from web3.middleware import geth_poa_middleware as _POA    # web3 v6
+    except ImportError:
+        _POA = None
 
 Q96 = 2**96
 MAX_UINT128 = 2**128 - 1
@@ -99,10 +108,17 @@ CHAINS = {
         # PancakeSwap V2 (diverifikasi on-chain: v2_router.factory()==v2_factory,
         # v2_router.WETH()==wrapped)
         "v2_factory": "0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73",
+        # Semua diverifikasi: eth_chainId == 56 DAN eth_sendRawTransaction didukung.
+        # rpc.48.club ditaruh duluan karena dioperasikan operator validator BSC —
+        # tx-nya masuk jalur langsung ke pemilih blok. bsc-dataseed pernah terbukti
+        # MENERIMA tx wrap lalu tidak pernah mempropagasikannya (tx hilang total dari
+        # chain, lihat wait_ok). 1rpc.io dibuang: jawabannya bukan JSON yang sah.
         "rpcs": [
-            "https://1rpc.io/bnb",
+            "https://rpc.48.club",
             "https://bsc-dataseed.bnbchain.org",
             "https://bsc-rpc.publicnode.com",
+            "https://bsc-dataseed1.defibit.io",
+            "https://bsc-dataseed1.ninicoin.io",
         ],
         "alchemy": "bnb-mainnet",
         "rpc_env": "RPC_56",
@@ -618,7 +634,7 @@ def _forced_ip_w3(rpc_url: str) -> Web3 | None:
     ip_url = rpc_url.replace(u.hostname, ip, 1)
     provider = Web3.HTTPProvider(ip_url, request_kwargs={"timeout": 30}, session=session)
     provider.cache_allowed_requests = True  # eth_chainId dkk tidak di-query berulang
-    return Web3(provider)
+    return _poa(Web3(provider))
 
 
 # ---------- Koneksi & util dasar ----------
@@ -626,6 +642,19 @@ _W3_CACHE: dict[int, tuple[Web3, float]] = {}
 _NONCE_NEXT: dict[str, int] = {}  # alamat → nonce berikutnya (pelacak lokal utk tx beruntun)
 _LAST_TX: dict[str, str] = {}     # alamat → hash tx terakhir yang kita siarkan
 _LAST_RAW: dict[str, bytes] = {}  # hash → raw signed tx, untuk siar ulang kalau hilang
+
+
+def _poa(w3: Web3) -> Web3:
+    """Pasang middleware PoA. Tanpa ini `eth_getBlock` di BSC SELALU melempar
+    ExtraDataLengthError (extraData 280 byte) — chart harga dan pembacaan timestamp
+    blok mati diam-diam di chain itu. Aman untuk chain non-PoA: middleware ini cuma
+    memangkas extraData yang kepanjangan."""
+    if _POA is not None:
+        try:
+            w3.middleware_onion.inject(_POA, layer=0)
+        except Exception:
+            pass
+    return w3
 
 
 def get_w3(chain_id: int, fresh: bool = False) -> Web3:
@@ -647,7 +676,7 @@ def get_w3(chain_id: int, fresh: bool = False) -> Web3:
     for rpc in rpcs:
         provider = Web3.HTTPProvider(rpc, request_kwargs={"timeout": 30}, session=_rpc_session())
         provider.cache_allowed_requests = True  # eth_chainId dkk tidak di-query berulang
-        candidates = [Web3(provider)]
+        candidates = [_poa(Web3(provider))]
         for i, w3 in enumerate(candidates):
             try:
                 if w3.eth.chain_id == chain_id:
@@ -755,6 +784,7 @@ def send_tx(w3: Web3, pk: str, tx: dict) -> str:
             if len(_LAST_RAW) > 50:
                 _LAST_RAW.clear()
             _LAST_RAW[hh] = signed.raw_transaction
+            _fanout_async(w3, signed.raw_transaction)
             return hh
         except Exception as e:
             s = str(e).lower()
@@ -865,6 +895,32 @@ def _peer_w3s(chain_id: int, skip_uri: str = "", _cache={}) -> list:
             continue
     _cache[key] = (out, time.time())
     return out
+
+
+def _fanout_async(w3: Web3, raw) -> None:
+    """Sebar raw tx ke endpoint LAIN sekarang juga, di thread terpisah.
+
+    Tanpa ini tx cuma duduk di satu node sampai ronde siar ulang pertama (20 detik).
+    Terbukti perlu di BSC: tx wrap 0xdde477e4… diterima bsc-dataseed (hash-nya
+    kembali normal) lalu tidak pernah dipropagasikan — 180 detik kemudian tx itu
+    tidak dikenal node mana pun, bukan sekadar belum di-mine.
+
+    Dijalankan di thread supaya send_tx tidak ikut menunggu (satu ronde ke semua
+    endpoint terukur ~4 detik); kegagalan diabaikan, ini murni usaha tambahan."""
+    try:
+        cid = w3.eth.chain_id
+    except Exception:
+        return
+    uri = getattr(w3.provider, "endpoint_uri", "") or ""
+
+    def go():
+        for p in _peer_w3s(cid, uri):
+            try:
+                p.eth.send_raw_transaction(raw)
+            except Exception:
+                pass
+
+    threading.Thread(target=go, daemon=True).start()
 
 
 def _rebroadcast(w3: Web3, raw) -> None:
