@@ -363,6 +363,34 @@ Browser hanya mengirim *persen* lebar range; tick final tetap dari `calc_strateg
 dari browser**: hasil discovery disimpan di `_POOLS` (web.py) dan klien cuma memegang
 key-nya. Pertahankan properti ini saat menambah endpoint.
 
+### Tx hilang dari mempool, bukan kurang gas
+
+Base fee Robinhood terukur rata **0,02 gwei** dan stabil; `send_tx` mengirim tip
+0,1 gwei (5×) dengan cap `base*2 + tip`. Jadi kalau tx tidak masuk blok, sebabnya
+hampir pasti tx dibuang/tidak dipropagasikan node — bukan underpriced. Menaikkan
+gas tidak menolong; yang menolong **siar ulang berkala**.
+
+`wait_ok()` menunggu dalam potongan ~20 detik dan menyiarkan ulang raw tx yang sama
+tiap potongan (nonce & tanda tangan identik → mustahil dobel), total 180 detik.
+Sebelumnya siar ulangnya cuma sekali di detik ke-90.
+
+**Jangan menyebar siaran ke semua endpoint.** Sudah dicoba: di chain 4663 endpoint
+kedua (blockscout eth-rpc) mati dan membangun daftar peer-nya makan **116 detik**
+retry, sedangkan satu-satunya yang hidup adalah node yang sudah dipakai `get_w3()`
+(itu pun lewat bypass DoH/IP). Biayanya jauh melebihi manfaatnya.
+
+Kalau `wait_ok` menyerah, `_NONCE_NEXT`/`_LAST_TX` WAJIB di-reset — tanpa itu tx
+berikutnya lahir dengan lubang nonce dan ikut mati satu per satu.
+
+### Baca hasil tx: tunggu sisi yang benar-benar berubah
+
+`rebalance_position` dulu cuma mem-`poll_balance` sisi **meme**. Posisi single-sided
+(mode Lower) pulang 100% **quote**, jadi `got_m == 0` dan tidak ada penungguan sama
+sekali — replika RPC yang telat menjawab saldo pra-close bikin kedua delta 0 dan
+rebalance batal *"Hasil close terbaca 0 (RPC lag)"* padahal close-nya sukses.
+Sekarang kedua sisi ditunggu (`_poll_wallet` sadar-native untuk currency v4
+`address(0)`) dan pembacaan delta diulang 8× sebelum menyerah.
+
 ### Serialisasi transaksi & eksekutor tunggal
 
 Masing-masing proses punya lock nonce sendiri (`TX_LOCK`: `asyncio.Lock` di bot.py,

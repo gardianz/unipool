@@ -792,31 +792,52 @@ def poll_balance(w3: Web3, token: str, addr: str, min_expected: int,
     return bal
 
 
-def wait_ok(w3: Web3, txhash: str, what: str):
+def _rebroadcast(w3: Web3, raw) -> None:
+    """Siarkan ulang raw tx. Nonce dan tanda tangannya identik, jadi tidak mungkin
+    jadi tx kedua — paling banter dijawab "already known".
+
+    Sengaja hanya ke node aktif. Pernah dicoba menyebar ke seluruh endpoint chain:
+    di chain 4663 endpoint kedua (blockscout eth-rpc) mati dan membangun daftarnya
+    memakan 116 detik retry, sementara satu-satunya yang hidup adalah node yang
+    sudah dipakai get_w3() — biayanya jauh melebihi manfaatnya."""
+    if raw is None:
+        return
     try:
-        r = w3.eth.wait_for_transaction_receipt(txhash, timeout=90)
+        w3.eth.send_raw_transaction(raw)
     except Exception:
-        # Tidak masuk blok dalam 90 detik. Penyebab paling lazim BUKAN gas kurang,
-        # melainkan tx hilang dari mempool: node penerima tidak mempropagasikannya,
-        # atau kena eviction. Siarkan ulang raw tx yang sama persis (nonce & tanda
-        # tangan identik, jadi tidak mungkin dobel) lalu tunggu sekali lagi.
-        raw = _LAST_RAW.get(txhash)
-        if raw is not None:
-            try:
-                w3.eth.send_raw_transaction(raw)
-            except Exception:
-                pass                      # "already known" dsb — tidak apa-apa
+        pass
+
+
+def wait_ok(w3: Web3, txhash: str, what: str, total_wait: int = 180):
+    """Tunggu receipt sambil menyiarkan ulang tx BERKALA (tiap ~20 detik).
+
+    Penyebab gagal di titik ini bukan gas kurang — base fee Robinhood terukur rata
+    0,02 gwei dan tx dikirim dengan tip 0,1 gwei (5x) — melainkan tx hilang dari
+    mempool: node tidak mempropagasikannya atau meng-evict-nya. Dulu siar ulangnya
+    cuma SEKALI di detik ke-90; sekarang ~8 kali dalam jendela yang sama, karena
+    blok chain ini sub-detik dan tx yang belum masuk 20 detik memang bukan sekadar
+    "masih antre"."""
+    raw = _LAST_RAW.get(txhash)
+    deadline = time.time() + total_wait
+    r = None
+    while True:
+        left = deadline - time.time()
+        if left <= 0:
+            break
         try:
-            r = w3.eth.wait_for_transaction_receipt(txhash, timeout=90)
+            r = w3.eth.wait_for_transaction_receipt(txhash, timeout=max(5, min(20, left)))
+            break
         except Exception:
-            # Menyerah. WAJIB reset pelacak nonce: kalau tidak, tx berikutnya lahir
-            # dengan lubang nonce dan ikut mati satu per satu.
-            _NONCE_NEXT.clear()
-            _LAST_TX.clear()
-            raise RuntimeError(
-                f"Tx {what} tidak masuk chain setelah 180 detik dan sudah disiarkan "
-                f"ulang — kemungkinan besar dibuang mempool RPC. Tidak ada dana yang "
-                f"berpindah di langkah ini; ulangi saja. ({txhash})")
+            _rebroadcast(w3, raw)
+    if r is None:
+        # Menyerah. WAJIB reset pelacak nonce: kalau tidak, tx berikutnya lahir
+        # dengan lubang nonce dan ikut mati satu per satu.
+        _NONCE_NEXT.clear()
+        _LAST_TX.clear()
+        raise RuntimeError(
+            f"Tx {what} tidak masuk chain setelah {total_wait} detik dan sudah disiarkan "
+            f"ulang berkali-kali — kemungkinan besar dibuang mempool RPC. "
+            f"Tidak ada dana yang berpindah di langkah ini; ulangi saja. ({txhash})")
     if r.status != 1:
         hint = ""
         try:
@@ -5074,6 +5095,22 @@ def _wallet_balance(w3: Web3, cur: str, addr: str) -> int:
     return erc20(w3, cur).functions.balanceOf(addr).call()
 
 
+def _poll_wallet(w3: Web3, cur: str, addr: str, min_expected: int,
+                 tries: int = 10, delay: float = 0.7) -> int:
+    """poll_balance versi sadar-native — currency v4 bisa address(0), yang tidak
+    punya kontrak ERC20 untuk di-balanceOf."""
+    bal = 0
+    for _ in range(tries):
+        try:
+            bal = _wallet_balance(w3, cur, addr)
+        except Exception:
+            bal = 0
+        if bal >= min_expected:
+            return bal
+        time.sleep(delay)
+    return bal
+
+
 def rebalance_position(chain_id: int, pk: str, pid, mode: str, slippage_pct: float,
                        gap: int = 1) -> dict:
     """Close posisi → swap komposisi sesuai mode → mint ulang dengan lebar range
@@ -5161,12 +5198,22 @@ def rebalance_position(chain_id: int, pk: str, pid, mode: str, slippage_pct: flo
     steps = list(closed["steps"])
 
     got_m = (closed["got0"] if q_is_t1 else closed["got1"]) * 10 ** minfo["decimals"]
+    got_q = (closed["got1"] if q_is_t1 else closed["got0"]) * 10 ** pool_info["quote_decimals"]
+    # Sisi QUOTE dulu tidak pernah ditunggu: posisi single-sided (mode Lower) pulang
+    # 100% quote, jadi got_m == 0 dan tidak ada polling sama sekali. Replika RPC yang
+    # telat menjawab saldo pra-close bikin kedua delta 0 dan rebalance batal padahal
+    # close-nya sudah sukses.
+    if got_q > 0:
+        _poll_wallet(w3, quote, account.address, pre_q + int(got_q * 0.9))
     if got_m > 0:
         poll_balance(w3, meme, account.address, pre_m + int(got_m * 0.9))
-    m_delta = erc20(w3, meme).functions.balanceOf(account.address).call() - pre_m
-    q_delta = _wallet_balance(w3, quote, account.address) - pre_q  # native: sudah minus gas
-    q_delta = max(0, q_delta)
-    m_delta = max(0, m_delta)
+    m_delta = q_delta = 0
+    for _ in range(8):   # replika bisa telat beberapa detik — jangan menyerah sekali baca
+        m_delta = max(0, erc20(w3, meme).functions.balanceOf(account.address).call() - pre_m)
+        q_delta = max(0, _wallet_balance(w3, quote, account.address) - pre_q)  # native: minus gas
+        if q_delta or m_delta:
+            break
+        time.sleep(1.5)
     if q_delta == 0 and m_delta == 0:
         raise RuntimeError("Hasil close terbaca 0 (RPC lag) — dana aman di wallet, mint manual saja.")
 
