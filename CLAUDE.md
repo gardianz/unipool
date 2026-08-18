@@ -194,6 +194,26 @@ keluar dari posisi, dihitung dari delta saldo SEBELUM swap komposisi) dan dipaka
 sebagai cadangan. `closed_usd` sudah termasuk fee — jadi di jalur cadangan itu
 **jangan** menambah event `fees` lagi, nanti dobel.
 
+### Keterangan pool di kartu posisi
+
+`pool_stats(w3, cid, pos)` memberi TVL, volume 24 jam, fee tier, dan tick spacing
+satu pool. Dipakai `_pool_info_line()` di kartu detail **satu** posisi saja —
+JANGAN dipanggil dari `/list`: TVL v4 butuh StateView dan volume butuh dexscreener,
+jadi biayanya per-posisi. Cache 60 detik.
+
+Sumber TVL beda per versi, sengaja:
+
+- v2/v3 — saldo NYATA kedua sisi di kontrak pool (`balanceOf` × harga USD).
+- v4 — dexscreener dulu, baru reserve virtual dari StateView (`liquidity` × harga
+  × 2) yang ditandai *(perkiraan)* di UI, karena saldo per-pool v4 tidak bisa dibaca.
+
+Semua angkanya **tampilan saja**, jangan dipakai membangun transaksi.
+
+`_v4_position_detail` wajib mengembalikan `tick_spacing` (`key[3]`): fee v4 bebas
+(58200, 39966, …) sehingga tabel `TICK_SPACING` tidak memuatnya dan `box_pct()`
+jatuh ke default 60 — presisi kisi yang ditampilkan jadi salah (terukur: kisi asli
+5,99% dilaporkan 0,60%).
+
 ### Registry posisi (kenapa `history.json` penting)
 
 Posisi v3 bisa dienumerasi on-chain (ERC721Enumerable), tapi **PositionManager v4 tidak

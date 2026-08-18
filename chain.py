@@ -4711,6 +4711,76 @@ def _v4_pending_fees(w3: Web3, chain_id: int, pid: bytes, tid: int,
     return f0, f1
 
 
+def _v4_tvl_onchain(w3: Web3, chain_id: int, p: dict) -> float:
+    """TVL pool v4 dari StateView: reserve virtual sisi quote x harga x 2.
+
+    Saldo per-pool v4 TIDAK bisa dibaca (semua currency ditahan satu PoolManager),
+    jadi ini perkiraan dari `liquidity` di harga sekarang — bukan reserve nyata.
+    Dipakai hanya kalau dexscreener tidak meng-index poolId itu."""
+    sv = _v4c(w3, chain_id, "v4_stateview", V4_STATEVIEW_ABI)
+    sqrtp = sv.functions.getSlot0(p["pool_id"]).call()[0]
+    liq = sv.functions.getLiquidity(p["pool_id"]).call()
+    if not sqrtp or not liq:
+        return 0.0
+    q_is_c1 = bool(p.get("quote_is_token1"))
+    qaddr = p["token1"] if q_is_c1 else p["token0"]
+    qdec = _v4_currency_info(w3, chain_id, qaddr)["decimals"]
+    qusd = quote_usd_price(w3, chain_id, p["quote_sym"])
+    q_virt = (liq * sqrtp // Q96) if q_is_c1 else (liq * Q96 // sqrtp)
+    return q_virt / 10 ** qdec * qusd * 2
+
+
+def pool_stats(w3: Web3, chain_id: int, p: dict, _cache={}) -> dict:
+    """Angka tingkat-POOL untuk kartu detail posisi: TVL, volume 24 jam, fee, kisi.
+
+    Dihitung on-demand dan HANYA untuk kartu satu posisi — jangan dipanggil dari
+    daftar posisi: TVL v4 butuh StateView dan volume butuh dexscreener, jadi biayanya
+    per-posisi. Cache 60 detik.
+
+    Semua nilainya boleh None dan semuanya angka TAMPILAN. Jangan pernah dipakai
+    membangun transaksi — sumbernya indexer luar dan perkiraan reserve virtual."""
+    ident = str(p.get("pool") or "").lower()
+    ck = (chain_id, ident)
+    hit = _cache.get(ck)
+    if hit and time.time() - hit[1] < 60:
+        return hit[0]
+    ver = p.get("ver", 3)
+    q_is_t1 = bool(p.get("quote_is_token1"))
+    meme = p["token0"] if q_is_t1 else p["token1"]
+    out = {"tvl_usd": None, "vol24_usd": None, "fee_pct": None,
+           "tick_spacing": p.get("tick_spacing"), "dex": p.get("dex"), "tvl_src": None}
+    try:
+        out["fee_pct"] = int(p["fee"]) / 1e4
+    except Exception:
+        pass
+    try:
+        out["vol24_usd"] = dex_volumes(chain_id, meme).get(ident) or None
+    except Exception:
+        pass
+    try:
+        if ver == 4:
+            tvl = _dexliq_of(chain_id, meme, ident)
+            out["tvl_src"] = "dexscreener" if tvl > 0 else "chain"
+            out["tvl_usd"] = (tvl or _v4_tvl_onchain(w3, chain_id, p)) or None
+        else:
+            # v2/v3: saldo NYATA kedua sisi di kontrak pool — lebih akurat daripada
+            # angka indexer (terukur $24,4k untuk pool yang saldonya $40,7k)
+            addr = Web3.to_checksum_address(p["pool"])
+            qaddr = p["token1"] if q_is_t1 else p["token0"]
+            qdec = p["dec1"] if q_is_t1 else p["dec0"]
+            mdec = p["dec0"] if q_is_t1 else p["dec1"]
+            qusd = quote_usd_price(w3, chain_id, p["quote_sym"])
+            musd = token_usd_price(w3, chain_id, meme)
+            qb = erc20(w3, qaddr).functions.balanceOf(addr).call() / 10 ** qdec
+            mb = erc20(w3, meme).functions.balanceOf(addr).call() / 10 ** mdec
+            out["tvl_src"] = "chain"
+            out["tvl_usd"] = (qb * qusd + mb * musd) or None
+    except Exception:
+        pass
+    _cache[ck] = (out, time.time())
+    return out
+
+
 def _v4_position_detail(w3: Web3, chain_id: int, tid: int, account_addr: str) -> dict | None:
     """None kalau posisi bukan milik wallet / sudah di-burn / kosong."""
     cfg = CHAINS[chain_id]
@@ -4774,9 +4844,13 @@ def _v4_position_detail(w3: Web3, chain_id: int, tid: int, account_addr: str) ->
 
         return {
             "ver": 4, "pid": f"v4:{tid}", "token_id": f"v4:{tid}", "v4_tid": tid,
-            "key": key, "pool_id": pid,
+            "dex": v4_dex(chain_id), "key": key, "pool_id": pid,
             "token0": key[0], "token1": key[1], "sym0": i0["symbol"], "sym1": i1["symbol"],
             "dec0": i0["decimals"], "dec1": i1["decimals"], "fee": key[2],
+            # tick_spacing WAJIB ikut: fee v4 bebas (58200 dst) sehingga tabel
+            # TICK_SPACING tidak memuatnya, dan box_pct() jatuh ke default 60 —
+            # presisi kisi yang ditampilkan jadi salah.
+            "tick_spacing": key[3],
             "pool": "0x" + pid.hex().removeprefix("0x"),
             "tick_lower": tick_lo, "tick_upper": tick_hi, "cur_tick": cur_tick,
             "liquidity": liq, "amount0": a0_raw / 10 ** i0["decimals"], "amount1": a1_raw / 10 ** i1["decimals"],

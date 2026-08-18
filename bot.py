@@ -1668,6 +1668,40 @@ def _pos_metrics(cid: int, p: dict) -> dict:
     }
 
 
+def _pool_info_line(cid: int, p: dict, ver: int) -> str:
+    """Baris keterangan POOL di kartu posisi: fee tier, TVL, volume, porsi kita.
+
+    Sengaja cuma di kartu detail (satu posisi), tidak di //list — pool_stats
+    memanggil StateView + dexscreener, jadi biayanya per-posisi."""
+    try:
+        s = ch.pool_stats(ch.get_w3(cid), cid, p)
+    except Exception:
+        s = {}
+    dex = s.get("dex") or p.get("dex") or ""
+    fee_pct = s.get("fee_pct")
+    bits = [f"v{ver}" + (f" {esc(dex)}" if dex else "")]
+    if fee_pct is not None:
+        bits.append(f"fee {fee_pct:g}%")
+    tvl, vol = s.get("tvl_usd"), s.get("vol24_usd")
+    if tvl:
+        src = " <i>(perkiraan)</i>" if s.get("tvl_src") == "chain" and ver == 4 else ""
+        bits.append(f"TVL ${fmt_short(tvl)}{src}")
+    if vol:
+        bits.append(f"vol 24j ${fmt_short(vol)}")
+    if tvl and vol:
+        bits.append(f"V/TVL {fmt_ratio(vol, tvl)}")
+    line = "🏊 " + " · ".join(bits)
+    extra = []
+    if tvl and p.get("value_usd"):
+        # Porsi kita di pool: penentu seberapa besar dampak masuk/keluar kita sendiri
+        extra.append(f"porsi kita {p['value_usd'] / tvl * 100:.1f}%")
+    if ver != 2:
+        extra.append(f"kisi {box_pct(p):.2f}%")
+    if extra:
+        line += "\n<i>" + " · ".join(extra) + "</i>"
+    return line
+
+
 def position_card(cid: int, p: dict) -> str:
     """Kartu detail satu posisi (ala BasedBot)."""
     m = _pos_metrics(cid, p)
@@ -1682,6 +1716,7 @@ def position_card(cid: int, p: dict) -> str:
         pnl_line = "PnL: ? (mint di luar bot)"
     range_line = ("📊 Full range (v2, selalu aktif)" if ver == 2
                   else f"📊 Range: {esc(range_str(p))}")
+    pool_line = _pool_info_line(cid, p, ver)
     fee_line = ((f"💰 Fee terkumpul ~{ch.fmt_usd(m['earned'])} "
                  f"<i>(fee {p.get('fee', 3000) / 10000:g}% auto-compound — sudah termasuk "
                  f"di nilai posisi, tak perlu diklaim)</i>"
@@ -1694,6 +1729,7 @@ def position_card(cid: int, p: dict) -> str:
         f"<b>{esc(m['meme_sym'])} {_pos_disp(p)}</b> · {in_out} · Age {m['age']}",
         f"CA: <code>{esc(meme_ca)}</code>",
         "",
+        pool_line,
         range_line,
         f"💼 <b>Nilai {ch.fmt_usd(p['value_usd'])}</b>",
         f"· {ch.fmt_amount(p['amount0'])} {esc(p['sym0'])} ({ch.fmt_usd(p['usd0'])} · {pct0:.0f}%)",
