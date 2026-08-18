@@ -424,6 +424,18 @@ rebalance batal *"Hasil close terbaca 0 (RPC lag)"* padahal close-nya sukses.
 Sekarang kedua sisi ditunggu (`_poll_wallet` sadar-native untuk currency v4
 `address(0)`) dan pembacaan delta diulang 8× sebelum menyerah.
 
+### Laporan langkah alur tx
+
+Satu mint/close/rebalance itu 3–5 tx berurutan; dengan `wait_ok` menunggu sampai 180
+detik per tx, totalnya bisa menit-menit. `chain.set_progress(fn)` memasang sink dan
+`_step()` melaporkan tiap tahap dari `wait_ok` (terkirim / disiarkan ulang + detik
+berjalan / beres), jadi otomatis mencakup SEMUA alur tanpa menyentuh tiap fungsi.
+
+Sink itu global — aman karena semua alur tx diserialisasi `TX_LOCK` per proses.
+`_step()` dipanggil dari thread kerja, jadi ia hanya boleh menumpuk teks; di bot,
+`with_progress()` yang mengedit pesan Telegram dari sisi async (ticker 5 detik, 5
+baris terakhir) dan WAJIB melepas sink di `finally`.
+
 ### Serialisasi transaksi & eksekutor tunggal
 
 Masing-masing proses punya lock nonce sendiri (`TX_LOCK`: `asyncio.Lock` di bot.py,

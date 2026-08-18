@@ -792,6 +792,31 @@ def poll_balance(w3: Web3, token: str, addr: str, min_expected: int,
     return bal
 
 
+# ---------- Laporan langkah ke UI ----------
+# Satu alur mint/close/rebalance itu 3–5 tx berurutan yang totalnya bisa memakan
+# menit. Tanpa laporan, UI cuma menampilkan satu pesan diam dan user tidak bisa tahu
+# langkah mana yang menggantung — keluhannya jadi "stuck lama lalu gagal" tanpa
+# petunjuk. Global aman di sini karena SEMUA alur tx diserialisasi TX_LOCK di
+# masing-masing proses (asyncio.Lock di bot.py, threading.Lock di web.py).
+_PROGRESS = None
+
+
+def set_progress(fn) -> None:
+    """Pasang/lepas (fn=None) sink laporan langkah. fn dipanggil dari thread kerja,
+    jadi ia harus murah dan tidak boleh melempar."""
+    global _PROGRESS
+    _PROGRESS = fn
+
+
+def _step(msg: str) -> None:
+    if _PROGRESS is None:
+        return
+    try:
+        _PROGRESS(msg)
+    except Exception:
+        pass
+
+
 def _peer_session() -> requests.Session:
     """Sesi khusus siar ulang: TANPA retry, timeout pendek. `_rpc_session()` memakai
     `Retry(total=6, backoff 0.6→9.6s)` — untuk endpoint mati itu ~40 detik per
@@ -873,8 +898,10 @@ def wait_ok(w3: Web3, txhash: str, what: str, total_wait: int = 180):
     blok chain ini sub-detik dan tx yang belum masuk 20 detik memang bukan sekadar
     "masih antre"."""
     raw = _LAST_RAW.get(txhash)
-    deadline = time.time() + total_wait
+    started = time.time()
+    deadline = started + total_wait
     r = None
+    _step(f"⏳ {what} terkirim, menunggu masuk blok…")
     while True:
         left = deadline - time.time()
         if left <= 0:
@@ -884,6 +911,9 @@ def wait_ok(w3: Web3, txhash: str, what: str, total_wait: int = 180):
             break
         except Exception:
             _rebroadcast(w3, raw)
+            _step(f"↻ {what} belum masuk blok setelah {int(time.time() - started)}s — disiarkan ulang")
+    if r is not None and r.status == 1:
+        _step(f"✅ {what} beres ({int(time.time() - started)}s)")
     if r is None:
         # Menyerah. WAJIB reset pelacak nonce: kalau tidak, tx berikutnya lahir
         # dengan lubang nonce dan ikut mati satu per satu.

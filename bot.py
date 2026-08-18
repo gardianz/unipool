@@ -205,6 +205,34 @@ async def edit(msg, text: str, kb: InlineKeyboardMarkup | None = None):
                                          reply_markup=kb, disable_web_page_preview=True)
 
 
+async def with_progress(status, head: str, work):
+    """Jalankan `work` (fungsi sinkron, di thread) sambil menyiarkan langkahnya.
+
+    Alur mint/close/rebalance itu 3–5 tx berurutan; tanpa ini UI diam berpuluh detik
+    dan user tidak tahu langkah mana yang menggantung. chain._step() dipanggil dari
+    thread kerja, jadi ia cuma menumpuk teks ke list — pengeditan pesan dilakukan
+    ticker di sisi async supaya tidak menyentuh Telegram dari thread lain."""
+    log: list[str] = []
+    ch.set_progress(log.append)
+
+    async def ticker():
+        seen = 0
+        while True:
+            await asyncio.sleep(5)
+            if len(log) == seen:
+                continue
+            seen = len(log)
+            body = "\n".join(f"<i>{esc(x)}</i>" for x in log[-5:])
+            await edit(status, f"{head}\n\n{body}")
+
+    tick = asyncio.create_task(ticker())
+    try:
+        return await asyncio.to_thread(work)
+    finally:
+        tick.cancel()
+        ch.set_progress(None)
+
+
 def range_str(p: dict) -> str:
     # tampil market cap kalau ada (lebih gampang dibaca daripada harga 0.0₆xx)
     if p.get("mc_now"):
@@ -1485,23 +1513,22 @@ async def do_mint(update: Update, ctx_data: dict):
         return
 
     mode_label = "V2 50/50" if ver == 2 else STRAT_LABEL[mode]
-    status = await reply(update, (
-        f"⏳ Minting position ({mode_label}) [v{ver}]...\n"
-        f"<i>{esc(tsym)}/{esc(p['quote_sym'])} fee {p['fee'] / 10000:.2f}% · "
-        f"deposit {ch.fmt_amount(amount)} {esc(dep_sym)} "
-        f"(wrap/swap otomatis kalau perlu)</i>"))
+    head = (f"⏳ Minting position ({mode_label}) [v{ver}]...\n"
+            f"<i>{esc(tsym)}/{esc(p['quote_sym'])} fee {p['fee'] / 10000:.2f}% · "
+            f"deposit {ch.fmt_amount(amount)} {esc(dep_sym)} "
+            f"(wrap/swap otomatis kalau perlu)</i>")
+    status = await reply(update, head)
+
+    def work():
+        if ver == 2:
+            return ch.mint_v2(cid, pk(), p, amount, s["slippage_pct"])
+        if ver == 4:
+            return ch.mint_v4(cid, pk(), p, amount, strategy, s["slippage_pct"])
+        return ch.mint_position(cid, pk(), p, amount, strategy, s["slippage_pct"])
 
     async with TX_LOCK:
         try:
-            if ver == 2:
-                r = await asyncio.to_thread(
-                    ch.mint_v2, cid, pk(), p, amount, s["slippage_pct"])
-            elif ver == 4:
-                r = await asyncio.to_thread(
-                    ch.mint_v4, cid, pk(), p, amount, strategy, s["slippage_pct"])
-            else:
-                r = await asyncio.to_thread(
-                    ch.mint_position, cid, pk(), p, amount, strategy, s["slippage_pct"])
+            r = await with_progress(status, head, work)
         except Exception as e:
             await edit(status, f"❌ Mint gagal: {esc(e)}")
             return
@@ -1926,9 +1953,10 @@ async def do_add_exec(update: Update, pid: str, val: float, is_pct: bool):
             budget = (bal * val / 100) / 10 ** qdec
         return ch.add_any(cid, pk(), pid, budget, s["slippage_pct"]), pre_fee
 
+    head = f"⏳ Menambah dana ke {disp_pid(pid)}..."
     async with TX_LOCK:
         try:
-            r, pre_fee = await asyncio.to_thread(work)
+            r, pre_fee = await with_progress(status, head, work)
         except Exception as e:
             await edit(status, f"❌ Add gagal: {esc(e)}")
             return
@@ -2006,10 +2034,12 @@ async def do_reduce_exec(update: Update, pid: str, pct: int):
         return next((p for p in list_positions_all(cid) if p["pid"] == str(pid)), None)
 
     pos = await asyncio.to_thread(snapshot)
-    status = await reply(update, f"⏳ Menarik {pct}% dari {disp_pid(pid)}...")
+    head = f"⏳ Menarik {pct}% dari {disp_pid(pid)}..."
+    status = await reply(update, head)
     async with TX_LOCK:
         try:
-            r = await asyncio.to_thread(ch.reduce_any, cid, pk(), pid, pct, s["slippage_pct"])
+            r = await with_progress(status, head,
+                                    lambda: ch.reduce_any(cid, pk(), pid, pct, s["slippage_pct"]))
         except Exception as e:
             await edit(status, f"❌ Reduce gagal: {esc(e)}")
             return
@@ -2100,11 +2130,12 @@ async def do_rebalance(update: Update, pid: str, mode: str):
         return next((p for p in list_positions_all(cid) if p["pid"] == str(pid)), None)
 
     pos = await asyncio.to_thread(snapshot)
-    status = await reply(update, f"⏳ Rebalance {disp_pid(pid)} → {mode}... (close → swap → mint)")
+    head = f"⏳ Rebalance {disp_pid(pid)} → {mode}... (close → swap → mint)"
+    status = await reply(update, head)
     async with TX_LOCK:
         try:
-            r = await asyncio.to_thread(ch.rebalance_position, cid, pk(), pid, mode,
-                                        s["slippage_pct"], int(s.get("gap", 1)))
+            r = await with_progress(status, head, lambda: ch.rebalance_position(
+                cid, pk(), pid, mode, s["slippage_pct"], int(s.get("gap", 1))))
         except Exception as e:
             await edit(status, f"❌ Rebalance gagal: {esc(e)}\n"
                                f"<i>Kalau close sudah jalan, dananya aman di wallet — "
@@ -2196,10 +2227,12 @@ async def do_close(update: Update, pid: str, autoswap: bool):
     pos = await asyncio.to_thread(find_pos)
     usd = (pos["value_usd"] + pos["unclaimed_usd"]) if pos else 0.0
     ver, ref = ch.parse_pid(pid)
-    status = await reply(update, f"⏳ Closing {disp_pid(pid)} (v{ver})...")
+    head = f"⏳ Closing {disp_pid(pid)} (v{ver})..."
+    status = await reply(update, head)
     async with TX_LOCK:
         try:
-            r = await asyncio.to_thread(ch.close_any, cid, pk(), pid, s["slippage_pct"], autoswap)
+            r = await with_progress(status, head, lambda: ch.close_any(
+                cid, pk(), pid, s["slippage_pct"], autoswap))
         except Exception as e:
             await edit(status, f"❌ Close gagal: {esc(e)}")
             return
