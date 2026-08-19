@@ -2865,7 +2865,12 @@ def main():
     if not os.environ.get("PRIVATE_KEY", "").strip():
         sys.exit("❌ PRIVATE_KEY belum diset (.env).")
 
-    app = Application.builder().token(token).post_init(post_init).build()
+    # Timeout HTTP Telegram dinaikkan dari default (5 detik): VPS ini berkali-kali
+    # kena ReadTimeout ke api.telegram.org, dan long polling memang menahan koneksi.
+    app = (Application.builder().token(token)
+           .connect_timeout(20).read_timeout(40).write_timeout(40).pool_timeout(20)
+           .get_updates_connect_timeout(20).get_updates_read_timeout(40)
+           .post_init(post_init).build())
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("settings", cmd_settings))
@@ -2880,7 +2885,10 @@ def main():
     app.add_error_handler(on_error)
     log.info("LP bot jalan. Wallet: %s",
              ", ".join(f"W{i + 1} {_addr_of(k)}" for i, k in enumerate(all_pks())))
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    # bootstrap_retries=-1: coba selamanya. Default 0 berarti SATU kegagalan jaringan
+    # saat start (get_me timeout) langsung mematikan proses — "Failed run number 0 of
+    # 0. Aborting." — dan bot tidak pernah hidup sampai dijalankan manual lagi.
+    app.run_polling(allowed_updates=Update.ALL_TYPES, bootstrap_retries=-1)
 
 
 if __name__ == "__main__":
