@@ -153,6 +153,19 @@ pengambilannya harus ikut:
   kurang persis sebesar gas itu (terukur: "punya 0.130946, butuh 0.130789 + gas").
   Sisa kekurangan selalu dihitung ulang dari saldo NYATA, bukan dikurangi angka rencana.
 
+### 'STF' pada swap = jumlah melebihi saldo, bukan pool bermasalah
+
+`TransferHelper.safeTransferFrom` di router v3 balas `'STF'` — revert yang tidak
+menyebut token, jumlah, maupun sebabnya. Terbukti di BSC dengan allowance MAX:
+swap sebesar saldo LOLOS simulasi, swap 10× saldo memberi `execution reverted: STF`
+yang persis sama. Jadi jangan cari-cari masalah di pool.
+
+`swap_to_token()` karena itu memangkas `amount_in_wei` ke saldo NYATA (dan menurunkan
+`min_out` proporsional — kalau tidak, swap revert karena minOut kekinggian), lalu
+kalau tetap STF ia menyetel ulang approval sekali dan menyimulasikan lagi. Selisih
+tipis lazim: jumlahnya dihitung dari saldo yang dibaca sepersekian detik lebih awal,
+atau tokennya fee-on-transfer.
+
 ### Auto-swap saat close cuma menjual HASIL close
 
 `close_position`/`close_v4`/`reduce_v2` memotret saldo kedua sisi sebelum eksekusi,

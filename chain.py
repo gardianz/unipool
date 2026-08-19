@@ -3649,20 +3649,46 @@ def swap_to_token(chain_id: int, pk: str, token_in: str, token_out: str, fee: in
     sym_in = token_info(w3, token_in)["symbol"]
     dec_in = token_info(w3, token_in)["decimals"]
     bal_in = poll_balance(w3, token_in, account.address, amount_in_wei, tries=6)
-    if bal_in < amount_in_wei:
+    if bal_in <= 0 or bal_in < int(amount_in_wei * 0.99):
         raise RuntimeError(
             f"Saldo {sym_in} kurang untuk swap: punya {bal_in / 10 ** dec_in:.8f}, "
             f"butuh {amount_in_wei / 10 ** dec_in:.8f}")
+    # Selisih tipis (jumlah dihitung dari saldo yang dibaca sepersekian detik lebih
+    # awal, atau token fee-on-transfer) TIDAK boleh menggagalkan swap: router balas
+    # 'STF' — safeTransferFrom gagal — tanpa menyebut token maupun jumlahnya. Jual
+    # sebanyak yang BENAR-BENAR ada.
+    if bal_in < amount_in_wei:
+        out_est *= bal_in / amount_in_wei      # minOut ikut turun, kalau tidak swap revert
+        amount_in_wei = bal_in
+        min_out = int(out_est * (100 - slippage_pct) / 100)
 
     ensure_approval(w3, pk, token_in, cfg["router"], amount_in_wei)
     router = w3.eth.contract(address=Web3.to_checksum_address(cfg["router"]), abi=ROUTER_ABI)
-    params = (token_in, token_out, fee, account.address, amount_in_wei, min_out, 0)
-    tx = {"to": cfg["router"], "data": calldata(router.functions.exactInputSingle(params))}
     sym_out = token_info(w3, token_out)["symbol"]
+
+    def _build():
+        params = (token_in, token_out, fee, account.address, amount_in_wei, min_out, 0)
+        return {"to": cfg["router"], "data": calldata(router.functions.exactInputSingle(params))}
+
+    tx = _build()
     try:
         _preflight(w3, account.address, tx)
     except Exception as e:
-        raise RuntimeError(f"Swap {sym_in}→{sym_out} (fee {fee}) ditolak pool: {e}")
+        # 'STF' = TransferHelper.safeTransferFrom gagal: router tidak bisa menarik
+        # token. Dengan saldo sudah dipastikan cukup di atas, sisanya soal allowance
+        # — bisa terbaca basi dari replika RPC, atau habis dipakai swap sebelumnya.
+        # Setel ulang sekali lalu simulasikan lagi sebelum menyerah.
+        if "STF" in str(e) or "TRANSFER_FROM_FAILED" in str(e):
+            c = erc20(w3, token_in)
+            h_ap = send_tx(w3, pk, {"to": token_in,
+                                    "data": calldata(c.functions.approve(cfg["router"], MAX_UINT256))})
+            wait_ok(w3, h_ap, "approve ulang")
+            try:
+                _preflight(w3, account.address, tx)
+            except Exception as e2:
+                raise RuntimeError(f"Swap {sym_in}→{sym_out} (fee {fee}) ditolak pool: {e2}")
+        else:
+            raise RuntimeError(f"Swap {sym_in}→{sym_out} (fee {fee}) ditolak pool: {e}")
     h = send_tx(w3, pk, tx)
     wait_ok(w3, h, "swap")
     return h
