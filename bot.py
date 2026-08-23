@@ -188,13 +188,34 @@ def wallet_address() -> str:
     return _addr_of(pk())
 
 
+TG_MAX_CHARS = 4096          # batas keras Telegram untuk satu pesan
+
+
+def _fit(text: str) -> str:
+    """Potong ke batas Telegram.
+
+    Pesan >4096 karakter ditolak dengan BadRequest "Message is too long" — dan di
+    PTB `BadRequest` itu TURUNAN `NetworkError`, jadi on_error dulu menganggapnya
+    gangguan jaringan lalu menelannya diam-diam. Akibatnya operasi yang sebenarnya
+    SUDAH SELESAI tidak pernah menampilkan hasil, dan bot kelihatan menggantung di
+    pesan "Closing…" selamanya. Tag HTML yang terbelah ikut dibuang supaya potongan
+    tetap bisa di-parse."""
+    if len(text) <= TG_MAX_CHARS:
+        return text
+    cut = text[:TG_MAX_CHARS - 48]
+    if cut.rfind("<") > cut.rfind(">"):      # jangan tinggalkan tag setengah jadi
+        cut = cut[:cut.rfind("<")]
+    return cut.rstrip() + "\n… <i>(dipotong — terlalu panjang)</i>"
+
+
 async def reply(update: Update, text: str, kb: InlineKeyboardMarkup | None = None):
     return await update.effective_chat.send_message(
-        text, parse_mode=ParseMode.HTML, reply_markup=kb, disable_web_page_preview=True)
+        _fit(text), parse_mode=ParseMode.HTML, reply_markup=kb, disable_web_page_preview=True)
 
 
 async def edit(msg, text: str, kb: InlineKeyboardMarkup | None = None):
     """Edit pesan status in-place; fallback kirim baru kalau gagal."""
+    text = _fit(text)
     try:
         await msg.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb,
                             disable_web_page_preview=True)
@@ -2841,7 +2862,21 @@ async def post_init(app):
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
-    from telegram.error import NetworkError
+    from telegram.error import BadRequest, NetworkError
+    # BadRequest HARUS dicek duluan: di PTB ia turunan NetworkError, jadi cabang di
+    # bawah akan menelannya sebagai "gangguan jaringan, retry otomatis" padahal
+    # Telegram menolak pesannya secara permanen dan tidak ada retry yang menolong.
+    if isinstance(context.error, BadRequest):
+        log.error("Telegram menolak pesan: %s", context.error)
+        if isinstance(update, Update) and update.effective_chat:
+            try:
+                await update.effective_chat.send_message(
+                    f"⚠️ Telegram menolak pesan hasil: {esc(str(context.error)[:200])}\n"
+                    f"<i>Aksinya sendiri kemungkinan sudah jalan — cek /list.</i>",
+                    parse_mode=ParseMode.HTML)
+            except Exception:
+                pass
+        return
     if isinstance(context.error, NetworkError):
         # 502/timeout dari server Telegram — PTB retry sendiri, cukup 1 baris warning
         log.warning("Jaringan Telegram: %s (retry otomatis)", context.error)
