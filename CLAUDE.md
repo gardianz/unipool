@@ -227,6 +227,34 @@ Semua angkanya **tampilan saja**, jangan dipakai membangun transaksi.
 jatuh ke default 60 — presisi kisi yang ditampilkan jadi salah (terukur: kisi asli
 5,99% dilaporkan 0,60%).
 
+### Posisi v3 yang sudah di-decrease tapi belum di-collect
+
+Uniswap v3 memindahkan **pokok** ke `tokensOwed` saat `decreaseLiquidity` — field
+yang SAMA dengan fee. Kalau `collect` gagal/tidak jalan, posisi tertinggal dengan
+`liquidity == 0` dan `tokensOwed > 0`, dan angka "unclaimed" itu **pokok + fee**,
+bukan fee saja.
+
+`_position_detail` menandainya `pending_claim`. UI wajib memakainya: kartu lama
+menulis "Nilai $0,00 / Fee unclaimed $472,32" dan user mengira modalnya lenyap
+(kejadian nyata #757291 — $472 aman di dalam posisi selama berjam-jam). Kartu
+konfirmasi close juga menyebut `value_usd + unclaimed_usd`, bukan `value_usd` saja.
+
+`close_position` sudah benar: `if liq > 0` melewati decrease dan langsung collect.
+Uniswap UI **menyembunyikan** posisi seperti ini (likuiditasnya nol), jadi jangan
+menyarankan user mengambilnya dari sana.
+
+### NFT posisi kosong menumpuk
+
+Close tidak mem-burn NFT-nya. Terukur di satu wallet: **108 NFT v3 untuk 1 posisi
+hidup**, dan tiap refresh daftar membayar satu `positions()` per NFT (10,5 detik
+sekali pindai penuh). `_is_active()` sudah menyaringnya dari tampilan; yang tersisa
+ongkos enumerasinya.
+
+`/cleanup` → `burn_empty()` membakarnya lewat `multicall`, 25 per tx (terukur 2,12
+juta gas ≈ 0,000045 ETH). AMAN tanpa syarat: `burn` di NPM me-require liquidity DAN
+tokensOwed dua-duanya nol — posisi berisi ditolak kontraknya sendiri dengan
+`execution reverted: Not cleared` (sudah diuji terhadap posisi hidup).
+
 ### Registry posisi (kenapa `history.json` penting)
 
 Posisi v3 bisa dienumerasi on-chain (ERC721Enumerable), tapi **PositionManager v4 tidak

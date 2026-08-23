@@ -301,6 +301,16 @@ POOL_ABI = [
 ]
 
 NPM_ABI = [
+    # burn + multicall dipakai membersihkan NFT posisi kosong (lihat burn_empty()).
+    # burn hanya lolos kalau liquidity DAN tokensOwed dua-duanya 0 — kontraknya
+    # sendiri yang menjaga, jadi tidak mungkin membakar posisi yang masih berisi.
+    {"inputs": [{"name": "tokenId", "type": "uint256"}], "name": "burn",
+     "outputs": [], "stateMutability": "payable", "type": "function"},
+    {"inputs": [{"name": "data", "type": "bytes[]"}], "name": "multicall",
+     "outputs": [{"name": "results", "type": "bytes[]"}],
+     "stateMutability": "payable", "type": "function"},
+    {"inputs": [{"name": "tokenId", "type": "uint256"}], "name": "ownerOf",
+     "outputs": [{"name": "", "type": "address"}], "stateMutability": "view", "type": "function"},
     {"inputs": [{"components": [
         {"name": "token0", "type": "address"}, {"name": "token1", "type": "address"},
         {"name": "fee", "type": "uint24"}, {"name": "tickLower", "type": "int24"}, {"name": "tickUpper", "type": "int24"},
@@ -3124,6 +3134,57 @@ def list_positions(chain_id: int, pk: str, max_positions: int = 40,
     return [r for r in results if r]
 
 
+def empty_position_ids(chain_id: int, pk: str, dex: str | None = None) -> list[int]:
+    """tokenId NFT v3 yang benar-benar kosong: liquidity 0 DAN tokensOwed 0.
+
+    Close tidak mem-burn NFT, jadi sisanya menumpuk dan setiap refresh daftar posisi
+    membayar satu `positions()` per NFT — terukur 127 NFT untuk 1 posisi hidup."""
+    w3 = get_w3(chain_id)
+    account = w3.eth.account.from_key(pk)
+    npm = w3.eth.contract(address=Web3.to_checksum_address(dex_cfg(chain_id, dex)["npm"]), abi=NPM_ABI)
+    n = npm.functions.balanceOf(account.address).call()
+    out = []
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        tids = list(ex.map(
+            lambda i: npm.functions.tokenOfOwnerByIndex(account.address, i).call(), range(n)))
+        raws = list(ex.map(lambda t: npm.functions.positions(t).call(), tids))
+    for tid, p in zip(tids, raws):
+        if p[7] == 0 and p[10] == 0 and p[11] == 0:
+            out.append(int(tid))
+    return out
+
+
+def burn_empty(chain_id: int, pk: str, dex: str | None = None,
+               batch: int = 25, max_batches: int = 8) -> dict:
+    """Burn NFT posisi kosong lewat `multicall`, batch per batch.
+
+    AMAN: `burn` di NPM me-require liquidity == 0 DAN tokensOwed0/1 == 0, jadi
+    posisi yang masih berisi (termasuk yang sudah decrease tapi belum collect)
+    ditolak kontraknya sendiri. Daftarnya tetap disaring ulang di sini supaya satu
+    NFT berisi tidak membatalkan seluruh batch.
+
+    Dibatasi `max_batches` supaya satu perintah tidak berubah jadi puluhan menit tx.
+    """
+    w3 = get_w3(chain_id)
+    npm_addr = Web3.to_checksum_address(dex_cfg(chain_id, dex)["npm"])
+    npm = w3.eth.contract(address=npm_addr, abi=NPM_ABI)
+    ids = empty_position_ids(chain_id, pk, dex)
+    steps, burned = [], 0
+    for bi in range(min(max_batches, (len(ids) + batch - 1) // batch)):
+        chunk = ids[bi * batch:(bi + 1) * batch]
+        if not chunk:
+            break
+        calls = [npm.encode_abi("burn", args=[t]) for t in chunk]
+        tx = {"to": npm_addr, "data": calldata(npm.functions.multicall(calls))}
+        _step(f"🔥 burn {len(chunk)} NFT kosong (batch {bi + 1})")
+        _preflight(w3, w3.eth.account.from_key(pk).address, tx)
+        h = send_tx(w3, pk, tx)
+        wait_ok(w3, h, f"burn {len(chunk)} NFT")
+        steps.append(("burn", h))
+        burned += len(chunk)
+    return {"steps": steps, "burned": burned, "sisa": max(0, len(ids) - burned), "total": len(ids)}
+
+
 def pool_addr_of(factory, t0: str, t1: str, fee: int, _cache={}) -> str:
     """factory.getPool — pemetaan immutable, aman di-cache selamanya.
     Menghemat 1 panggilan RPC per posisi tiap kali daftar posisi disegarkan."""
@@ -3271,6 +3332,12 @@ def _position_detail(w3: Web3, chain_id: int, npm, factory, account, tid: int, p
             "liquidity": liq, "amount0": a0_raw / 10 ** i0["decimals"], "amount1": a1_raw / 10 ** i1["decimals"],
             "fees0": f0 / 10 ** i0["decimals"], "fees1": f1 / 10 ** i1["decimals"],
             "in_range": tick_lo <= cur_tick < tick_hi,
+            # liq==0 tapi tokensOwed>0 = decreaseLiquidity SUDAH jalan, collect BELUM.
+            # Uniswap v3 memindahkan POKOK ke tokensOwed — field yang sama dengan fee —
+            # jadi angka "unclaimed" di keadaan ini pokok + fee, bukan fee saja. Tanpa
+            # penanda ini kartu menulis "Nilai $0.00 / Fee unclaimed $472" dan user
+            # mengira dananya hilang (kejadian nyata di #757291).
+            "pending_claim": liq == 0 and (f0 > 0 or f1 > 0),
             "value_usd": usd, "unclaimed_usd": unclaimed_usd,
             "usd0": usd0, "usd1": usd1, "fees_usd0": fees_usd0, "fees_usd1": fees_usd1,
             "quote_sym": qsym, "quote_is_token1": q_is_t1,

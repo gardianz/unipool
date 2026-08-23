@@ -1770,7 +1770,14 @@ def position_card(cid: int, p: dict) -> str:
                  f"di nilai posisi, tak perlu diklaim)</i>"
                  if m.get("earned") else
                  f"💰 Fee {p.get('fee', 3000) / 10000:g}% auto-compound ke posisi (v2)") if ver == 2 else
-                f"💰 <b>Fee unclaimed {ch.fmt_usd(p['unclaimed_usd'])}</b>\n"
+                # liq==0 + tokensOwed>0: decrease sudah jalan, collect belum. Angka itu
+                # POKOK + fee, bukan fee saja — menyebutnya "fee" bikin user mengira
+                # modalnya hilang karena "Nilai" di atasnya $0,00.
+                (f"📦 <b>Menunggu diklaim {ch.fmt_usd(p['unclaimed_usd'])}</b> "
+                 f"<i>(pokok + fee — posisi sudah ditarik, tinggal Fee/Close untuk "
+                 f"memindahkannya ke wallet)</i>\n"
+                 if p.get("pending_claim") else
+                 f"💰 <b>Fee unclaimed {ch.fmt_usd(p['unclaimed_usd'])}</b>\n") +
                 f"· {ch.fmt_amount(p['fees0'])} {esc(p['sym0'])} ({ch.fmt_usd(p['fees_usd0'])}) + "
                 f"{ch.fmt_amount(p['fees1'])} {esc(p['sym1'])} ({ch.fmt_usd(p['fees_usd1'])})")
     L = [
@@ -2222,9 +2229,12 @@ async def ask_close(update: Update, pid: str):
         swap_note = f"<i>Opsi swap menjual {esc(meme_sym)} hasil penarikan via router v2.</i>"
         detail = "Full exit LP (removeLiquidity 100%, fee sudah auto-compound)."
     else:
-        swap_note = (f"<i>Opsi swap menjual SELURUH saldo {esc(meme_sym)} di wallet "
-                     f"(termasuk sisa dari close/mint sebelumnya), bukan cuma hasil posisi ini.</i>")
-        detail = "Full exit LP (decrease + collect)."
+        # close_position memotret saldo sebelum eksekusi dan hanya menjual SELISIHNYA —
+        # saldo lama user tidak disentuh. Teks lama menyatakan sebaliknya.
+        swap_note = (f"<i>Opsi swap menjual hasil {esc(meme_sym)} dari posisi ini saja; "
+                     f"saldo {esc(meme_sym)} yang sudah ada di wallet tidak disentuh.</i>")
+        detail = ("Posisi SUDAH ditarik, tinggal dipindahkan ke wallet (collect)."
+                  if p.get("pending_claim") else "Full exit LP (decrease + collect).")
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton(f"✅ Close + swap {meme_sym} → {wsym if ver != 4 else 'quote'}",
                               callback_data=f"closeok|{pid}|1")],
@@ -2234,7 +2244,12 @@ async def ask_close(update: Update, pid: str):
     await reply(update, (
         f"⚠️ <b>Close position?</b>\n\n"
         f"{_pos_disp(p)} {esc(p['sym1'])}/{esc(p['sym0'])}\n"
-        f"Val ~{ch.fmt_usd(p['value_usd'])} · {status}\n\n"
+        # yang keluar ke wallet = nilai posisi DITAMBAH yang belum diklaim. Menampilkan
+        # value_usd saja bikin posisi pending-claim tertulis "Val ~$0.00" padahal ada
+        # ratusan dolar menunggu (kejadian nyata #757291).
+        f"Keluar ke wallet ~{ch.fmt_usd(p['value_usd'] + p['unclaimed_usd'])} · {status}\n"
+        f"<i>posisi {ch.fmt_usd(p['value_usd'])} + belum diklaim "
+        f"{ch.fmt_usd(p['unclaimed_usd'])}</i>\n\n"
         f"{detail}\n{swap_note}"), kb)
 
 
@@ -2307,6 +2322,10 @@ async def on_callback(update: Update, _):
         return
     if data == "refresh":
         await cmd_list(update, None, status_msg=q.message)
+        return
+    if data == "cleanupok":
+        await q.edit_message_reply_markup(None)
+        await do_cleanup(update)
         return
     if data == "noop":
         return
@@ -2861,6 +2880,52 @@ async def post_init(app):
     app.create_task(monitor_loop(app))
 
 
+async def cmd_cleanup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Burn NFT posisi v3 yang benar-benar kosong.
+
+    Close tidak mem-burn NFT-nya, jadi sisanya menumpuk dan setiap refresh daftar
+    posisi membayar satu `positions()` per NFT (terukur 127 NFT untuk 1 posisi hidup).
+    Aman: `burn` di NPM me-require liquidity DAN tokensOwed dua-duanya 0 — posisi
+    yang masih berisi ditolak kontraknya sendiri ("Not cleared")."""
+    if not authorized(update):
+        return
+    cid = store.load_settings()["chain"]
+    status = await reply(update, "🔎 Menghitung NFT posisi kosong…")
+    try:
+        ids = await asyncio.to_thread(ch.empty_position_ids, cid, pk())
+    except Exception as e:
+        await edit(status, f"❌ Gagal membaca: {esc(e)}")
+        return
+    if not ids:
+        await edit(status, "✅ Tidak ada NFT kosong — sudah bersih.", NAV_KB)
+        return
+    await edit(status, (
+        f"🧹 <b>{len(ids)} NFT posisi kosong</b> ditemukan (likuiditas 0, fee 0).\n"
+        f"<i>Membakarnya mempercepat semua refresh daftar posisi. Posisi yang masih "
+        f"berisi tidak bisa ikut terbakar — kontraknya menolak.</i>"),
+        InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"🔥 Burn {min(len(ids), 200)} NFT", callback_data="cleanupok")],
+            [InlineKeyboardButton("❌ Cancel", callback_data="cancel")]]))
+
+
+async def do_cleanup(update: Update):
+    cid = store.load_settings()["chain"]
+    head = "🔥 Membakar NFT kosong…"
+    status = await reply(update, head)
+    async with TX_LOCK:
+        try:
+            r = await with_progress(status, head, lambda: ch.burn_empty(cid, pk()))
+        except Exception as e:
+            await edit(status, f"❌ Cleanup gagal: {esc(e)}")
+            return
+    lines = [f"✅ <b>{r['burned']} NFT kosong dibakar</b> (dari {r['total']})"]
+    if r["sisa"]:
+        lines.append(f"<i>Sisa {r['sisa']} — jalankan /cleanup lagi.</i>")
+    for label, h in r["steps"]:
+        lines.append(f"{label}: {ch.tx_link(cid, h)}")
+    await edit(status, "\n".join(lines), NAV_KB)
+
+
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     from telegram.error import BadRequest, NetworkError
     # BadRequest HARUS dicek duluan: di PTB ia turunan NetworkError, jadi cabang di
@@ -2915,6 +2980,7 @@ def main():
     app.add_handler(CommandHandler("wallets", cmd_wallets))
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("orders", cmd_orders))
+    app.add_handler(CommandHandler("cleanup", cmd_cleanup))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_address))
     app.add_error_handler(on_error)
