@@ -5,11 +5,12 @@ DEX per chain: Uniswap v2/v3/v4 di Robinhood (4663), PancakeSwap v2/v3 di BSC (5
 """
 import math
 import os
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import requests
 from eth_abi import encode as abi_encode
@@ -1487,24 +1488,81 @@ def krystal_last_error() -> str:
 # datacenter ketiganya menolak python-requests — dan penolakannya BUKAN exception,
 # melainkan halaman HTML, sehingga pemanggilnya cuma melihat "hasil kosong" lalu
 # diam-diam jatuh ke jalur lambat. Semua request ke sana harus lewat helper ini.
-def _cf_get(url: str, **kw):
-    """GET tahan Cloudflare: curl_cffi (impersonate Chrome) dulu, requests cadangan."""
-    if _cffi_requests is not None:
+def _proxy_list(_cache=[]) -> list[str]:
+    """Proxy dari env `PROXY_LIST` — `ip:port:user:pass` atau URL penuh, dipisah
+    koma/baris/spasi. Kredensialnya tinggal di `.env`, JANGAN pernah masuk repo.
+
+    Dipakai HANYA untuk API data pasar (Krystal / indexer Uniswap / dexscreener /
+    GeckoTerminal), TIDAK untuk RPC. Angka dari API itu memang sudah diperlakukan
+    sebagai tampilan belaka dan tiap pool tetap diverifikasi on-chain, jadi operator
+    proxy tidak bisa mengarahkan transaksi. Menyalurkan RPC lewat pihak ketiga akan
+    membuang jaminan itu."""
+    if _cache:
+        return _cache[0]
+    out = []
+    for tok in re.split(r"[,\s]+", os.environ.get("PROXY_LIST", "").strip()):
+        if not tok:
+            continue
+        if "://" in tok:
+            out.append(tok)
+            continue
+        parts = tok.split(":")
+        if len(parts) == 4:
+            ip, port, user, pw = parts
+            out.append(f"http://{quote(user, safe='')}:{quote(pw, safe='')}@{ip}:{port}")
+        elif len(parts) == 2:
+            out.append(f"http://{tok}")
+    _cache.append(out)
+    return out
+
+
+_PROXY_GOOD = [0]      # indeks proxy yang terakhir berhasil — dicoba duluan
+
+
+def _cf_request(method: str, url: str, **kw):
+    """Request ke sumber data luar, tahan Cloudflare DAN blokir IP.
+
+    Urutannya: langsung dulu (host sehat tidak membayar apa pun), lalu proxy satu
+    per satu kalau jawabannya 4xx/5xx atau error. Cloudflare menolak dengan 403 +
+    halaman HTML, bukan exception, jadi status code ikut diperiksa."""
+    def _try(proxies):
+        if _cffi_requests is not None:
+            try:
+                fn = getattr(_cffi_requests, method)
+                return fn(url, impersonate="chrome", proxies=proxies, **kw)
+            except Exception:
+                pass
+        return getattr(requests, method)(url, proxies=proxies, **kw)
+
+    last = None
+    try:
+        last = _try(None)
+        if last.status_code < 400:
+            return last
+    except Exception:
+        pass
+    proxies = _proxy_list()
+    for i in range(len(proxies)):
+        p = proxies[(_PROXY_GOOD[0] + i) % len(proxies)]
         try:
-            return _cffi_requests.get(url, impersonate="chrome", **kw)
+            r = _try({"http": p, "https": p})
+            if r.status_code < 400:
+                _PROXY_GOOD[0] = (_PROXY_GOOD[0] + i) % len(proxies)
+                return r
+            last = r
         except Exception:
-            pass
-    return requests.get(url, **kw)
+            continue
+    if last is None:
+        raise RuntimeError("semua jalur (langsung + proxy) gagal")
+    return last
+
+
+def _cf_get(url: str, **kw):
+    return _cf_request("get", url, **kw)
 
 
 def _cf_post(url: str, **kw):
-    """POST tahan Cloudflare — lihat _cf_get."""
-    if _cffi_requests is not None:
-        try:
-            return _cffi_requests.post(url, impersonate="chrome", **kw)
-        except Exception:
-            pass
-    return requests.post(url, **kw)
+    return _cf_request("post", url, **kw)
 
 
 def _krystal_get(params: dict, timeout: int = 15):

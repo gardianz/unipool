@@ -428,6 +428,23 @@ Kalau Krystal tidak kenal tokennya, `token_chains_onchain()` mengecek `eth_getCo
 per chain sebagai petunjuk terakhir. Itu satu request per chain, jadi HANYA dipakai
 di jalur "tidak ada pool", tidak pernah di jalur normal.
 
+### `PROXY_LIST`: proxy untuk API data pasar, JANGAN untuk RPC
+
+`_cf_request()` mencoba jalur langsung dulu, lalu proxy dari env `PROXY_LIST`
+(`ip:port:user:pass` atau URL penuh) kalau jawabannya 4xx/5xx — Cloudflare menolak
+dengan **403 + HTML**, bukan exception, jadi status code ikut diperiksa. Proxy yang
+berhasil diingat (`_PROXY_GOOD`) supaya percobaan berikutnya mulai dari situ.
+
+Batas yang disengaja: proxy **hanya** untuk Krystal / indexer Uniswap / dexscreener
+/ GeckoTerminal. Angka dari sumber-sumber itu memang sudah diperlakukan sebagai
+tampilan belaka dan tiap pool tetap diverifikasi on-chain, jadi operator proxy tidak
+bisa mengarahkan transaksi. Menyalurkan RPC lewat pihak ketiga akan membuang jaminan
+itu — jangan dilakukan.
+
+Terukur dengan proxy datacenter: indexer Uniswap **pulih** (0 → 94 entri saat jalur
+langsung diblokir), Krystal **tetap 403** — Cloudflare mereka menolak IP datacenter
+apa pun, proxy maupun bukan. Jadi proxy menolong indexer, bukan Krystal.
+
 ### GeckoTerminal: satu-satunya sumber yang lolos dari host terblokir
 
 Urutan sumber daftar pool: **Krystal → GeckoTerminal → discovery sendiri**.
