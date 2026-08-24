@@ -1,0 +1,10 @@
+# Satu proxy per baris. Baris kosong & yang diawali '#' dilewati.
+# Format: ip:port:user:pass   ATAU   http://user:pass@ip:port
+#
+# Dipakai HANYA untuk API data pasar (Krystal / indexer Uniswap / dexscreener /
+# GeckoTerminal), TIDAK untuk RPC. Jalur langsung dicoba dulu; proxy cuma dipakai
+# kalau jawabannya 4xx/5xx (Cloudflare menolak dengan 403 + halaman HTML).
+#
+# Salin file ini jadi `proxies.txt` (sudah masuk .gitignore) lalu isi punyamu.
+1.2.3.4:8000:user:pass
+5.6.7.8:8000:user:pass

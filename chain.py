@@ -10,6 +10,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
+from pathlib import Path
 from urllib.parse import quote, urlparse
 
 import requests
@@ -1499,8 +1500,19 @@ def _proxy_list(_cache=[]) -> list[str]:
     membuang jaminan itu."""
     if _cache:
         return _cache[0]
+    # File lebih enak dikelola daripada satu baris env panjang: satu proxy per baris,
+    # baris kosong dan yang diawali '#' dilewati. Default `proxies.txt` di samping
+    # chain.py — WAJIB ada di .gitignore, isinya kredensial.
+    raw = os.environ.get("PROXY_LIST", "")
+    pf = os.environ.get("PROXY_FILE", "").strip() or str(Path(__file__).parent / "proxies.txt")
+    try:
+        with open(pf) as fh:
+            raw += "\n" + "\n".join(
+                ln.split("#", 1)[0].strip() for ln in fh if ln.strip() and not ln.lstrip().startswith("#"))
+    except OSError:
+        pass
     out = []
-    for tok in re.split(r"[,\s]+", os.environ.get("PROXY_LIST", "").strip()):
+    for tok in re.split(r"[,\s]+", raw.strip()):
         if not tok:
             continue
         if "://" in tok:
@@ -2178,14 +2190,20 @@ def discover_any(chain_id: int, token_addr: str) -> dict:
         # di daftar mereka padahal itu pool terbesarnya). Jadi pencari pair aneh TETAP
         # dijalankan dan hasilnya digabung — persis aturan "pair aneh pakai discovery
         # sendiri". Angka pool yang Krystal punya tetap dari Krystal.
-        try:
-            seen = {str(p["pool"]).lower() for p in res["pools"]}
-            extra = [p for p in discover_foreign_pools(get_w3(chain_id), chain_id,
-                                                       token_addr, seen)
-                     if (p.get("tvl_usd") or 0) > 0]
-            res["pools"] += extra
-        except Exception:
-            pass
+        # HANYA untuk jalur Krystal. Daftar mereka disaring per-quote sehingga pool
+        # ber-quote aneh bisa hilang (RUBY/RDDT $40k tidak ada di sana padahal itu
+        # pool terbesarnya). GeckoTerminal memuat SEMUA pool yang mengandung token
+        # itu apa pun quote-nya, jadi di jalur gecko pencarian ini murni beban:
+        # terukur 32,7 detik untuk 0 pool tambahan — hampir seluruh waktu discovery.
+        if src_name == "krystal":
+            try:
+                seen = {str(p["pool"]).lower() for p in res["pools"]}
+                extra = [p for p in discover_foreign_pools(get_w3(chain_id), chain_id,
+                                                           token_addr, seen)
+                         if (p.get("tvl_usd") or 0) > 0]
+                res["pools"] += extra
+            except Exception:
+                pass
         res["pools"].sort(key=lambda p: p.get("tvl_usd") or 0, reverse=True)
         res["dropped_dead"], res["dropped_offprice"] = [], []
         res["hook_pools"] = count_hook_pools(chain_id, token_addr)

@@ -430,8 +430,9 @@ di jalur "tidak ada pool", tidak pernah di jalur normal.
 
 ### `PROXY_LIST`: proxy untuk API data pasar, JANGAN untuk RPC
 
-`_cf_request()` mencoba jalur langsung dulu, lalu proxy dari env `PROXY_LIST`
-(`ip:port:user:pass` atau URL penuh) kalau jawabannya 4xx/5xx — Cloudflare menolak
+`_cf_request()` mencoba jalur langsung dulu, lalu proxy dari `proxies.txt` (satu
+per baris, `#` = komentar; path bisa diganti lewat `PROXY_FILE`) dan env
+`PROXY_LIST` (`ip:port:user:pass` atau URL penuh) kalau jawabannya 4xx/5xx — Cloudflare menolak
 dengan **403 + HTML**, bukan exception, jadi status code ikut diperiksa. Proxy yang
 berhasil diingat (`_PROXY_GOOD`) supaya percobaan berikutnya mulai dari situ.
 
@@ -441,9 +442,22 @@ tampilan belaka dan tiap pool tetap diverifikasi on-chain, jadi operator proxy t
 bisa mengarahkan transaksi. Menyalurkan RPC lewat pihak ketiga akan membuang jaminan
 itu — jangan dilakukan.
 
+`proxies.txt` ada di `.gitignore` — isinya kredensial, jangan pernah di-commit.
+Contohnya `proxies.txt.example`.
+
 Terukur dengan proxy datacenter: indexer Uniswap **pulih** (0 → 94 entri saat jalur
 langsung diblokir), Krystal **tetap 403** — Cloudflare mereka menolak IP datacenter
 apa pun, proxy maupun bukan. Jadi proxy menolong indexer, bukan Krystal.
+
+Blokirnya **se-domain**, bukan per-path: `api.krystal.app/all/v2/lp_explorer/top_pools`,
+`/all/v1/lp_explorer/configs`, bahkan halaman `defi.krystal.app/pools` semuanya 403
+dari IP yang sama. Tidak ada celah host/path — yang bisa menembus cuma IP dengan
+reputasi bersih (residensial/mobile).
+
+**`discover_foreign_pools()` hanya untuk jalur Krystal.** Daftar Krystal disaring
+per-quote sehingga pool ber-quote aneh bisa hilang; GeckoTerminal memuat semua pool
+yang mengandung token itu apa pun quote-nya. Di jalur gecko pencarian itu murni
+beban — terukur 32,7 detik untuk 0 pool tambahan (36,1s → 6,9s setelah dilewati).
 
 ### GeckoTerminal: satu-satunya sumber yang lolos dari host terblokir
 

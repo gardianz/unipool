@@ -20,3 +20,6 @@ __pycache__/
 
 # brankas wallet tambahan — private key polos, JANGAN di-commit
 wallets.json
+
+# Kredensial proxy — jangan pernah di-commit
+proxies.txt
