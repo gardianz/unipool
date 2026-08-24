@@ -430,11 +430,21 @@ di jalur "tidak ada pool", tidak pernah di jalur normal.
 
 ### `PROXY_LIST`: proxy untuk API data pasar, JANGAN untuk RPC
 
+**Cara yang terbukti menembus: WARP mode proxy.** `warp-cli mode proxy` + `proxy
+port 40000`, lalu `socks5://127.0.0.1:40000` di baris pertama `proxies.txt`. Exit
+IP-nya milik Cloudflare sendiri (terukur 104.28.222.43) dan Krystal menjawab
+**200 + 19 pool** dari VPS yang sebelumnya selalu 403. Sengaja **proxy mode, bukan
+full-tunnel**: full-tunnel akan menyeret RPC ikut lewat WARP, padahal pemisahan
+"proxy hanya untuk data pasar" itu justru jaminannya. Butuh `PySocks` untuk jalur
+requests (curl_cffi sudah lewat libcurl).
+
 `_cf_request()` mencoba jalur langsung dulu, lalu proxy dari `proxies.txt` (satu
 per baris, `#` = komentar; path bisa diganti lewat `PROXY_FILE`) dan env
 `PROXY_LIST` (`ip:port:user:pass` atau URL penuh) kalau jawabannya 4xx/5xx — Cloudflare menolak
 dengan **403 + HTML**, bukan exception, jadi status code ikut diperiksa. Proxy yang
-berhasil diingat (`_PROXY_GOOD`) supaya percobaan berikutnya mulai dari situ.
+berhasil diingat (`_PROXY_GOOD`) supaya percobaan berikutnya mulai dari situ, dan
+jalur langsung yang ditolak dilewati selama `_DIRECT_COOLDOWN` (300 detik) — di host
+terblokir ia selalu gagal, jadi mencobanya tiap request cuma round-trip percuma.
 
 Batas yang disengaja: proxy **hanya** untuk Krystal / indexer Uniswap / dexscreener
 / GeckoTerminal. Angka dari sumber-sumber itu memang sudah diperlakukan sebagai

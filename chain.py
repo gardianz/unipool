@@ -1529,6 +1529,8 @@ def _proxy_list(_cache=[]) -> list[str]:
 
 
 _PROXY_GOOD = [0]      # indeks proxy yang terakhir berhasil — dicoba duluan
+_DIRECT_BAD = [0.0]    # kapan jalur langsung terakhir ditolak (0 = tidak pernah)
+_DIRECT_COOLDOWN = 300
 
 
 def _cf_request(method: str, url: str, **kw):
@@ -1546,14 +1548,22 @@ def _cf_request(method: str, url: str, **kw):
                 pass
         return getattr(requests, method)(url, proxies=proxies, **kw)
 
-    last = None
-    try:
-        last = _try(None)
-        if last.status_code < 400:
-            return last
-    except Exception:
-        pass
     proxies = _proxy_list()
+    # Di host yang diblokir, jalur langsung SELALU gagal — mencobanya tiap request
+    # cuma menambah satu round-trip percuma. Setelah gagal sekali, lewati selama
+    # _DIRECT_COOLDOWN detik lalu coba lagi (blokir bisa dicabut, WARP bisa mati).
+    skip_direct = proxies and time.time() - _DIRECT_BAD[0] < _DIRECT_COOLDOWN
+    last = None
+    if not skip_direct:
+        try:
+            last = _try(None)
+            if last.status_code < 400:
+                _DIRECT_BAD[0] = 0.0
+                return last
+        except Exception:
+            pass
+        if proxies:
+            _DIRECT_BAD[0] = time.time()
     for i in range(len(proxies)):
         p = proxies[(_PROXY_GOOD[0] + i) % len(proxies)]
         try:
