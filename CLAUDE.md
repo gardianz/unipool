@@ -391,6 +391,11 @@ harus sedekat mungkin ke kenyataan:
   `curl_cffi` (`impersonate="chrome"`) meniru handshake TLS Chrome dan tembus —
   dipakai duluan lewat `_krystal_get()`, `requests` jadi cadangan. Paketnya
   **opsional**: tanpa itu bot tetap jalan, discovery-nya saja jatuh ke scan RPC.
+- **Blokirnya tidak cuma mengenai Krystal.** Indexer Uniswap (ListPools/ListPositions)
+  dan dexscreener duduk di belakang Cloudflare yang sama. Terukur: dengan indexer
+  hidup, jalur fallback pun menemukan 19 pool BNBCAT; di VPS yang diblokir cuma 2
+  (hasil scan RPC murni). Karena itu SEMUA request ke sumber luar lewat
+  `_cf_get()`/`_cf_post()`, bukan `requests` polos.
 - Header tetap meniru browser (`user-agent`, `origin`, `referer`). Default
   python-requests gampang dijegal Cloudflare dari IP datacenter, dan gejalanya
   bukan exception melainkan **hasil kosong** — bot lalu diam-diam jatuh ke scan RPC

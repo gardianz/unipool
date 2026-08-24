@@ -1207,7 +1207,7 @@ def _dex_pairs(chain_id: int, token_addr: str, _cache={}) -> list[dict]:
     if hit and time.time() - hit[1] < 120:
         return hit[0]
     try:
-        r = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{token_addr}", timeout=8)
+        r = _cf_get(f"https://api.dexscreener.com/latest/dex/tokens/{token_addr}", timeout=8)
         pairs = [p for p in (r.json().get("pairs") or [])
                  if p.get("chainId") == cfg.get("dexscreener")]
     except Exception:
@@ -1247,7 +1247,7 @@ def uni_pools(cid: int, token: str, ttl: int = 30) -> list | None:
             "protocolVersions": ["PROTOCOL_VERSION_V3", "PROTOCOL_VERSION_V4"],
             "pageSize": 100}
     try:
-        r = requests.post(_UNI_POOLS_API, headers=_UNI_HDR, json=body, timeout=10)
+        r = _cf_post(_UNI_POOLS_API, headers=_UNI_HDR, json=body, timeout=10)
         pools = r.json().get("pools")
         if not isinstance(pools, list):
             return hit[1] if hit else None
@@ -1482,15 +1482,33 @@ def krystal_last_error() -> str:
     return _KRYSTAL_LAST_ERR
 
 
-def _krystal_get(params: dict, timeout: int = 15):
-    """GET ke API Krystal — curl_cffi (impersonate Chrome) dulu, requests cadangan."""
+# Beberapa sumber data di file ini duduk di belakang Cloudflare yang sama: API
+# Krystal, indexer Uniswap (ListPools/ListPositions), dan dexscreener. Dari IP
+# datacenter ketiganya menolak python-requests — dan penolakannya BUKAN exception,
+# melainkan halaman HTML, sehingga pemanggilnya cuma melihat "hasil kosong" lalu
+# diam-diam jatuh ke jalur lambat. Semua request ke sana harus lewat helper ini.
+def _cf_get(url: str, **kw):
+    """GET tahan Cloudflare: curl_cffi (impersonate Chrome) dulu, requests cadangan."""
     if _cffi_requests is not None:
         try:
-            return _cffi_requests.get(_KRYSTAL_POOLS, params=params, headers=_KRYSTAL_HDR,
-                                      impersonate="chrome", timeout=timeout)
+            return _cffi_requests.get(url, impersonate="chrome", **kw)
         except Exception:
-            pass    # jatuh ke requests biasa
-    return requests.get(_KRYSTAL_POOLS, params=params, headers=_KRYSTAL_HDR, timeout=timeout)
+            pass
+    return requests.get(url, **kw)
+
+
+def _cf_post(url: str, **kw):
+    """POST tahan Cloudflare — lihat _cf_get."""
+    if _cffi_requests is not None:
+        try:
+            return _cffi_requests.post(url, impersonate="chrome", **kw)
+        except Exception:
+            pass
+    return requests.post(url, **kw)
+
+
+def _krystal_get(params: dict, timeout: int = 15):
+    return _cf_get(_KRYSTAL_POOLS, params=params, headers=_KRYSTAL_HDR, timeout=timeout)
 
 
 def krystal_raw(chain_id: int, token: str, _cache={}, ttl: int = 120) -> list:
@@ -3247,7 +3265,7 @@ def uniswap_v3_token_ids(chain_id: int, address: str, _cache={}, ttl: int = 20) 
             "positionStatuses": ["POSITION_STATUS_IN_RANGE", "POSITION_STATUS_OUT_OF_RANGE"],
             "pageSize": 100, "includeHidden": True}
     try:
-        r = requests.post(_UNI_POS_API, headers=_UNI_HDR, json=body, timeout=10)
+        r = _cf_post(_UNI_POS_API, headers=_UNI_HDR, json=body, timeout=10)
         raw = r.json().get("positions")
         if not isinstance(raw, list):
             return None
@@ -3641,7 +3659,7 @@ def token_usd_price(w3: Web3, chain_id: int, token_addr: str, _cache={}) -> floa
     # likuiditas terbesar menang.
     if not price or best_liq_usd < 500:
         try:
-            r = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{token}", timeout=8)
+            r = _cf_get(f"https://api.dexscreener.com/latest/dex/tokens/{token}", timeout=8)
             pairs = [p for p in (r.json().get("pairs") or [])
                      if p.get("chainId") == cfg.get("dexscreener")]
             pairs.sort(key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0), reverse=True)
