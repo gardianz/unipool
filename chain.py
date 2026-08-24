@@ -1466,9 +1466,31 @@ _KRYSTAL_HDR = {
 }
 _KRYSTAL_LAST_ERR = ""      # sebab kegagalan terakhir, ditampilkan UI saat fallback
 
+# Cloudflare di depan api.krystal.app menyaring lewat TLS fingerprint (JA3), BUKAN
+# cuma User-Agent: dari IP datacenter, python-requests kena 403 walau header-nya
+# sudah meniru browser persis (terbukti di VPS — 403 tanpa header, dan dengan header
+# jawabannya tetap bukan JSON). curl_cffi meniru handshake TLS Chrome sungguhan dan
+# tembus. Opsional: kalau paketnya tidak ada, jalur requests biasa tetap dipakai —
+# yang hilang cuma kecepatan discovery, bukan fungsinya.
+try:
+    from curl_cffi import requests as _cffi_requests
+except Exception:               # pragma: no cover
+    _cffi_requests = None
+
 
 def krystal_last_error() -> str:
     return _KRYSTAL_LAST_ERR
+
+
+def _krystal_get(params: dict, timeout: int = 15):
+    """GET ke API Krystal — curl_cffi (impersonate Chrome) dulu, requests cadangan."""
+    if _cffi_requests is not None:
+        try:
+            return _cffi_requests.get(_KRYSTAL_POOLS, params=params, headers=_KRYSTAL_HDR,
+                                      impersonate="chrome", timeout=timeout)
+        except Exception:
+            pass    # jatuh ke requests biasa
+    return requests.get(_KRYSTAL_POOLS, params=params, headers=_KRYSTAL_HDR, timeout=timeout)
 
 
 def krystal_raw(chain_id: int, token: str, _cache={}, ttl: int = 120) -> list:
@@ -1482,9 +1504,8 @@ def krystal_raw(chain_id: int, token: str, _cache={}, ttl: int = 120) -> list:
     global _KRYSTAL_LAST_ERR
     for attempt in range(2):    # sekali ulang: hiccup 1 request tidak boleh
         try:                    # mematikan seluruh jalur Krystal
-            r = requests.get(_KRYSTAL_POOLS, timeout=15, headers=_KRYSTAL_HDR,
-                             params={"chainId": chain_id, "tokenAddress": str(token).lower(),
-                                     "skipCheckAutomation": "true"})
+            r = _krystal_get({"chainId": chain_id, "tokenAddress": str(token).lower(),
+                              "skipCheckAutomation": "true"})
             got = (r.json() or {}).get("result") or []
             if isinstance(got, list) and got:
                 out = got
@@ -1611,8 +1632,7 @@ def token_chains(token: str, _cache={}, ttl: int = 180) -> list[tuple[int, float
         return hit[0]
     tot: dict[int, float] = {}
     try:
-        r = requests.get(_KRYSTAL_POOLS, timeout=15, headers=_KRYSTAL_HDR,
-                         params={"tokenAddress": key, "skipCheckAutomation": "true"})
+        r = _krystal_get({"tokenAddress": key, "skipCheckAutomation": "true"})
         for p in (r.json().get("result") or []):
             try:
                 cid = int(p.get("chainId") or 0)

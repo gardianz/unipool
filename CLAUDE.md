@@ -386,7 +386,12 @@ harus sedekat mungkin ke kenyataan:
 - `skipCheckAutomation=true` mematikan pengecekan dukungan automation di sisi
   server — itu fitur UI mereka (ikon robot; **bukan** penanda hook). Tanpa itu
   request dingin terukur 4 detik, dengan itu 0,4 detik.
-- Header wajib meniru browser (`user-agent`, `origin`, `referer`). Default
+- **Cloudflare menyaring lewat TLS fingerprint (JA3), bukan cuma header.** Terukur
+  di VPS: `403` tanpa header, dan DENGAN header lengkap jawabannya tetap bukan JSON.
+  `curl_cffi` (`impersonate="chrome"`) meniru handshake TLS Chrome dan tembus —
+  dipakai duluan lewat `_krystal_get()`, `requests` jadi cadangan. Paketnya
+  **opsional**: tanpa itu bot tetap jalan, discovery-nya saja jatuh ke scan RPC.
+- Header tetap meniru browser (`user-agent`, `origin`, `referer`). Default
   python-requests gampang dijegal Cloudflare dari IP datacenter, dan gejalanya
   bukan exception melainkan **hasil kosong** — bot lalu diam-diam jatuh ke scan RPC
   penuh. `krystal_last_error()` menyimpan sebabnya dan UI menampilkannya, jadi

@@ -2,3 +2,7 @@ web3>=7.0
 python-telegram-bot>=21
 python-dotenv>=1.0
 requests>=2.31
+# TLS impersonation Chrome — Cloudflare di depan api.krystal.app menolak
+# python-requests dari IP datacenter (403 walau header sudah meniru browser).
+# Opsional: tanpa ini bot tetap jalan, discovery-nya saja jadi lambat.
+curl_cffi>=0.7
