@@ -887,8 +887,10 @@ async def show_pools_for(status, cid: int, token: str):
     # BNBCAT 20 pool jadi 4).
     src_line = ("\U0001F4DA sumber: daftar Krystal (\u2265$1K TVL, apa adanya)"
                 if res.get("source") == "krystal" else
-                "\U0001F526 sumber: scan sendiri \u2014 Krystal tidak punya token ini atau "
-                "sedang gagal; daftarnya lewat saringan pool mati & harga menyimpang")
+                "\U0001F526 sumber: scan sendiri \u2014 daftarnya lewat saringan pool mati "
+                "& harga menyimpang"
+                + (f" (Krystal gagal: {esc(ch.krystal_last_error())})"
+                   if ch.krystal_last_error() else " (Krystal tidak punya token ini)"))
     text = (f"Found {len(pools)} pool(s) untuk <b>{esc(tsym)}</b> ({_t.time() - t0:.1f}s):\n"
             f"<pre>{esc(chr(10).join(rows))}</pre>\n"
             f"<i>P=PancakeSwap · U=Uniswap · ! = harga menyimpang · TVL/volume USD · "

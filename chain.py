@@ -1451,6 +1451,26 @@ _KRYSTAL_PROTO = {          # protocol Krystal → (DEX kita, versi pool)
 }
 
 
+# Header yang dikirim web Krystal sendiri. python-requests default (User-Agent
+# "python-requests/2.x", tanpa origin/referer) gampang dijegal Cloudflare dari IP
+# datacenter — gejalanya request "sukses" tapi hasilnya kosong, dan bot diam-diam
+# jatuh ke scan RPC penuh. `skipCheckAutomation=true` mematikan pengecekan dukungan
+# automation di sisi server (ikon robot di UI mereka); kita tidak memakainya, dan
+# tanpa itu request dingin terukur 4 detik, dengan itu 0,4 detik.
+_KRYSTAL_HDR = {
+    "accept": "application/json",
+    "user-agent": ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"),
+    "origin": "https://defi.krystal.app",
+    "referer": "https://defi.krystal.app/",
+}
+_KRYSTAL_LAST_ERR = ""      # sebab kegagalan terakhir, ditampilkan UI saat fallback
+
+
+def krystal_last_error() -> str:
+    return _KRYSTAL_LAST_ERR
+
+
 def krystal_raw(chain_id: int, token: str, _cache={}, ttl: int = 120) -> list:
     """Entri mentah dari API Krystal. List kosong kalau gagal / chain tak dilayani —
     pemanggil WAJIB tetap jalan tanpa ini."""
@@ -1459,16 +1479,20 @@ def krystal_raw(chain_id: int, token: str, _cache={}, ttl: int = 120) -> list:
     if hit and time.time() - hit[1] < ttl:
         return hit[0]
     out = []
+    global _KRYSTAL_LAST_ERR
     for attempt in range(2):    # sekali ulang: hiccup 1 request tidak boleh
         try:                    # mematikan seluruh jalur Krystal
-            r = requests.get(_KRYSTAL_POOLS, timeout=8, headers={"accept": "application/json"},
-                             params={"chainId": chain_id, "tokenAddress": str(token).lower()})
-            got = r.json().get("result") or []
+            r = requests.get(_KRYSTAL_POOLS, timeout=15, headers=_KRYSTAL_HDR,
+                             params={"chainId": chain_id, "tokenAddress": str(token).lower(),
+                                     "skipCheckAutomation": "true"})
+            got = (r.json() or {}).get("result") or []
             if isinstance(got, list) and got:
                 out = got
+                _KRYSTAL_LAST_ERR = ""
                 break
-        except Exception:
-            pass
+            _KRYSTAL_LAST_ERR = f"HTTP {r.status_code}, hasil kosong"
+        except Exception as e:
+            _KRYSTAL_LAST_ERR = f"{type(e).__name__}: {str(e)[:80]}"
         if attempt == 0:
             time.sleep(0.6)
     if not out:
@@ -1587,8 +1611,8 @@ def token_chains(token: str, _cache={}, ttl: int = 180) -> list[tuple[int, float
         return hit[0]
     tot: dict[int, float] = {}
     try:
-        r = requests.get(_KRYSTAL_POOLS, timeout=8, headers={"accept": "application/json"},
-                         params={"tokenAddress": key})
+        r = requests.get(_KRYSTAL_POOLS, timeout=15, headers=_KRYSTAL_HDR,
+                         params={"tokenAddress": key, "skipCheckAutomation": "true"})
         for p in (r.json().get("result") or []):
             try:
                 cid = int(p.get("chainId") or 0)

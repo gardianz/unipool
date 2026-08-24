@@ -378,6 +378,22 @@ harus sedekat mungkin ke kenyataan:
   `liquidity` × harga lewat StateView. Angka indexer tidak dipakai lagi: terukur
   $43,9k untuk pool yang nyatanya ~$3k.
 
+**Request-nya harus meniru web mereka.** Dibaca dari bundel
+`defi-assets.krystal.app/assets/index-*.js`, parameter yang dikirim
+`defi.krystal.app/pools` adalah `chainId` (DIHILANGKAN saat "All Networks"),
+`tokenAddress` (lowercase), `category`, `protocols`, dan `skipCheckAutomation`.
+
+- `skipCheckAutomation=true` mematikan pengecekan dukungan automation di sisi
+  server — itu fitur UI mereka (ikon robot; **bukan** penanda hook). Tanpa itu
+  request dingin terukur 4 detik, dengan itu 0,4 detik.
+- Header wajib meniru browser (`user-agent`, `origin`, `referer`). Default
+  python-requests gampang dijegal Cloudflare dari IP datacenter, dan gejalanya
+  bukan exception melainkan **hasil kosong** — bot lalu diam-diam jatuh ke scan RPC
+  penuh. `krystal_last_error()` menyimpan sebabnya dan UI menampilkannya, jadi
+  kegagalan tidak lagi tak terlihat.
+- `/all/v1/lp_explorer/configs` memberi daftar chain + protokol yang dilayani
+  Krystal (9 chain saat ditulis).
+
 **Endpoint Krystal**: `GET api.krystal.app/all/v2/lp_explorer/top_pools?chainId=&tokenAddress=`
 — **v2**, yang v1 cuma melayani Solana (menjawab "chain id 56 not supported"), dan
 paramnya `tokenAddress` bukan `search`. Tidak terdokumentasi di swagger publik;
