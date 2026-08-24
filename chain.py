@@ -1887,9 +1887,16 @@ def discover_gecko(chain_id: int, token: str) -> list[dict]:
         except Exception:
             return None
 
+    # Verifikasi on-chain per pool itu beberapa panggilan RPC (token0/1, fee, slot0,
+    # tickSpacing, liquidity, kepemilikan factory, harga quote). Di chain dengan
+    # ratusan pool dan RPC publik yang gampang kena 429, memverifikasi semuanya
+    # terukur 211 detik di Base. Urutkan TVL dulu lalu verifikasi yang teratas saja —
+    # pool di bawahnya toh tidak akan pernah dipilih user.
+    rows.sort(key=lambda p: float(((p.get("attributes") or {}).get("reserve_in_usd")) or 0),
+              reverse=True)
     res = []
-    with ThreadPoolExecutor(max_workers=5) as ex:
-        for x in ex.map(build, rows[:25]):
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        for x in ex.map(build, rows[:15]):
             if x:
                 res.append(x)
     return res
