@@ -428,6 +428,31 @@ Kalau Krystal tidak kenal tokennya, `token_chains_onchain()` mengecek `eth_getCo
 per chain sebagai petunjuk terakhir. Itu satu request per chain, jadi HANYA dipakai
 di jalur "tidak ada pool", tidak pernah di jalur normal.
 
+### GeckoTerminal: satu-satunya sumber yang lolos dari host terblokir
+
+Urutan sumber daftar pool: **Krystal → GeckoTerminal → discovery sendiri**.
+
+Krystal dan indexer Uniswap sama-sama di belakang Cloudflare. Dari VPS yang IP-nya
+kena *managed challenge*, keduanya menjawab halaman HTML "Just a moment…" — 403
+untuk SEMUA profil impersonasi curl_cffi (chrome, chrome131/124/120, safari17_0,
+firefox133). Itu keputusan reputasi IP, bukan TLS: tidak ada perubahan HTTP client
+yang bisa menembusnya. `api.geckoterminal.com` tidak di belakang Cloudflare dan
+tetap menjawab 200 dari host yang sama.
+
+`discover_gecko()` memakai `/networks/{net}/tokens/{addr}/pools`. Dua hal penting:
+
+- **`address` untuk pool v4 adalah poolId 66-karakter**, bukan alamat kontrak.
+- **Fee-nya dibulatkan** di nama pool ("BNBCAT / USDT 4.202%" untuk fee asli 42122),
+  jadi `_v4_key_search()` menebak fee di sekitar nilai itu dan menerima yang
+  `v4_pool_id(key)`-nya cocok. Hash itu keccak LOKAL — tanpa RPC — jadi ribuan
+  kombinasi praktis gratis (16 pool < 1 detik) dan hash cocok = kunci autentik.
+  Pool ber-hooks otomatis tidak pernah cocok, dan itu memang yang diinginkan.
+
+Terukur di BNBCAT/BSC dengan Krystal + indexer dimatikan: **16 pool dalam 10,4
+detik**, termasuk pool terbesarnya (PancakeSwap v2 $263k) dan 13 pool v4 ber-fee
+non-standar. Sebelum ada jalur ini, host terblokir cuma dapat 2 pool dalam 45 detik
+(hasil scan tier tetap).
+
 ### Krystal sebagai sumber utama daftar pool
 
 `discover_any()` mencoba `discover_krystal()` DULU (<1 detik, angkanya sama dengan yang

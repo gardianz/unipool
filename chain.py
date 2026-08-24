@@ -1681,6 +1681,150 @@ def token_chains_onchain(token: str) -> list[int]:
     return out
 
 
+_GECKO_POOLS = "https://api.geckoterminal.com/api/v2/networks/{net}/tokens/{token}/pools"
+# dexId GeckoTerminal → (nama DEX di CHAINS, versi). Slug mereka tidak seragam
+# ("pancakeswap_v2" pakai garis bawah, "pancakeswap-v3-bsc" pakai strip + sufiks
+# chain), jadi pencocokannya lewat potongan kata, bukan tabel kaku.
+def _gecko_proto(chain_id: int, dex_id: str) -> tuple[str | None, int | None]:
+    d = str(dex_id or "").lower().replace("_", "-")
+    ver = 4 if "-v4" in d else 3 if "-v3" in d else 2 if "-v2" in d else None
+    if ver is None:
+        return None, None
+    for name in dex_names(chain_id):
+        if name.lower().replace(" ", "") in d.replace("-", ""):
+            return name, ver
+    return None, None
+
+
+def _v4_key_search(c0: str, c1: str, pool_id_hex: str, fee_hint: int, span: int = 400) -> tuple | None:
+    """Cari PoolKey v4 dengan menebak fee di sekitar `fee_hint`, dibuktikan hash.
+
+    Perlu karena GeckoTerminal cuma menyebut fee yang SUDAH DIBULATKAN di nama pool
+    ("BNBCAT / USDT 4.202%" untuk fee asli 42122). v4_pool_id() itu keccak lokal —
+    tanpa RPC — jadi mencoba ribuan kombinasi praktis gratis (terukur 16 pool < 1
+    detik). Hash cocok = kunci autentik, aman dipakai membangun transaksi.
+
+    Pool ber-hooks tidak akan pernah cocok (hooks bukan alamat nol) — itu memang
+    yang diinginkan: bot tidak mendukungnya."""
+    want = str(pool_id_hex).lower()
+    zero = "0x" + "00" * 20
+    for d in range(span):
+        for fee in ({fee_hint + d, fee_hint - d} if d else {fee_hint}):
+            if fee <= 0 or fee >= 0x800000:
+                continue
+            for sp in _spacing_candidates(fee):
+                key = (c0, c1, fee, sp, zero)
+                if "0x" + v4_pool_id(key).hex().removeprefix("0x") == want:
+                    return key
+    return None
+
+
+def discover_gecko(chain_id: int, token: str) -> list[dict]:
+    """Daftar pool dari GeckoTerminal. Pengganti indexer Uniswap + Krystal di host
+    yang diblokir Cloudflare — endpoint ini TIDAK di belakang Cloudflare (terbukti
+    200 dari VPS yang ditolak dua sumber lain).
+
+    Sama seperti sumber luar lain, angkanya cuma untuk tampilan/pengurutan; tiap
+    pool tetap diverifikasi on-chain sebelum bisa dipakai: v2/v3 lewat `token0()/
+    token1()` + kepemilikan factory, v4 lewat hash PoolKey."""
+    cfg = CHAINS[chain_id]
+    net = cfg.get("gecko")
+    if not net:
+        return []
+    try:
+        r = _cf_get(_GECKO_POOLS.format(net=net, token=str(token).lower()),
+                    timeout=15, headers={"accept": "application/json"})
+        rows = (r.json() or {}).get("data") or []
+    except Exception:
+        return []
+    w3 = get_w3(chain_id)
+    tl = str(token).lower()
+    quotes_lc = {a.lower(): s for s, a in cfg["quotes"].items()}
+
+    def build(p):
+        try:
+            a = p.get("attributes") or {}
+            rel = p.get("relationships") or {}
+            dname, ver = _gecko_proto(chain_id, (rel.get("dex") or {}).get("data", {}).get("id"))
+            if not dname or (ver == 4 and not has_v4(chain_id, dname)):
+                return None
+            addr = str(a.get("address") or "")
+            stats = {"tvl_usd": float(a.get("reserve_in_usd") or 0),
+                     "vol24_usd": float((a.get("volume_usd") or {}).get("h24") or 0) or None,
+                     "apr_pct": None, "tvl_src": "gecko", "basis": "gecko"}
+            if ver == 4:
+                # fee dari nama pool ("… / USDT 4.202%") — sudah dibulatkan, jadi
+                # dipakai sebagai TEBAKAN AWAL lalu dicari yang hash-nya cocok
+                try:
+                    pct = float(str(a.get("name") or "").rsplit(" ", 1)[1].rstrip("%"))
+                except (IndexError, ValueError):
+                    return None
+                b = _norm_currency(str((rel.get("base_token") or {}).get("data", {}).get("id", "")).split("_")[-1])
+                q_ = _norm_currency(str((rel.get("quote_token") or {}).get("data", {}).get("id", "")).split("_")[-1])
+                c0, c1 = sort_tokens(b, q_)
+                key = _v4_key_search(c0, c1, addr, int(round(pct * 10000)))
+                if not key:
+                    return None                  # ber-hooks atau fee di luar jangkauan
+                if tl not in (key[0].lower(), key[1].lower()):
+                    return None
+                qa = key[1] if key[0].lower() == tl else key[0]
+                qsym, qusd, qdec = _quote_meta(w3, chain_id, qa, quotes_lc)
+                if qusd <= 0:
+                    return None
+                pid = v4_pool_id(key)
+                sqrtp, tick = v4_slot0(w3, chain_id, pid)
+                return {"ver": 4, "dex": dname, "pool": "0x" + pid.hex().removeprefix("0x"),
+                        "pool_id": pid, "key": key, "fee": key[2], "tick_spacing": key[3],
+                        "quote_sym": qsym, "quote_addr": qa, "quote_decimals": qdec,
+                        "quote_usd": qusd, "sqrtp": sqrtp, "tick": tick,
+                        "token0": key[0], "token1": key[1],
+                        "quote_is_token1": qa.lower() == key[1].lower(),
+                        "foreign_quote": qa.lower() not in quotes_lc, **stats}
+            pc = w3.eth.contract(address=Web3.to_checksum_address(addr),
+                                 abi=POOL_ABI if ver == 3 else V2_PAIR_ABI)
+            t0, t1 = pc.functions.token0().call(), pc.functions.token1().call()
+            if tl not in (t0.lower(), t1.lower()):
+                return None
+            fee = pc.functions.fee().call() if ver == 3 else cfg.get("v2_fee", 3000)
+            # kepemilikan factory diverifikasi on-chain — daftar GeckoTerminal memuat
+            # SEMUA dex di chain itu, termasuk yang tidak kita dukung
+            owner = (which_dex_v3(w3, chain_id, addr, *sort_tokens(t0, t1), fee) if ver == 3
+                     else which_dex_v2(w3, chain_id, addr, t0, t1))
+            if not owner:
+                return None
+            q = t1 if t0.lower() == tl else t0
+            qsym, qusd, qdec = _quote_meta(w3, chain_id, q, quotes_lc)
+            if qusd <= 0:
+                return None
+            out = {"ver": ver, "dex": owner, "pool": Web3.to_checksum_address(addr), "fee": fee,
+                   "quote_sym": qsym, "quote_addr": Web3.to_checksum_address(q),
+                   "quote_decimals": qdec, "quote_usd": qusd,
+                   "token0": Web3.to_checksum_address(t0), "token1": Web3.to_checksum_address(t1),
+                   "quote_is_token1": q.lower() == t1.lower(),
+                   "foreign_quote": q.lower() not in quotes_lc, **stats}
+            if ver == 3:
+                s0 = pc.functions.slot0().call()
+                out.update({"sqrtp": s0[0], "tick": s0[1],
+                            "tick_spacing": pc.functions.tickSpacing().call(),
+                            "liquidity": pc.functions.liquidity().call()})
+            else:
+                rq, rm = _v2_pair_reserves(w3, addr, q)
+                if rq <= 0 or rm <= 0:
+                    return None
+                out.update({"reserve_quote": rq, "reserve_meme": rm,
+                            "sqrtp": None, "tick": None, "liquidity": None})
+            return out
+        except Exception:
+            return None
+
+    res = []
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        for x in ex.map(build, rows[:25]):
+            if x:
+                res.append(x)
+    return res
+
+
 def discover_krystal(chain_id: int, token: str) -> list[dict]:
     """Bangun daftar pool dari Krystal, TIAP POOL DIVERIFIKASI ON-CHAIN.
 
@@ -1939,12 +2083,24 @@ def discover_any(chain_id: int, token_addr: str) -> dict:
         kr = discover_krystal(chain_id, token_addr)
     except Exception:
         kr = []
+    src_name = "krystal"
+    if not kr:
+        # Krystal gagal/tidak kenal → GeckoTerminal. Endpoint mereka TIDAK di belakang
+        # Cloudflare, jadi ini satu-satunya daftar pool yang tetap jalan di host yang
+        # IP-nya kena managed challenge (terukur di VPS: Krystal & indexer Uniswap
+        # dua-duanya "Just a moment…", GeckoTerminal 200). Ia juga memuat pool v4
+        # ber-fee non-standar yang mustahil ditemukan scan tier tetap.
+        try:
+            kr = discover_gecko(chain_id, token_addr)
+            src_name = "gecko"
+        except Exception:
+            kr = []
     if kr:
         try:
             tinfo = token_info(get_w3(chain_id), Web3.to_checksum_address(token_addr))
         except Exception:
             tinfo = {"symbol": "?", "decimals": 18, "name": ""}
-        res = {"token": tinfo, "pools": kr, "source": "krystal"}
+        res = {"token": tinfo, "pools": kr, "source": src_name}
         for p in res["pools"]:
             p["thin"] = (p.get("tvl_usd") or 0) < 50
         # Pool dari Krystal TIDAK disaring lagi (daftar mereka sudah tersaring

@@ -887,6 +887,8 @@ async def show_pools_for(status, cid: int, token: str):
     # BNBCAT 20 pool jadi 4).
     src_line = ("\U0001F4DA sumber: daftar Krystal (\u2265$1K TVL, apa adanya)"
                 if res.get("source") == "krystal" else
+                "\U0001F4CA sumber: GeckoTerminal (Krystal tidak terjangkau dari server ini)"
+                if res.get("source") == "gecko" else
                 "\U0001F526 sumber: scan sendiri \u2014 daftarnya lewat saringan pool mati "
                 "& harga menyimpang"
                 + (f" (Krystal gagal: {esc(ch.krystal_last_error())})"
