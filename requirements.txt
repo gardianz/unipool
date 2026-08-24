@@ -2,6 +2,10 @@ web3>=7.0
 python-telegram-bot>=21
 python-dotenv>=1.0
 requests>=2.31
+# Dukungan proxy SOCKS5 untuk requests — dipakai kalau PROXY_LIST/proxies.txt
+# berisi socks5:// (mis. WARP mode proxy di 127.0.0.1:40000). curl_cffi sudah
+# mendukungnya lewat libcurl; ini supaya jalur cadangan requests ikut jalan.
+PySocks>=1.7
 # TLS impersonation Chrome — Cloudflare di depan api.krystal.app menolak
 # python-requests dari IP datacenter (403 walau header sudah meniru browser).
 # Opsional: tanpa ini bot tetap jalan, discovery-nya saja jadi lambat.
