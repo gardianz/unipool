@@ -92,6 +92,33 @@ Jebakan yang sudah terbukti saat menambah PancakeSwap — jangan diulang:
 Verifikasi alamat baru **on-chain** sebelum dipakai (semua alamat di dict itu sudah:
 `npm.factory()`, `router.factory()`, `v2_router.factory()/WETH()` saling cocok).
 
+### Chain yang didukung
+
+| chain | DEX | v4 | indexer Uniswap | quote |
+|---|---|---|---|---|
+| Robinhood 4663 | Uniswap | ya | ya | WETH, USDG |
+| BSC 56 | PancakeSwap + Uniswap | tidak | tidak | WBNB, USDT, USDC |
+| Base 8453 | Uniswap | ya | ya | WETH, USDC |
+| HyperEVM 999 | HyperSwap | tidak | tidak | WHYPE, USDC |
+
+Semua alamat di dua entri baru diverifikasi on-chain sebelum dipakai:
+`npm.factory()`, `npm.WETH9()`, `router.factory()`, `router.WETH9()`,
+`v2_router.factory()`, `v2_router.WETH()`, dan untuk Base
+`v4_posm/stateview/quoter.poolManager() == v4_pm` + `posm.permit2()` canonical.
+`fee_tiers` dibaca dari `factory.feeAmountTickSpacing()`, bukan ditebak.
+
+**HyperEVM ramai fork Solidly/Ramses** — nest, kittenswap, ramses, hybra memakai fee
+bebas (terukur 858, 602, 1105, 22222) dan antarmuka factory yang beda, jadi TIDAK
+didukung dan pool-nya otomatis terbuang oleh verifikasi factory di
+`discover_dex_pools`. Yang didukung HyperSwap (fork Uniswap v3 lurus, tier standar).
+**prjx** TVL-nya terbesar (terukur $18,5jt vs HyperSwap $743k) dan fee-nya standar —
+layak jadi DEX kedua di `CHAINS[999]["dexes"]`, tapi alamat NPM/router-nya belum
+diverifikasi on-chain jadi sengaja belum dimasukkan.
+
+Alchemy mendukung kedua chain (`base-mainnet`, `hyperliquid-mainnet`) tapi tiap
+network harus **di-enable per app** di dashboard — kalau tidak, jawabannya 403
+"not enabled for this app" dan `get_w3` jatuh ke RPC publik.
+
 ### Dispatch versi pool
 
 Satu dict "pool_info" dipakai lintas seluruh kode dengan field `ver` (2/3/4) plus

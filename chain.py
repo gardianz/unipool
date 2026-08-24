@@ -90,6 +90,100 @@ CHAINS = {
         },
         "stable_syms": {"USDG"},
     },
+    8453: {
+        "name": "Base",
+        "dex": "Uniswap",
+        # feeAmountTickSpacing() dibaca langsung dari factory: 100→1, 500→10,
+        # 3000→60, 10000→200 (tier standar Uniswap, tidak ada kejutan seperti Pancake)
+        "fee_tiers": (100, 500, 3000, 10000),
+        "uni_api": True,
+        "v2_fee": 3000,
+        "v2_swap_num": 997, "v2_swap_den": 1000,
+        "gas_reserve": 0.00005,   # L2, gas murah
+        "slug": "base",
+        "dexscreener": "base",
+        "gecko": "base",
+        "gmgn": "base",
+        "rpcs": [
+            "https://mainnet.base.org",
+            "https://base-rpc.publicnode.com",
+            "https://base.drpc.org",
+        ],
+        "alchemy": "base-mainnet",
+        "rpc_env": "RPC_8453",
+        "explorer": "https://basescan.org",
+        # Semua diverifikasi on-chain: npm.factory()==factory, npm.WETH9()==wrapped,
+        # router.factory()==factory, router.WETH9()==wrapped,
+        # v2_router.factory()==v2_factory, v2_router.WETH()==wrapped
+        "factory": "0x33128a8fC17869897dcE68Ed026d694621f6FDfD",
+        "npm": "0x03a520b32C04BF3bEEf7BEb72E919cf822Ed34f1",
+        "router": "0x2626664c2603336E57B271c5C0b26F421741e481",
+        "v2_factory": "0x8909Dc15e40173Ff4699343b6eB8132c65e18eC6",
+        "v2_router": "0x4752ba5DBc23f44D87826276BF6Fd6b1C372aD24",
+        # v4 — posm/stateview/quoter .poolManager() semuanya == v4_pm (diverifikasi),
+        # posm.permit2() == permit2 canonical
+        "v4_pm": "0x498581fF718922c3f8e6A244956aF099B2652b2b",
+        "v4_posm": "0x7C5f5A4bBd8fD63184577525326123B519429bDc",
+        "v4_stateview": "0xA3c0c9b65baD0b08107Aa264b0f3dB444b867A71",
+        "v4_quoter": "0x0d5e0F971ED27FBfF6c2837bf31316121532048D",
+        "v4_router": "0x6fF5693b99212Da76ad316178A184AB56D299b43",
+        "v4_swap_hop_field": False,   # UniversalRouter standar, bukan build Robinhood
+        "permit2": "0x000000000022D473030F116dDEE9F6B43aC78BA3",
+        "wrapped": "0x4200000000000000000000000000000000000006",
+        "wrapped_symbol": "WETH",
+        "native_symbol": "ETH",
+        "quotes": {
+            "WETH": "0x4200000000000000000000000000000000000006",
+            "USDC": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+        },
+        "stable_syms": {"USDC"},
+    },
+    999: {
+        "name": "HyperEVM",
+        # DEX utama HyperSwap — fork Uniswap v3 lurus (fee tier standar). HyperEVM
+        # ramai fork Solidly/Ramses (nest, kittenswap, ramses) yang fee-nya bebas
+        # (858, 602, 1105, 22222) dan antarmuka factory-nya beda; itu TIDAK didukung.
+        # prjx (TVL terbesar) fee-nya standar dan layak ditambah nanti sebagai DEX
+        # kedua — alamat NPM/router-nya belum sempat diverifikasi on-chain.
+        "dex": "HyperSwap",
+        "fee_tiers": (100, 500, 3000, 10000),   # dibaca dari feeAmountTickSpacing()
+        "uni_api": False,       # indexer Uniswap tidak mengindeks HyperEVM
+        "v2_fee": 3000,
+        "v2_swap_num": 997, "v2_swap_den": 1000,
+        "gas_reserve": 0.02,    # gas dibayar HYPE; blok cepat, biaya per tx kecil
+        "slug": "hyperevm",
+        "dexscreener": "hyperevm",
+        "gecko": "hyperevm",
+        "gmgn": "hyperevm",
+        "rpcs": [
+            "https://rpc.hyperliquid.xyz/evm",
+            "https://hyperliquid.drpc.org",
+            "https://rpc.hyperlend.finance",
+            "https://rpc.purroofgroup.com",
+        ],
+        "alchemy": "hyperliquid-mainnet",
+        "rpc_env": "RPC_999",
+        "explorer": "https://hyperevmscan.io",
+        # HyperSwap, semua diverifikasi on-chain: npm.factory()==factory,
+        # npm.WETH9()==wrapped, router.factory()==factory, router.WETH9()==wrapped,
+        # v2_router.factory()==v2_factory, v2_router.WETH()==wrapped
+        "factory": "0xB1c0fa0B789320044A6F623cFe5eBda9562602E3",
+        "npm": "0x6eDA206207c09e5428F281761DdC0D300851fBC8",
+        "router": "0x6D99e7f6747AF2cDbB5164b6DD50e40D4fDe1e77",
+        "v2_factory": "0x724412C00059bf7d6ee7d4a1d0D5cd4de3ea1C48",
+        "v2_router": "0xb4a9C4e6Ea8E2191d2FA5B380452a634Fb21240A",
+        # Tidak ada Uniswap v4 di HyperEVM → has_v4() False, verify_v4/discover_v4_pools
+        # fail-closed karena kunci v4_* memang tidak ada (sama seperti BSC).
+        "permit2": "0x000000000022D473030F116dDEE9F6B43aC78BA3",
+        "wrapped": "0x5555555555555555555555555555555555555555",
+        "wrapped_symbol": "WHYPE",
+        "native_symbol": "HYPE",
+        "quotes": {
+            "WHYPE": "0x5555555555555555555555555555555555555555",
+            "USDC": "0xb88339CB7199b77E23DB6E890353E22632Ba630f",
+        },
+        "stable_syms": {"USDC"},
+    },
     56: {
         "name": "BSC",
         "dex": "PancakeSwap",

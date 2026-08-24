@@ -4,7 +4,7 @@ bot.py — Telegram LP bot: paste alamat token → pilih pool → mint LP single
 /list untuk posisi + PnL + close (dengan auto-swap hasil close → WETH/WBNB).
 
 Jalankan:  python3 bot.py
-Env (.env): TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, PRIVATE_KEY, [RPC_4663, RPC_56]
+Env (.env): TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, PRIVATE_KEY, [RPC_4663, RPC_56, RPC_8453, RPC_999]
 """
 import asyncio
 import functools

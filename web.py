@@ -2,7 +2,7 @@
 web.py — UI web unipool: chart real-time + atur range min/max lewat drag di chart.
 
 Jalankan:  python3 web.py          → http://127.0.0.1:8899
-Env (.env, sama dengan bot.py): PRIVATE_KEY, [RPC_4663, RPC_56]
+Env (.env, sama dengan bot.py): PRIVATE_KEY, [RPC_4663, RPC_56, RPC_8453, RPC_999]
 Env tambahan opsional:
     WEB_HOST   default 127.0.0.1  — JANGAN dibuka ke publik tanpa WEB_TOKEN
     WEB_PORT   default 8899
