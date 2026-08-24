@@ -839,11 +839,20 @@ async def on_address(update: Update, _):
         off_line = (f"\n⚠️ {len(off)} pool disembunyikan — harganya menyimpang jauh dari pool "
                     f"terdalam ({det}). Pool begitu tak terarbitrase; LP di situ = modalmu "
                     f"yang dipakai menyeret harganya balik ke pasar.")
+    # Sumber daftar WAJIB disebut: jalur Krystal menampilkan daftar mereka apa adanya,
+    # sedangkan jalur "scan sendiri" melewati seluruh saringan (pool mati, harga
+    # menyimpang) sehingga daftarnya bisa jauh lebih pendek. Tanpa keterangan ini,
+    # Krystal yang gagal sesaat terlihat seperti bot kehilangan pool (kejadian nyata:
+    # BNBCAT 20 pool jadi 4).
+    src_line = ("\U0001F4DA sumber: daftar Krystal (\u2265$1K TVL, apa adanya)"
+                if res.get("source") == "krystal" else
+                "\U0001F526 sumber: scan sendiri \u2014 Krystal tidak punya token ini atau "
+                "sedang gagal; daftarnya lewat saringan pool mati & harga menyimpang")
     text = (f"Found {len(pools)} pool(s) untuk <b>{esc(tsym)}</b> ({_t.time() - t0:.1f}s):\n"
             f"<pre>{esc(chr(10).join(rows))}</pre>\n"
             f"<i>P=PancakeSwap · U=Uniswap · ! = harga menyimpang · TVL/volume USD · "
             f"APR estimasi · V/TVL = volume 24j ÷ TVL (makin tinggi makin produktif) "
-            f"· – = belum terindeks</i>{off_line}\n\nPilih pool:")
+            f"· – = belum terindeks</i>\n<i>{src_line}</i>{off_line}\n\nPilih pool:")
     await edit(status, text, InlineKeyboardMarkup(buttons))
 
 

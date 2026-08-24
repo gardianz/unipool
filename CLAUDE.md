@@ -392,6 +392,18 @@ daftar Krystal, titik — tidak disaring ulang oleh `_drop_dead_pools`/`_drop_of
 (daftar mereka sudah tersaring ≥$1K TVL). Harga menyimpang cuma DITANDAI
 (`p["deviation"]`), tidak dibuang.
 
+**`krystal_raw()` tidak boleh meng-cache hasil kosong.** Krystal bisa menjawab HTTP
+200 dengan payload error (`result` hilang) → `out = []`, dan dulu itu ikut di-cache
+selama ttl penuh (120 detik). Akibatnya SETIAP discovery dalam 2 menit berikutnya
+jatuh ke scan RPC penuh berikut seluruh saringannya — token yang di web Krystal
+punya 20 pool cuma muncul 4 di bot, plus "78 pool disembunyikan" (kejadian nyata:
+BNBCAT di BSC). Sekarang ada satu retry, dan hasil kosong mengembalikan cache lama
+tanpa menimpanya.
+
+Karena dua jalur ini menghasilkan daftar yang panjangnya bisa jauh berbeda, UI
+**wajib menyebut `res["source"]`** — tanpa itu Krystal yang gagal sesaat terlihat
+seperti bot kehilangan pool.
+
 Kalau Krystal tidak punya token itu (pair aneh: RTX/NVDAB, HOUSE/BTCB) barulah discovery
 sendiri jalan — dengan seluruh saringannya. `res["source"]` menyebut jalur mana yang dipakai.
 

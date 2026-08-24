@@ -1458,13 +1458,26 @@ def krystal_raw(chain_id: int, token: str, _cache={}, ttl: int = 120) -> list:
     hit = _cache.get(key)
     if hit and time.time() - hit[1] < ttl:
         return hit[0]
-    try:
-        r = requests.get(_KRYSTAL_POOLS, timeout=8, headers={"accept": "application/json"},
-                         params={"chainId": chain_id, "tokenAddress": str(token).lower()})
-        out = r.json().get("result") or []
-        if not isinstance(out, list):
-            out = []
-    except Exception:
+    out = []
+    for attempt in range(2):    # sekali ulang: hiccup 1 request tidak boleh
+        try:                    # mematikan seluruh jalur Krystal
+            r = requests.get(_KRYSTAL_POOLS, timeout=8, headers={"accept": "application/json"},
+                             params={"chainId": chain_id, "tokenAddress": str(token).lower()})
+            got = r.json().get("result") or []
+            if isinstance(got, list) and got:
+                out = got
+                break
+        except Exception:
+            pass
+        if attempt == 0:
+            time.sleep(0.6)
+    if not out:
+        # JANGAN cache hasil kosong selama ttl penuh. Krystal bisa menjawab HTTP 200
+        # dengan payload error (result hilang) — dulu itu ikut di-cache 120 detik,
+        # sehingga SETIAP discovery dalam 2 menit berikutnya jatuh ke scan RPC penuh
+        # dengan seluruh saringannya. Gejalanya: token yang di web Krystal punya 20
+        # pool cuma muncul 4 di bot, plus "78 pool disembunyikan".
+        # Hasil lama (kalau ada) tetap dipakai; kalau tidak, kosong tanpa di-cache.
         return hit[0] if hit else []
     _cache[key] = (out, time.time())
     return out
