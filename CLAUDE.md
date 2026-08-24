@@ -384,6 +384,24 @@ paramnya `tokenAddress` bukan `search`. Tidak terdokumentasi di swagger publik;
 ditemukan dari bundel JS defi.krystal.app. Fragile — semua pemanggilnya harus tetap
 jalan kalau API-nya mati, dan angkanya tidak pernah jadi dasar membangun transaksi.
 
+### Tempel CA token chain mana pun: pemetaan token → chain
+
+`token_chains(token)` mengembalikan `[(chain_id, tvl_total)]` untuk chain yang ADA di
+`CHAINS`, urut TVL. Satu request saja: endpoint `top_pools` Krystal jalan **tanpa
+`chainId`** dan tiap entri membawa `chainId` sendiri — itu juga cara
+`defi.krystal.app/pools` bekerja (satu daftar lintas chain; filter chain di UI cuma
+menyempitkan, bukan syarat query).
+
+`on_address` memakainya sebelum discovery: token yang tidak ada di chain aktif
+memindahkan chain aktif (satu chain → otomatis, beberapa chain → tombol `chtok|`).
+Chain aktif memang ikut dipindah — bukan cuma dipakai untuk flow itu — supaya
+`/list`, `/wallet`, dan monitor tidak menunjuk chain lain daripada posisi yang baru
+dibuat.
+
+Kalau Krystal tidak kenal tokennya, `token_chains_onchain()` mengecek `eth_getCode`
+per chain sebagai petunjuk terakhir. Itu satu request per chain, jadi HANYA dipakai
+di jalur "tidak ada pool", tidak pernah di jalur normal.
+
 ### Krystal sebagai sumber utama daftar pool
 
 `discover_any()` mencoba `discover_krystal()` DULU (<1 detik, angkanya sama dengan yang

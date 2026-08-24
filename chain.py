@@ -1570,6 +1570,55 @@ def _v4_key_from_krystal(entry: dict, pool_id_hex: str) -> tuple | None:
     return None
 
 
+def token_chains(token: str, _cache={}, ttl: int = 180) -> list[tuple[int, float]]:
+    """Chain mana saja yang punya pool untuk token ini — [(chain_id, tvl_total)] urut TVL.
+
+    Endpoint `top_pools` Krystal jalan TANPA `chainId` dan tiap entri membawa
+    `chainId` sendiri, jadi satu request sudah cukup memetakan token ke chain.
+    Itulah cara defi.krystal.app/pools bekerja: satu daftar lintas chain, filter
+    chain cuma dipakai untuk menyempitkan.
+
+    Hanya chain yang ADA di CHAINS yang dikembalikan — token di chain yang tidak
+    didukung bot tidak ada gunanya ditawarkan. Kosong = Krystal tidak tahu token
+    ini (bukan berarti token tidak ada; caller harus tetap jalan tanpa hasil)."""
+    key = str(token).lower()
+    hit = _cache.get(key)
+    if hit and time.time() - hit[1] < ttl:
+        return hit[0]
+    tot: dict[int, float] = {}
+    try:
+        r = requests.get(_KRYSTAL_POOLS, timeout=8, headers={"accept": "application/json"},
+                         params={"tokenAddress": key})
+        for p in (r.json().get("result") or []):
+            try:
+                cid = int(p.get("chainId") or 0)
+            except (TypeError, ValueError):
+                continue
+            if cid in CHAINS:
+                tot[cid] = tot.get(cid, 0.0) + float(p.get("tvlUsd") or 0)
+    except Exception:
+        return hit[0] if hit else []
+    out = sorted(tot.items(), key=lambda kv: -kv[1])
+    if out:
+        _cache[key] = (out, time.time())
+    return out
+
+
+def token_chains_onchain(token: str) -> list[int]:
+    """Cadangan kalau Krystal tidak tahu token itu: cek kontraknya BENAR-BENAR ada
+    (punya bytecode) di tiap chain. Jauh lebih lambat daripada token_chains() karena
+    satu eth_getCode per chain, jadi dipakai hanya saat Krystal nihil."""
+    out = []
+    for cid in CHAINS:
+        try:
+            w3 = get_w3(cid)
+            if len(w3.eth.get_code(Web3.to_checksum_address(token))) > 2:
+                out.append(cid)
+        except Exception:
+            continue
+    return out
+
+
 def discover_krystal(chain_id: int, token: str) -> list[dict]:
     """Bangun daftar pool dari Krystal, TIAP POOL DIVERIFIKASI ON-CHAIN.
 

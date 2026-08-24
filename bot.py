@@ -773,9 +773,41 @@ async def on_address(update: Update, _):
     token = m.group(1)
     s = store.load_settings()
     cid = s["chain"]
+    status = await reply(update, "🔎 Mencari chain untuk token ini…")
+    # Token yang ditempel belum tentu di chain aktif. Krystal memetakan token→chain
+    # dalam SATU request: endpoint top_pools jalan tanpa `chainId` dan tiap entri
+    # membawa chainId sendiri — itu juga cara defi.krystal.app/pools bekerja.
+    try:
+        hits = await asyncio.to_thread(ch.token_chains, token)
+    except Exception:
+        hits = []
+    found = [c for c, _ in hits]
+    if found and cid not in found:
+        if len(found) == 1:
+            cid = found[0]
+            s["chain"] = cid
+            store.save_settings(s)
+            await edit(status, f"⛓ Token ini ada di <b>{esc(ch.CHAINS[cid]['name'])}</b> — "
+                               f"chain aktif dipindah ke sana.")
+        else:
+            # Beberapa chain → biar user yang pilih; jangan menebak pakai uang orang.
+            rows = [[InlineKeyboardButton(
+                f"{ch.CHAINS[c]['name']} · TVL {fmt_short(v)}", callback_data=f"chtok|{c}|{token}")]
+                for c, v in hits]
+            rows.append([InlineKeyboardButton("✖ Cancel", callback_data="cancel")])
+            await edit(status, (f"⛓ Token ini punya pool di <b>{len(found)} chain</b>. "
+                                f"Pilih yang mana:"), InlineKeyboardMarkup(rows))
+            return
+    await show_pools_for(status, cid, token)
+
+
+async def show_pools_for(status, cid: int, token: str):
+    """Discovery + daftar pool untuk (chain, token). Dipisah dari on_address supaya
+    tombol pilih-chain bisa memakai jalur yang sama persis."""
+    s = store.load_settings()
     cfg = ch.CHAINS[cid]
     amount_desc = f"amount {s['amount_fixed']} fix" if s["amount_fixed"] else f"amount {s['amount_pct']}%"
-    status = await reply(update, (
+    await edit(status, (
         f"⏳ Fetching {esc(ch.dex_name(cid))} {esc(ch.versions_label(cid))} pools "
         f"on {esc(cfg['name'])}...\n"
         f"(width {s['width_pct']:g}% · {esc(amount_desc)} · deposit auto)"))
@@ -790,8 +822,17 @@ async def on_address(update: Update, _):
 
     pools = res["pools"]
     if not pools:
+        # Krystal tidak tahu token ini (kalau tahu, chain-nya sudah dipindah di
+        # on_address). Cek kontraknya benar-benar ada di chain lain — satu
+        # eth_getCode per chain, cuma dibayar di jalur gagal ini.
+        others = [c for c in await asyncio.to_thread(ch.token_chains_onchain, token) if c != cid]
+        extra = ""
+        if others:
+            extra = ("\n\n<i>Kontrak ini juga ada di: "
+                     + ", ".join(esc(ch.CHAINS[c]["name"]) for c in others)
+                     + " — pindah dengan /chain lalu tempel lagi.</i>")
         await edit(status, f"❌ Tidak ada pool {esc(ch.versions_label(cid))} untuk "
-                           f"{esc(res['token']['symbol'])} di {esc(cfg['name'])}.")
+                           f"{esc(res['token']['symbol'])} di {esc(cfg['name'])}.{extra}")
         return
 
     top = pools[:10]
@@ -2400,6 +2441,16 @@ async def on_callback(update: Update, _):
         return
     if data.startswith("pos|"):
         await show_position(update, q.message, data.split("|", 1)[1])
+        return
+    if data.startswith("chtok|"):
+        # user memilih chain untuk token yang punya pool di beberapa chain
+        _, c, tok = data.split("|", 2)
+        cid2 = int(c)
+        st = store.load_settings()
+        st["chain"] = cid2
+        store.save_settings(st)
+        await q.edit_message_reply_markup(None)
+        await show_pools_for(q.message, cid2, tok)
         return
     if data.startswith("pool|"):
         # pilih pool → kartu konfirmasi (belum mint)
