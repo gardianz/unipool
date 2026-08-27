@@ -3139,6 +3139,25 @@ def ensure_approval(w3: Web3, pk: str, token_addr: str, spender: str, need_wei: 
     return [("approve", h)]
 
 
+def _recover_sent(w3: Web3, sent: list, steps: list, label: str):
+    """Cari tx yang ternyata SUKSES di antara percobaan yang dianggap gagal.
+
+    wait_ok/preflight bisa keliru menyimpulkan gagal padahal tx-nya sudah masuk
+    blok. Kalau itu dibiarkan, alur pemanggil melempar error dan posisi v4 yang
+    baru lahir tidak pernah didaftarkan — dan v4 tidak bisa dienumerasi on-chain,
+    jadi dananya hilang dari UI. Terjadi sungguhan (NFT 1026584, 171,97 USDG)."""
+    for hh in sent or []:
+        try:
+            r = w3.eth.get_transaction_receipt(hh)
+        except Exception:
+            continue
+        if r and r.status == 1:
+            steps.append((label, hh))
+            _step(f"✅ {label} ternyata SUKSES di {hh[:12]}… — dipulihkan")
+            return r
+    return None
+
+
 def approval_spenders(chain_id: int) -> list[tuple[str, str]]:
     """Semua kontrak yang PERNAH diberi approval oleh bot ini: [(label, alamat)].
 
@@ -5437,6 +5456,7 @@ def mint_v4(chain_id: int, pk: str, pool_info: dict, budget: float,
     # ---- Fase 2: mint (retry 3×, harga dibaca ulang tiap attempt) ----
     receipt = None
     last_err = None
+    sent: list[str] = []        # semua tx yang BENAR-BENAR terkirim, untuk pemulihan
     for attempt in range(3):
         sqrtp, cur_tick = v4_slot0(w3, chain_id, pid)
         tick_lower, tick_upper, now_mode = _range_of(
@@ -5475,9 +5495,11 @@ def mint_v4(chain_id: int, pk: str, pool_info: dict, budget: float,
         data = calldata(posm.functions.modifyLiquidities(
             _v4_unlock(actions, params), int(time.time()) + DEADLINE_SECS))
         tx = {"to": posm_addr, "data": data, "value": value}
+        h = None
         try:
             _preflight(w3, account.address, tx)
             h = send_tx(w3, pk, tx)
+            sent.append(h)
             receipt = wait_ok(w3, h, "mint v4")
             steps.append(("mint", h))
             break
@@ -5485,6 +5507,14 @@ def mint_v4(chain_id: int, pk: str, pool_info: dict, budget: float,
             last_err = e
             if attempt < 2:
                 time.sleep(2)
+    if receipt is None:
+        # Salah satu percobaan bisa saja SUKSES di chain walau wait_ok/preflight
+        # percobaan berikutnya gagal. Kalau itu terjadi dan kita tetap melempar
+        # error, posisi v4 yang baru lahir tidak pernah didaftarkan store.add_ref()
+        # — dan v4 TIDAK bisa dienumerasi on-chain, jadi dana itu hilang dari UI
+        # selamanya. Terjadi sungguhan: mint 0x34f14b15 sukses (NFT 1026584, 171,97
+        # USDG) tapi bot melapor "gagal 3×". Periksa dulu sebelum menyerah.
+        receipt = _recover_sent(w3, sent, steps, "mint")
     if receipt is None:
         raise RuntimeError(f"Mint v4 gagal 3× (harga bergerak?). Detail: {last_err}")
 
@@ -5731,6 +5761,7 @@ def increase_v4(chain_id: int, pk: str, tid: int, budget_quote: float,
 
     receipt = None
     last_err = None
+    sent: list[str] = []
     for attempt in range(3):
         sqrtp, _ = v4_slot0(w3, chain_id, pid)
         a0d, a1d = (meme_have, quote_dep) if q_is_t1 else (quote_dep, meme_have)
@@ -5760,6 +5791,7 @@ def increase_v4(chain_id: int, pk: str, tid: int, budget_quote: float,
         try:
             _preflight(w3, account.address, tx)
             h = send_tx(w3, pk, tx)
+            sent.append(h)
             receipt = wait_ok(w3, h, "increase v4")
             steps.append(("increase", h))
             break
@@ -5767,6 +5799,7 @@ def increase_v4(chain_id: int, pk: str, tid: int, budget_quote: float,
             last_err = e
             if attempt < 2:
                 time.sleep(2)
+    receipt = receipt or _recover_sent(w3, sent, steps, "increase")
     if receipt is None:
         raise RuntimeError(f"Add v4 gagal 3×. Detail: {last_err}")
 

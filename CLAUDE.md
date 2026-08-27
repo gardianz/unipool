@@ -282,6 +282,23 @@ juta gas ≈ 0,000045 ETH). AMAN tanpa syarat: `burn` di NPM me-require liquidit
 tokensOwed dua-duanya nol — posisi berisi ditolak kontraknya sendiri dengan
 `execution reverted: Not cleared` (sudah diuji terhadap posisi hidup).
 
+### Mint yang sukses tapi dilaporkan gagal = dana hilang dari UI
+
+`mint_v4`/`increase_v4` mencoba 3× dan menyerah kalau `wait_ok`/`_preflight` gagal.
+Tapi salah satu percobaan bisa SUDAH masuk blok dengan sukses sementara percobaan
+berikutnya revert — dan kalau alurnya tetap melempar error, `store.add_ref()` tidak
+pernah dipanggil. v4 **tidak bisa dienumerasi on-chain**, jadi posisi itu lenyap dari
+UI padahal uangnya di dalamnya.
+
+Terjadi sungguhan: rebalance microduck melapor *"Mint v4 gagal 3×"*, padahal tx
+`0x34f14b15…` sukses dan melahirkan NFT **1026584 berisi 171,97 USDG**. Urutannya
+terbaca jelas di explorer: close 22:16:25 → swap 22:16:26 → **mint OK 22:16:28** →
+mint error 22:16:31.
+
+`_recover_sent()` karena itu memeriksa receipt SEMUA tx yang benar-benar terkirim
+sebelum menyerah, dan memakai yang statusnya 1. Jangan hapus: tanpa itu satu
+kekeliruan pembacaan sama dengan kehilangan posisi.
+
 ### Registry posisi (kenapa `history.json` penting)
 
 Posisi v3 bisa dienumerasi on-chain (ERC721Enumerable), tapi **PositionManager v4 tidak
