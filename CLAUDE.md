@@ -685,6 +685,12 @@ v2/posm/UniversalRouter tiap DEX + Permit2), jadi DEX atau chain baru otomatis i
 jangan menuliskan alamat lagi di situ. `permit2` bisa tinggal di sub-dict DEX
 (BSC: hanya Uniswap yang punya v4), jadi dibaca dari level chain DAN dex.
 
+**Cakupannya sengaja sempit dan itu perlu disebut ke user.** Rabby menemukan SEMUA
+spender dengan membaca event `Approval`; di sini tidak bisa — getLogs rentang lebar
+ditolak hampir semua RPC publik (BSC/Base terukur maks 5.000 blok ≈ 2 jam). Jadi
+`scan_approvals()` cuma memeriksa spender yang ada di `CHAINS`, dan `/revoke 0xAlamat`
+menerima spender lain yang disodorkan user (`extra_spenders`).
+
 Token yang dipindai: quote tetap + quote runtime + ERC20 di wallet (`wallet_tokens`,
 butuh Alchemy). Sengaja tidak menyapu seluruh riwayat transfer — approval yang
 berbahaya adalah yang tokennya masih dipegang. Terukur: 4 approval aktif ditemukan

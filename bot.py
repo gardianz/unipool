@@ -289,6 +289,7 @@ HELP = (
     "/chain — ganti chain aktif\n"
     "/wallets — kelola wallet: impor/buat/ekspor/hapus\n"
     "/revoke — cabut approval token yang menganggur (keamanan)\n"
+    "  <code>/revoke 0xKontrak</code> — periksa kontrak di luar daftar bot\n"
     "/cleanup — burn NFT posisi kosong (mempercepat /list)\n\n"
     "<b>Custom saat kartu konfirmasi aktif:</b>\n"
     "<code>r 40 120</code> — range −40%/+120%\n"
@@ -1472,7 +1473,13 @@ async def handle_awaiting(update: Update) -> bool:
                                   callback_data=f"addok|{tid}|{val:g}|{'p' if is_pct else 'f'}")],
             [InlineKeyboardButton("❌ Cancel", callback_data="cancel")],
         ])
-        await reply(update, f"Konfirmasi tambah dana ke posisi {disp_pid(tid)}:", kb)
+        msg = await reply(update, "⏳ Menghitung detail…")
+        cid = store.load_settings()["chain"]
+        try:
+            txt = await asyncio.to_thread(add_confirm_text, cid, tid, val, is_pct)
+        except Exception:
+            txt = f"Konfirmasi tambah dana ke posisi {disp_pid(tid)}:"
+        await edit(msg, txt, kb)
         return True
     if st["kind"] == "order":
         pid = st["key"]
@@ -1776,6 +1783,79 @@ def _pos_metrics(cid: int, p: dict) -> dict:
         "pnl": pnl, "pnl_pct": pnl_pct, "apr": apr, "earned": earned,
         "age": store.fmt_age(mts),
     }
+
+
+def add_confirm_text(cid: int, pid: str, val: float, is_pct: bool) -> str:
+    """Kartu konfirmasi ADD yang benar-benar memberi tahu apa yang akan terjadi.
+
+    Dipanggil di thread — semua isinya baca on-chain. Sebelumnya kartu ini cuma
+    menulis "Konfirmasi tambah dana ke posisi X", jadi user menyetujui tanpa tahu
+    pool mana, berapa yang benar-benar masuk, dan komposisinya jadi apa."""
+    s = store.load_settings()
+    p = next((x for x in list_positions_all(cid) if x["pid"] == str(pid)), None)
+    if not p:
+        return f"Konfirmasi tambah dana ke posisi {disp_pid(pid)}:"
+    ver = p.get("ver", 3)
+    w3 = ch.get_w3(cid)
+    quote = p["token1"] if p["quote_is_token1"] else p["token0"]
+    qsym = p.get("quote_sym") or "quote"
+    try:
+        qdec = ch._v4_currency_info(w3, cid, quote)["decimals"] if ver == 4 \
+            else ch.token_info(w3, quote)["decimals"]
+        qusd = ch.quote_usd_price(w3, cid, qsym)
+    except Exception:
+        qdec, qusd = 18, 0.0
+
+    # jumlah yang benar-benar akan dipakai: persen dihitung dari modal yang bisa diambil
+    amt = val
+    if is_pct:
+        try:
+            # compute_amount butuh bentuk pool_info discovery (quote_addr/quote_decimals),
+            # sedangkan dict posisi memakai token0/token1 + quote_is_token1
+            amt = compute_amount({"chain": cid, "mode": "lower",
+                                  "amount_pct": val, "amount_fixed": 0,
+                                  "pool_info": {"quote_addr": quote, "quote_sym": qsym,
+                                                "quote_decimals": qdec, "ver": ver,
+                                                "pool": p.get("pool")}})
+        except Exception:
+            amt = None
+    lines = [f"➕ <b>Konfirmasi tambah dana</b> — {esc(p.get('sym0') if p['quote_is_token1'] else p.get('sym1'))} "
+             f"{_pos_disp(p)}", "", _pool_info_line(cid, p, ver)]
+    if ver != 2:
+        lines.append(f"📊 Range: {esc(range_str(p))} · "
+                     f"{'🟢 IN range' if p['in_range'] else '🔴 OUT of range'}")
+    lines.append(f"💼 Posisi sekarang <b>{ch.fmt_usd(p['value_usd'])}</b>")
+    lines.append("")
+    if amt is None:
+        lines.append(f"Akan ditambah: <b>{val:g}% saldo</b> <i>(jumlah dihitung saat eksekusi)</i>")
+    else:
+        lines.append(f"Akan ditambah: <b>{ch.fmt_amount(amt)} {esc(qsym)}</b>"
+                     + (f" (~{ch.fmt_usd(amt * qusd)})" if qusd else ""))
+    # komposisi: berapa yang ditahan sebagai quote vs ditukar jadi meme
+    try:
+        if ver != 2 and amt:
+            sqrtp = (ch.v4_slot0(w3, cid, p["pool_id"])[0] if ver == 4
+                     else w3.eth.contract(address=ch.Web3.to_checksum_address(p["pool"]),
+                                          abi=ch.POOL_ABI).functions.slot0().call()[0])
+            keep, swap = ch.plan_two_sided(sqrtp, p["tick_lower"], p["tick_upper"],
+                                           int(amt * 10 ** qdec), p["quote_is_token1"])
+            tot = keep + swap
+            if tot > 0:
+                msym = p["sym0"] if p["quote_is_token1"] else p["sym1"]
+                lines.append(f"Komposisi otomatis: ~{keep / tot * 100:.0f}% {esc(qsym)} + "
+                             f"~{swap / tot * 100:.0f}% {esc(msym)} "
+                             f"<i>(meme dibeli otomatis; yang sudah di wallet dipakai duluan)</i>")
+    except Exception:
+        pass
+    if amt and qusd:
+        lines.append(f"Perkiraan sesudahnya: <b>{ch.fmt_usd(p['value_usd'] + amt * qusd)}</b>")
+    if ver == 4 and p.get("unclaimed_usd"):
+        # v4 mengkreditkan feesAccrued ke tagihan SETTLE_PAIR — lihat CLAUDE.md
+        lines.append(f"♻️ Fee unclaimed {ch.fmt_usd(p['unclaimed_usd'])} ikut jadi modal "
+                     f"(tidak keluar ke wallet)")
+    lines.append("")
+    lines.append(f"<i>Slippage {s['slippage_pct']:g}% · deadline 20 menit</i>")
+    return "\n".join(lines)
 
 
 def _pool_info_line(cid: int, p: dict, ver: int) -> str:
@@ -3027,7 +3107,7 @@ def _revoke_line(i: int, r: dict) -> str:
     return f"{i}. {tag} · <b>{esc(r['symbol'])}</b> → {esc(r['spender_label'])}\n     jumlah {amt}"
 
 
-async def cmd_revoke(update: Update, _):
+async def cmd_revoke(update: Update, ctx=None):
     """Daftar approval aktif + tombol mencabutnya.
 
     Bot memberi approval TAK TERBATAS ke router/NPM saat mint & swap (standar, biar
@@ -3039,8 +3119,11 @@ async def cmd_revoke(update: Update, _):
     s = store.load_settings()
     cid = s["chain"]
     status = await reply(update, f"🔎 Memindai approval di {esc(ch.CHAINS[cid]['name'])}…")
+    # /revoke <alamat> — periksa kontrak di luar daftar bot (mis. yang kamu lihat
+    # di Rabby tapi tidak pernah dipakai bot ini)
+    extra = [a for a in (getattr(ctx, "args", None) or []) if ADDR_RE.fullmatch(a.strip())]
     try:
-        rows = await asyncio.to_thread(ch.scan_approvals, cid, pk())
+        rows = await asyncio.to_thread(ch.scan_approvals, cid, pk(), None, extra)
     except Exception as e:
         await edit(status, f"❌ Gagal memindai: {esc(e)}")
         return
@@ -3070,6 +3153,8 @@ async def cmd_revoke(update: Update, _):
     await edit(status, (
         f"🔐 <b>{len(rows)} approval aktif</b> · {wallet_label()} · "
         f"{esc(ch.CHAINS[cid]['name'])}\n\n{body}\n\n"
+        f"<i>Tip: <code>/revoke 0xKontrak</code> untuk memeriksa kontrak di luar daftar bot "
+        f"(mis. yang muncul di Rabby).</i>\n"
         f"<i>Approval TAK TERBATAS artinya kontrak itu boleh memindahkan token tersebut "
         f"kapan saja tanpa persetujuan lagi. Mencabutnya aman — bot akan minta approval "
         f"lagi sendiri saat kamu mint/swap berikutnya.</i>"

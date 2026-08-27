@@ -3187,7 +3187,8 @@ def _revoke_token_candidates(w3: Web3, chain_id: int, addr: str) -> list[str]:
     return list(out.values())
 
 
-def scan_approvals(chain_id: int, pk: str, extra_tokens: list[str] | None = None) -> list[dict]:
+def scan_approvals(chain_id: int, pk: str, extra_tokens: list[str] | None = None,
+                   extra_spenders: list[str] | None = None) -> list[dict]:
     """Approval aktif wallet ini terhadap kontrak-kontrak bot. Read-only.
 
     Dua jenis dilaporkan terpisah karena cara mencabutnya beda:
@@ -3200,6 +3201,16 @@ def scan_approvals(chain_id: int, pk: str, extra_tokens: list[str] | None = None
     me = account.address
     cfg = CHAINS[chain_id]
     spenders = approval_spenders(chain_id)
+    # Spender di luar daftar bot (mis. hasil approve lewat website lain) — Rabby
+    # menemukannya dengan membaca event Approval; di sini user yang menyodorkan
+    # alamatnya, karena getLogs rentang lebar ditolak hampir semua RPC publik.
+    for sp in (extra_spenders or []):
+        try:
+            a = Web3.to_checksum_address(sp)
+            if a.lower() not in {x.lower() for _, x in spenders}:
+                spenders.append((f"kontrak lain {a[:8]}…", a))
+        except Exception:
+            continue
     tokens = _revoke_token_candidates(w3, chain_id, me)
     for t in (extra_tokens or []):
         try:
