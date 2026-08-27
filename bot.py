@@ -275,7 +275,8 @@ def range_str(p: dict) -> str:
 # ---------- Commands & menu utama ----------
 HELP = (
     "<b>unipool — LP concentrated liquidity</b>\n"
-    "<i>Uniswap v2/v3/v4 di Robinhood · PancakeSwap v2/v3 di BSC</i>\n\n"
+    "<i>Uniswap v2/v3/v4 di Robinhood &amp; Base · PancakeSwap+Uniswap di BSC · "
+    "HyperSwap di HyperEVM</i>\n\n"
     "Paste alamat token (0x...) → bot cari pool → pilih → atur strategi → mint.\n"
     "/start membuka menu utama (dashboard saldo + tombol navigasi).\n\n"
     "<b>Perintah:</b>\n"
@@ -285,7 +286,10 @@ HELP = (
     "/wallet — saldo semua token + nilai USD\n"
     "/settings — pengaturan via tombol\n"
     "/set <code>key value</code> — set manual (width, amount, amount_pct, slippage, gap, alert, autoswap)\n"
-    "/chain — ganti chain aktif\n\n"
+    "/chain — ganti chain aktif\n"
+    "/wallets — kelola wallet: impor/buat/ekspor/hapus\n"
+    "/revoke — cabut approval token yang menganggur (keamanan)\n"
+    "/cleanup — burn NFT posisi kosong (mempercepat /list)\n\n"
     "<b>Custom saat kartu konfirmasi aktif:</b>\n"
     "<code>r 40 120</code> — range −40%/+120%\n"
     "<code>a 30%</code> / <code>a 0.005</code> — amount"
@@ -305,6 +309,10 @@ def menu_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("👛 Dompet", callback_data="menu|wallet"),
          InlineKeyboardButton("🔑 Wallet", callback_data="menu|wallets"),
          InlineKeyboardButton("⚙️ Pengaturan", callback_data="menu|settings")],
+        # Perawatan: dua-duanya sebelumnya cuma bisa lewat perintah ketik dan
+        # praktis tak terlihat dari menu.
+        [InlineKeyboardButton("🔐 Revoke", callback_data="menu|revoke"),
+         InlineKeyboardButton("🧹 Cleanup NFT", callback_data="menu|cleanup")],
         [InlineKeyboardButton("⛓ Chain", callback_data="menu|chain"),
          InlineKeyboardButton("❓ Bantuan", callback_data="menu|help")],
         [InlineKeyboardButton("🔄 Segarkan", callback_data="menu|main")],
@@ -2414,6 +2422,12 @@ async def on_callback(update: Update, _):
     if data == "menu|chain":
         await edit(q.message, "⛓ <b>Pilih chain aktif:</b>", chain_kb())
         return
+    if data == "menu|revoke":
+        await cmd_revoke(update, None)
+        return
+    if data == "menu|cleanup":
+        await cmd_cleanup(update, None)
+        return
     if data == "menu|help":
         await edit(q.message, HELP, InlineKeyboardMarkup([BACK_ROW]))
         return
@@ -2946,6 +2960,8 @@ async def post_init(app):
             BotCommand("wallets", "Kelola wallet: impor/buat/ekspor/hapus"),
             BotCommand("settings", "Pengaturan via tombol"),
             BotCommand("chain", "Ganti chain aktif"),
+            BotCommand("revoke", "Cabut approval token yang menganggur"),
+            BotCommand("cleanup", "Burn NFT posisi kosong (mempercepat /list)"),
             BotCommand("help", "Bantuan & daftar perintah"),
         ])
     except Exception as e:
