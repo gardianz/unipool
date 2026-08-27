@@ -3048,6 +3048,17 @@ async def cmd_revoke(update: Update, _):
         await edit(status, (f"✅ Tidak ada approval aktif di "
                             f"{esc(ch.CHAINS[cid]['name'])} untuk {wallet_label()}."), NAV_KB)
         return
+    # Approval yang dikunci kontrak tokennya tidak bisa dicabut — pisahkan supaya
+    # tidak ada tombol yang dijamin gagal.
+    fixed = [r for r in rows if r.get("fixed")]
+    rows = [r for r in rows if not r.get("fixed")]
+    if not rows:
+        note = (f"\n\n<i>{len(fixed)} allowance Permit2 ({', '.join(esc(r['symbol']) for r in fixed[:6])}) "
+                f"dikunci di tak terhingga oleh kontrak tokennya sendiri — bukan approval "
+                f"yang kamu berikan, dan tidak bisa dicabut.</i>" if fixed else "")
+        await edit(status, (f"✅ Tidak ada approval yang bisa dicabut di "
+                            f"{esc(ch.CHAINS[cid]['name'])} untuk {wallet_label()}.{note}"), NAV_KB)
+        return
     key = uuid.uuid4().hex[:8]
     REVOKES[key] = {"chain": cid, "rows": rows}
     body = "\n".join(_revoke_line(i, r) for i, r in enumerate(rows[:10], 1))
@@ -3061,7 +3072,11 @@ async def cmd_revoke(update: Update, _):
         f"{esc(ch.CHAINS[cid]['name'])}\n\n{body}\n\n"
         f"<i>Approval TAK TERBATAS artinya kontrak itu boleh memindahkan token tersebut "
         f"kapan saja tanpa persetujuan lagi. Mencabutnya aman — bot akan minta approval "
-        f"lagi sendiri saat kamu mint/swap berikutnya.</i>"), InlineKeyboardMarkup(btns))
+        f"lagi sendiri saat kamu mint/swap berikutnya.</i>"
+        + (f"\n<i>🔒 {len(fixed)} allowance Permit2 dilewati "
+           f"({', '.join(esc(r['symbol']) for r in fixed[:6])}) — dikunci di tak terhingga "
+           f"oleh kontrak tokennya, bukan approval yang kamu berikan, dan mustahil dicabut.</i>"
+           if fixed else "")), InlineKeyboardMarkup(btns))
 
 
 async def do_revoke(update: Update, key: str, idx: int | None):

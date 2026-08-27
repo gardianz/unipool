@@ -3224,12 +3224,32 @@ def scan_approvals(chain_id: int, pk: str, extra_tokens: list[str] | None = None
             for lb, sp in p2_spenders:
                 jobs.append(("permit2", tok, lb, sp))
 
+    def _permit2_fixed(tok: str) -> bool:
+        """True kalau kontrak tokennya MENGUNCI allowance Permit2 di tak terhingga.
+
+        Pola ERC20 Solady `_givePermit2InfiniteAllowance()`: `allowance(owner, Permit2)`
+        di-hardcode `type(uint256).max` (bukan approval tersimpan) dan `approve(Permit2, …)`
+        sengaja revert `Permit2AllowanceIsFixedAtInfinity()` (0x3f68539a). Approval
+        semacam itu tidak pernah diberikan user dan MUSTAHIL dicabut — melaporkannya
+        sebagai "approval aktif" cuma menakut-nakuti dan tombol cabutnya pasti gagal."""
+        try:
+            w3.eth.call({"from": me, "to": Web3.to_checksum_address(tok),
+                         "data": calldata(erc20(w3, tok).functions.approve(p2_addr, 0))})
+            return False
+        except Exception:
+            return True
+
     def probe(j):
         kind, tok, lb, sp = j
         try:
             if kind == "erc20":
                 amt = erc20(w3, tok).functions.allowance(me, sp).call()
                 exp = 0
+                if amt > 0 and p2_addr and sp.lower() == p2_addr.lower() and _permit2_fixed(tok):
+                    info = token_info(w3, tok)
+                    return {"kind": "erc20", "token": tok, "symbol": info["symbol"],
+                            "decimals": info["decimals"], "spender": sp, "spender_label": lb,
+                            "amount": amt, "expiry": 0, "unlimited": True, "fixed": True}
             else:
                 amt, exp, _ = p2.functions.allowance(me, tok, sp).call()
                 if exp and exp < time.time():
@@ -3239,7 +3259,7 @@ def scan_approvals(chain_id: int, pk: str, extra_tokens: list[str] | None = None
             info = token_info(w3, tok)
             return {"kind": kind, "token": tok, "symbol": info["symbol"],
                     "decimals": info["decimals"], "spender": sp, "spender_label": lb,
-                    "amount": amt, "expiry": exp,
+                    "amount": amt, "expiry": exp, "fixed": False,
                     "unlimited": amt >= 2 ** 160 - 1}
         except Exception:
             return None
@@ -3249,8 +3269,8 @@ def scan_approvals(chain_id: int, pk: str, extra_tokens: list[str] | None = None
         for r in ex.map(probe, jobs):
             if r:
                 out.append(r)
-    # tak terbatas duluan — itu yang paling berisiko
-    out.sort(key=lambda r: (not r["unlimited"], r["symbol"]))
+    # yang bisa dicabut duluan, tak terbatas di atas — itu yang paling berisiko
+    out.sort(key=lambda r: (r.get("fixed", False), not r["unlimited"], r["symbol"]))
     return out
 
 

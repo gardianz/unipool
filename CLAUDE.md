@@ -690,6 +690,18 @@ butuh Alchemy). Sengaja tidak menyapu seluruh riwayat transfer — approval yang
 berbahaya adalah yang tokennya masih dipegang. Terukur: 4 approval aktif ditemukan
 di 1,6 detik, gas cabut 31k–42k (~0,000001 ETH per approval).
 
+**Allowance Permit2 yang dikunci kontrak token tidak boleh dilaporkan.** ERC20 gaya
+Solady dengan `_givePermit2InfiniteAllowance()` meng-hardcode
+`allowance(owner, Permit2) == type(uint256).max` — itu BUKAN approval yang user
+berikan — dan `approve(Permit2, …)` sengaja revert
+`Permit2AllowanceIsFixedAtInfinity()` (selector `0x3f68539a`). Terukur di Robinhood:
+FRONG/Liluni/POOLS bytecode-nya identik 7154 byte dan `approve` ke Permit2 gagal
+untuk jumlah berapa pun, sedangkan ke NPM/router/alamat acak lolos.
+
+`scan_approvals()` mendeteksinya dengan menyimulasikan `approve(permit2, 0)` dan
+menandai `fixed=True`; UI memisahkannya dari daftar bertombol supaya tidak ada
+tombol yang dijamin gagal, tapi tetap menyebutkannya.
+
 Mencabut aman: bot minta approval lagi sendiri saat mint/swap berikutnya.
 
 ### Wallet: .env + brankas
