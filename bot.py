@@ -2446,6 +2446,15 @@ async def on_callback(update: Update, _):
     if data.startswith("pos|"):
         await show_position(update, q.message, data.split("|", 1)[1])
         return
+    if data.startswith("rvk|"):
+        _, k, i = data.split("|", 2)
+        await q.edit_message_reply_markup(None)
+        await do_revoke(update, k, int(i))
+        return
+    if data.startswith("rvkall|"):
+        await q.edit_message_reply_markup(None)
+        await do_revoke(update, data.split("|", 1)[1], None)
+        return
     if data.startswith("chtok|"):
         # user memilih chain untuk token yang punya pool di beberapa chain
         _, c, tok = data.split("|", 2)
@@ -2990,6 +2999,88 @@ async def do_cleanup(update: Update):
     await edit(status, "\n".join(lines), NAV_KB)
 
 
+# Hasil scan approval per chat, supaya tombol tidak perlu membawa alamat panjang
+# (callback_data Telegram dibatasi 64 byte).
+REVOKES: dict[str, dict] = {}
+
+
+def _revoke_line(i: int, r: dict) -> str:
+    amt = ("<b>TAK TERBATAS</b>" if r["unlimited"]
+           else f"{r['amount'] / 10 ** r['decimals']:,.4f}")
+    tag = "🔑 Permit2" if r["kind"] == "permit2" else "📝 ERC20"
+    return f"{i}. {tag} · <b>{esc(r['symbol'])}</b> → {esc(r['spender_label'])}\n     jumlah {amt}"
+
+
+async def cmd_revoke(update: Update, _):
+    """Daftar approval aktif + tombol mencabutnya.
+
+    Bot memberi approval TAK TERBATAS ke router/NPM saat mint & swap (standar, biar
+    tidak bayar gas approve tiap transaksi). Selama approval itu hidup, kontrak
+    tersebut bisa memindahkan token itu kapan saja — jadi mencabutnya setelah
+    selesai LP itu kebersihan yang wajar."""
+    if not authorized(update):
+        return
+    s = store.load_settings()
+    cid = s["chain"]
+    status = await reply(update, f"🔎 Memindai approval di {esc(ch.CHAINS[cid]['name'])}…")
+    try:
+        rows = await asyncio.to_thread(ch.scan_approvals, cid, pk())
+    except Exception as e:
+        await edit(status, f"❌ Gagal memindai: {esc(e)}")
+        return
+    if not rows:
+        await edit(status, (f"✅ Tidak ada approval aktif di "
+                            f"{esc(ch.CHAINS[cid]['name'])} untuk {wallet_label()}."), NAV_KB)
+        return
+    key = uuid.uuid4().hex[:8]
+    REVOKES[key] = {"chain": cid, "rows": rows}
+    body = "\n".join(_revoke_line(i, r) for i, r in enumerate(rows[:10], 1))
+    btns = [[InlineKeyboardButton(f"{i}. {r['symbol']} → {r['spender_label'][:22]}",
+                                  callback_data=f"rvk|{key}|{i - 1}")]
+            for i, r in enumerate(rows[:10], 1)]
+    btns.append([InlineKeyboardButton(f"🧹 Cabut SEMUA ({len(rows)})", callback_data=f"rvkall|{key}")])
+    btns.append([InlineKeyboardButton("✖ Cancel", callback_data="cancel")])
+    await edit(status, (
+        f"🔐 <b>{len(rows)} approval aktif</b> · {wallet_label()} · "
+        f"{esc(ch.CHAINS[cid]['name'])}\n\n{body}\n\n"
+        f"<i>Approval TAK TERBATAS artinya kontrak itu boleh memindahkan token tersebut "
+        f"kapan saja tanpa persetujuan lagi. Mencabutnya aman — bot akan minta approval "
+        f"lagi sendiri saat kamu mint/swap berikutnya.</i>"), InlineKeyboardMarkup(btns))
+
+
+async def do_revoke(update: Update, key: str, idx: int | None):
+    ctx = REVOKES.get(key)
+    if not ctx:
+        await reply(update, "⚠️ Daftar kadaluarsa (bot sempat restart). Jalankan /revoke lagi.")
+        return
+    cid = ctx["chain"]
+    items = ctx["rows"] if idx is None else [ctx["rows"][idx]]
+    head = f"⏳ Mencabut {len(items)} approval…"
+    status = await reply(update, head)
+
+    def work():
+        done, fail = [], []
+        for it in items:
+            try:
+                done.append((it, ch.revoke_approval(cid, pk(), it)))
+            except Exception as e:
+                fail.append((it, str(e)[:90]))
+        return done, fail
+
+    async with TX_LOCK:
+        try:
+            done, fail = await with_progress(status, head, work)
+        except Exception as e:
+            await edit(status, f"❌ Revoke gagal: {esc(e)}")
+            return
+    lines = [f"✅ <b>{len(done)} approval dicabut</b>"]
+    for it, h in done:
+        lines.append(f"· {esc(it['symbol'])} → {esc(it['spender_label'])}: {ch.tx_link(cid, h)}")
+    for it, err in fail:
+        lines.append(f"❌ {esc(it['symbol'])} → {esc(it['spender_label'])}: {esc(err)}")
+    await edit(status, "\n".join(lines), NAV_KB)
+
+
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
     from telegram.error import BadRequest, NetworkError
     # BadRequest HARUS dicek duluan: di PTB ia turunan NetworkError, jadi cabang di
@@ -3045,6 +3136,7 @@ def main():
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("orders", cmd_orders))
     app.add_handler(CommandHandler("cleanup", cmd_cleanup))
+    app.add_handler(CommandHandler("revoke", cmd_revoke))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_address))
     app.add_error_handler(on_error)

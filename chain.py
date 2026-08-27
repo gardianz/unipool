@@ -3139,6 +3139,144 @@ def ensure_approval(w3: Web3, pk: str, token_addr: str, spender: str, need_wei: 
     return [("approve", h)]
 
 
+def approval_spenders(chain_id: int) -> list[tuple[str, str]]:
+    """Semua kontrak yang PERNAH diberi approval oleh bot ini: [(label, alamat)].
+
+    Diambil dari dict chain supaya otomatis ikut kalau ada DEX/chain baru — jangan
+    menuliskan alamat lagi di sini."""
+    out, seen = [], set()
+
+    def add(label, addr):
+        if not addr:
+            return
+        a = Web3.to_checksum_address(addr)
+        if a.lower() not in seen:
+            seen.add(a.lower())
+            out.append((label, a))
+
+    for dname in dex_names(chain_id):
+        c = dex_cfg(chain_id, dname)
+        add(f"{dname} NPM (v3)", c.get("npm"))
+        add(f"{dname} router (v3)", c.get("router"))
+        add(f"{dname} router (v2)", c.get("v2_router"))
+        add(f"{dname} PositionManager (v4)", c.get("v4_posm"))
+        add(f"{dname} UniversalRouter (v4)", c.get("v4_router"))
+        # permit2 bisa tinggal di sub-dict DEX (BSC: cuma Uniswap yang punya v4),
+        # bukan di level chain — ambil dari dua-duanya
+        add("Permit2", c.get("permit2"))
+    add("Permit2", CHAINS[chain_id].get("permit2"))
+    return out
+
+
+def _revoke_token_candidates(w3: Web3, chain_id: int, addr: str) -> list[str]:
+    """Token yang masuk akal dicek approval-nya: quote tetap + quote runtime +
+    kedua sisi tiap posisi + token ERC20 di wallet (butuh Alchemy).
+
+    Sengaja tidak menyapu seluruh riwayat transfer: approval yang berbahaya adalah
+    yang tokennya masih kamu pegang atau masih dipakai posisi."""
+    cfg = CHAINS[chain_id]
+    out = {}
+    for a in list(cfg["quotes"].values()) + list(_EXTRA_QUOTES.get(chain_id, {}).values()):
+        out[Web3.to_checksum_address(a).lower()] = Web3.to_checksum_address(a)
+    try:
+        for t in wallet_tokens(chain_id, addr):
+            a = Web3.to_checksum_address(t["address"])
+            out[a.lower()] = a
+    except Exception:
+        pass
+    return list(out.values())
+
+
+def scan_approvals(chain_id: int, pk: str, extra_tokens: list[str] | None = None) -> list[dict]:
+    """Approval aktif wallet ini terhadap kontrak-kontrak bot. Read-only.
+
+    Dua jenis dilaporkan terpisah karena cara mencabutnya beda:
+      - `erc20`   : allowance(token → spender), dicabut dengan approve(spender, 0)
+      - `permit2` : allowance Permit2 (jumlah + kedaluwarsa), dicabut dengan
+                    permit2.approve(token, spender, 0, 0)
+    """
+    w3 = get_w3(chain_id)
+    account = w3.eth.account.from_key(pk)
+    me = account.address
+    cfg = CHAINS[chain_id]
+    spenders = approval_spenders(chain_id)
+    tokens = _revoke_token_candidates(w3, chain_id, me)
+    for t in (extra_tokens or []):
+        try:
+            a = Web3.to_checksum_address(t)
+            if a not in tokens:
+                tokens.append(a)
+        except Exception:
+            continue
+    p2raw = cfg.get("permit2") or next(
+        (dex_cfg(chain_id, d).get("permit2") for d in dex_names(chain_id)
+         if dex_cfg(chain_id, d).get("permit2")), None)
+    p2_addr = Web3.to_checksum_address(p2raw) if p2raw else None
+    p2 = w3.eth.contract(address=p2_addr, abi=PERMIT2_ABI) if p2_addr else None
+    # spender yang diberi kuasa LEWAT Permit2 (posm & UniversalRouter v4)
+    p2_spenders = [(lb, ad) for lb, ad in spenders if "v4" in lb]
+
+    jobs = []
+    for tok in tokens:
+        for lb, sp in spenders:
+            jobs.append(("erc20", tok, lb, sp))
+        if p2:
+            for lb, sp in p2_spenders:
+                jobs.append(("permit2", tok, lb, sp))
+
+    def probe(j):
+        kind, tok, lb, sp = j
+        try:
+            if kind == "erc20":
+                amt = erc20(w3, tok).functions.allowance(me, sp).call()
+                exp = 0
+            else:
+                amt, exp, _ = p2.functions.allowance(me, tok, sp).call()
+                if exp and exp < time.time():
+                    return None          # sudah kedaluwarsa — tidak berbahaya
+            if amt <= 0:
+                return None
+            info = token_info(w3, tok)
+            return {"kind": kind, "token": tok, "symbol": info["symbol"],
+                    "decimals": info["decimals"], "spender": sp, "spender_label": lb,
+                    "amount": amt, "expiry": exp,
+                    "unlimited": amt >= 2 ** 160 - 1}
+        except Exception:
+            return None
+
+    out = []
+    with ThreadPoolExecutor(max_workers=12) as ex:
+        for r in ex.map(probe, jobs):
+            if r:
+                out.append(r)
+    # tak terbatas duluan — itu yang paling berisiko
+    out.sort(key=lambda r: (not r["unlimited"], r["symbol"]))
+    return out
+
+
+def revoke_approval(chain_id: int, pk: str, item: dict) -> str:
+    """Cabut satu approval. Return txhash.
+
+    ERC20 → approve(spender, 0). Permit2 → approve(token, spender, 0, 0); jumlah 0
+    membuat spender tidak bisa menarik apa pun walau kedaluwarsanya belum lewat."""
+    w3 = get_w3(chain_id)
+    tok = Web3.to_checksum_address(item["token"])
+    sp = Web3.to_checksum_address(item["spender"])
+    if item["kind"] == "permit2":
+        p2raw = CHAINS[chain_id].get("permit2") or next(
+            (dex_cfg(chain_id, d).get("permit2") for d in dex_names(chain_id)
+             if dex_cfg(chain_id, d).get("permit2")), None)
+        p2_addr = Web3.to_checksum_address(p2raw)
+        p2 = w3.eth.contract(address=p2_addr, abi=PERMIT2_ABI)
+        tx = {"to": p2_addr, "data": calldata(p2.functions.approve(tok, sp, 0, 0))}
+    else:
+        tx = {"to": tok, "data": calldata(erc20(w3, tok).functions.approve(sp, 0))}
+    _preflight(w3, w3.eth.account.from_key(pk).address, tx)
+    h = send_tx(w3, pk, tx)
+    wait_ok(w3, h, f"revoke {item['symbol']} → {item['spender_label']}")
+    return h
+
+
 def plan_two_sided(sqrtp_x96: int, tick_lower: int, tick_upper: int,
                    budget_quote_wei: int, quote_is_token1: bool) -> tuple[int, int]:
     """Bagi budget quote jadi (quote_keep_wei, quote_to_swap_wei) supaya rasio

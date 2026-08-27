@@ -668,6 +668,30 @@ Ada bypass khusus blokir DNS ISP Indonesia: resolve via DNS-over-HTTPS lalu kone
 langsung dengan SNI dipertahankan (`_SNIAdapter`, `_forced_ip_w3`) — sertifikat tetap
 diverifikasi, jangan dilonggarkan.
 
+### Revoke approval
+
+Bot memberi approval **tak terbatas** ke router/NPM saat mint & swap (`ensure_approval`
+memakai `MAX_UINT256`) supaya tidak membayar gas approve tiap transaksi. Selama
+approval itu hidup, kontrak tersebut boleh memindahkan token itu kapan saja.
+
+`/revoke` → `scan_approvals()` → `revoke_approval()`. Dua jenis, cara mencabutnya beda:
+
+- **ERC20** — `approve(spender, 0)`.
+- **Permit2** — `permit2.approve(token, spender, 0, 0)`. Jumlah 0 melumpuhkan spender
+  walau kedaluwarsanya belum lewat. Permit2 yang SUDAH kedaluwarsa tidak dilaporkan.
+
+`approval_spenders()` menyusun daftar spender dari dict chain (NPM/router v3/router
+v2/posm/UniversalRouter tiap DEX + Permit2), jadi DEX atau chain baru otomatis ikut —
+jangan menuliskan alamat lagi di situ. `permit2` bisa tinggal di sub-dict DEX
+(BSC: hanya Uniswap yang punya v4), jadi dibaca dari level chain DAN dex.
+
+Token yang dipindai: quote tetap + quote runtime + ERC20 di wallet (`wallet_tokens`,
+butuh Alchemy). Sengaja tidak menyapu seluruh riwayat transfer — approval yang
+berbahaya adalah yang tokennya masih dipegang. Terukur: 4 approval aktif ditemukan
+di 1,6 detik, gas cabut 31k–42k (~0,000001 ETH per approval).
+
+Mencabut aman: bot minta approval lagi sendiri saat mint/swap berikutnya.
+
 ### Wallet: .env + brankas
 
 `all_pks()` = wallet `.env` (urutannya TETAP, supaya arti "W1" tidak bergeser) lalu
