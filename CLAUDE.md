@@ -268,11 +268,18 @@ untuk alur 2 tx).
 `rebalance_position(..., target_pool=dict)` menutup posisi di pool lama lalu mint di
 pool itu (mis. fee tier 5% → 2%). Dua penjagaan WAJIB, jangan dilemahkan:
 
-- **Quote harus sama.** Kalau beda, dananya perlu ditukar dulu — jalur tersendiri,
-  dan kalau gagal di tengah user sudah terlanjur close. Ditolak SEBELUM ada tx apa
-  pun yang menyentuh pool tujuan; UI juga menolaknya lebih awal.
+- **Token meme harus sama.** Kalau beda, itu bukan pindah pool melainkan tukar
+  aset — ditolak UI.
+- **Quote boleh beda.** Hasil close ditukar lewat `_convert_quote()` sebelum mint.
+  Helper itu sadar ETH native di KEDUA sisi (`swap_any` cuma mengerti ERC20, jadi
+  native di-wrap dulu / di-unwrap sesudahnya) dan membaca jumlah yang benar-benar
+  diterima dari delta saldo, bukan estimasi. Mode `upper` dilewati: budget-nya dalam
+  satuan meme, dan meme-nya sama di kedua pool.
 - **`assert_pool_orientation(w3, dest, chain_id)`** dipanggil untuk pool tujuan —
   dict-nya berasal dari pilihan UI, jadi tidak boleh dipercaya begitu saja.
+
+Pindah lintas-quote menambah fee + slippage satu swap lagi dan totalnya 4–6 tx —
+UI wajib menyebutnya supaya user tahu ongkosnya lebih mahal dari pindah sesama quote.
 
 Pembukuannya sama persis dengan rebalance (`finish_rebalance()` dipakai berdua):
 event `close` + `fees` untuk posisi lama, `mint` untuk yang baru, dan `drop_ref`/

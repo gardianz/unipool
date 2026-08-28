@@ -3273,13 +3273,14 @@ async def show_migrate_confirm(msg, key: str, src_pid: str):
     if not p:
         await edit(msg, "❌ Posisi asal tidak ditemukan.")
         return
-    if str(dest.get("quote_addr", "")).lower() != (
-            p["token1"] if p["quote_is_token1"] else p["token0"]).lower():
-        await edit(msg, (
-            f"❌ Pool tujuan ber-quote <b>{esc(dest.get('quote_sym'))}</b>, posisi lama "
-            f"<b>{esc(p.get('quote_sym'))}</b>.\n<i>Pindah pool baru mendukung quote yang "
-            f"sama. Untuk pindah lintas-quote: Close dulu, lalu buat posisi baru.</i>"),
-            NAV_KB)
+    src_q = (p["token1"] if p["quote_is_token1"] else p["token0"]).lower()
+    cross = str(dest.get("quote_addr", "")).lower() != src_q
+    # Token meme HARUS sama — kalau tidak, ini bukan pindah pool melainkan tukar aset.
+    src_meme = (p["token0"] if p["quote_is_token1"] else p["token1"]).lower()
+    dest_meme = str(dest.get("token0") if not dest.get("quote_is_token1")
+                    else dest.get("token1")).lower()
+    if dest_meme and dest_meme != src_meme:
+        await edit(msg, "❌ Pool tujuan bukan untuk token yang sama.", NAV_KB)
         return
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("↔️ Wide (dua sisi)", callback_data=f"migok|{key}|wide")],
@@ -3292,9 +3293,13 @@ async def show_migrate_confirm(msg, key: str, src_pid: str):
         f"fee {p.get('fee', 0) / 10000:g}% · {ch.fmt_usd(p['value_usd'])}\n"
         f"<b>Ke</b> [v{dest.get('ver', 3)}] {esc(dest.get('quote_sym'))} "
         f"fee {dest['fee'] / 10000:g}% · TVL {ch.fmt_usd(dest.get('tvl_usd') or 0)}\n\n"
-        f"Close posisi lama (fee ikut terambil) → swap komposisi → mint di pool baru.\n"
-        f"<i>Hanya dana hasil posisi ini yang dipakai. 3–5 transaksi. Lebar range "
-        f"mengikuti posisi lama; pilih bentuknya:</i>"), kb)
+        f"Close posisi lama (fee ikut terambil) → swap komposisi"
+        + (f" → tukar {esc(p.get('quote_sym'))} ke {esc(dest.get('quote_sym'))}" if cross else "")
+        + f" → mint di pool baru.\n"
+        + (f"<i>⚠️ Quote BEDA — hasil close ditukar dulu, jadi ada fee &amp; slippage "
+           f"swap tambahan dan totalnya 4–6 transaksi.</i>\n" if cross else "")
+        + f"<i>Hanya dana hasil posisi ini yang dipakai. Lebar range mengikuti posisi "
+          f"lama; pilih bentuknya:</i>"), kb)
 
 
 async def do_migrate(update: Update, key: str, mode: str):

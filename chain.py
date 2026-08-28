@@ -6262,6 +6262,50 @@ def _poll_wallet(w3: Web3, cur: str, addr: str, min_expected: int,
     return bal
 
 
+def _convert_quote(w3: Web3, chain_id: int, pk: str, src_q: str, dst_q: str,
+                   amount_wei: int, slippage_pct: float, steps: list) -> int:
+    """Tukar `amount_wei` dari quote lama ke quote baru. Return jumlah yang BENAR-BENAR
+    diterima (satuan wei quote baru), dibaca dari delta saldo — bukan dari estimasi.
+
+    Menangani ETH native di kedua sisi: `swap_any` cuma mengerti ERC20, jadi native
+    di-wrap dulu / di-unwrap sesudahnya. Dipakai jalur pindah pool lintas-quote."""
+    cfg = CHAINS[chain_id]
+    account = w3.eth.account.from_key(pk)
+    wrapped = Web3.to_checksum_address(cfg["wrapped"])
+    weth = w3.eth.contract(address=wrapped, abi=WETH_ABI)
+    src_native = src_q.lower() == V4_NATIVE
+    dst_native = str(dst_q).lower() == V4_NATIVE
+    src = wrapped if src_native else Web3.to_checksum_address(src_q)
+    dst = wrapped if dst_native else Web3.to_checksum_address(dst_q)
+
+    if src_native:
+        h = send_tx(w3, pk, {"to": wrapped, "value": amount_wei,
+                             "data": calldata(weth.functions.deposit())})
+        wait_ok(w3, h, "wrap")
+        steps.append(("wrap", h))
+        poll_balance(w3, wrapped, account.address, amount_wei)
+
+    if src.lower() == dst.lower():
+        got = amount_wei
+    else:
+        before = erc20(w3, dst).functions.balanceOf(account.address).call()
+        for lbl, h in swap_any(chain_id, pk, src, dst, amount_wei, slippage_pct):
+            steps.append((lbl, h))
+        got = poll_balance(w3, dst, account.address, before + 1) - before
+        if got <= 0:
+            raise RuntimeError(
+                "Konversi quote gagal terbaca — dana hasil close aman di wallet, "
+                "mint manual ke pool tujuan.")
+
+    if dst_native:
+        pre = w3.eth.get_balance(account.address)
+        h = send_tx(w3, pk, {"to": wrapped, "data": calldata(weth.functions.withdraw(got))})
+        wait_ok(w3, h, "unwrap")
+        steps.append(("unwrap", h))
+        got = max(0, w3.eth.get_balance(account.address) - pre)
+    return got
+
+
 def rebalance_position(chain_id: int, pk: str, pid, mode: str, slippage_pct: float,
                        gap: int = 1, target_pool: dict | None = None) -> dict:
     """Close posisi → swap komposisi sesuai mode → mint ulang dengan lebar range
@@ -6269,9 +6313,9 @@ def rebalance_position(chain_id: int, pk: str, pid, mode: str, slippage_pct: flo
     Hanya dana HASIL posisi ini yang dipakai (delta saldo, bukan seluruh wallet).
 
     `target_pool` = PINDAH POOL: close di pool lama, mint di pool itu (mis. dari fee
-    tier 5% ke 2%). Syaratnya quote DAN token meme-nya sama — kalau beda, dananya
-    perlu ditukar dan itu jalur lain; ditolak dengan pesan supaya user tidak
-    kehilangan dana di tengah alur."""
+    tier 5% ke 2%). Token meme harus sama; quote BOLEH beda — hasil close ditukar
+    lewat `_convert_quote()` (sadar ETH native) sebelum mint, dan jumlah yang dipakai
+    dibaca dari delta saldo NYATA, bukan estimasi."""
     ver, ref = parse_pid(pid)
     if ver == 2:
         raise RuntimeError("Posisi v2 full-range — tidak perlu rebalance.")
@@ -6431,16 +6475,15 @@ def rebalance_position(chain_id: int, pk: str, pid, mode: str, slippage_pct: flo
     if budget <= 0:
         raise RuntimeError("Budget mint 0 setelah close+swap — dana aman di wallet, mint manual saja.")
     if target_pool is not None:
-        # Quote/meme beda = dananya harus ditukar dulu; itu jalur tersendiri dan
-        # kalau gagal di tengah user sudah terlanjur close. Tolak di sini, sebelum
-        # ada tx apa pun yang menyentuh pool tujuan.
         tq = str(target_pool.get("quote_addr", "")).lower()
-        if tq and tq != quote.lower():
-            raise RuntimeError(
-                f"Pool tujuan ber-quote {target_pool.get('quote_sym')} sedangkan posisi "
-                f"lama ber-quote {pool_info['quote_sym']} — pindah pool baru mendukung "
-                f"quote yang sama. Dana hasil close sudah aman di wallet; mint manual "
-                f"ke pool tujuan.")
+        if tq and tq != quote.lower() and mode != "upper":
+            # Quote beda -> tukar dulu. Mode "upper" tidak lewat sini: budget-nya
+            # dalam satuan MEME, dan token meme sama di kedua pool.
+            got = _convert_quote(w3, chain_id, pk, quote, target_pool["quote_addr"],
+                                 int(budget * 10 ** qdec), slippage_pct, steps)
+            budget = got / 10 ** int(target_pool.get("quote_decimals") or 18)
+            if budget <= 0:
+                raise RuntimeError("Konversi quote menghasilkan 0 — dana aman di wallet.")
 
     strategy = {"mode": mode, "low_pct": low_pct, "up_pct": up_pct, "gap": gap}
     dest = target_pool or pool_info
