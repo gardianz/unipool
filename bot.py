@@ -3277,7 +3277,9 @@ async def show_migrate_confirm(msg, key: str, src_pid: str):
     cross = str(dest.get("quote_addr", "")).lower() != src_q
     # Token meme HARUS sama — kalau tidak, ini bukan pindah pool melainkan tukar aset.
     src_meme = (p["token0"] if p["quote_is_token1"] else p["token1"]).lower()
-    dest_meme = str(dest.get("token0") if not dest.get("quote_is_token1")
+    # quote_is_token1 True  -> quote = token1, jadi MEME = token0
+    # quote_is_token1 False -> quote = token0, jadi MEME = token1
+    dest_meme = str(dest.get("token0") if dest.get("quote_is_token1")
                     else dest.get("token1")).lower()
     if dest_meme and dest_meme != src_meme:
         await edit(msg, "❌ Pool tujuan bukan untuk token yang sama.", NAV_KB)
