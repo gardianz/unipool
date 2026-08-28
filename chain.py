@@ -941,11 +941,35 @@ def poll_balance(w3: Web3, token: str, addr: str, min_expected: int,
 _PROGRESS = None
 
 
+_GAS_WEI = [0]     # akumulasi gas satu alur (wei). Aman: alur tx diserialisasi TX_LOCK.
+
+
 def set_progress(fn) -> None:
     """Pasang/lepas (fn=None) sink laporan langkah. fn dipanggil dari thread kerja,
-    jadi ia harus murah dan tidak boleh melempar."""
+    jadi ia harus murah dan tidak boleh melempar. Memasang sink juga MERESET
+    penghitung gas, jadi tiap alur melapor biayanya sendiri."""
     global _PROGRESS
     _PROGRESS = fn
+    if fn is not None:
+        _GAS_WEI[0] = 0
+
+
+def gas_spent_wei() -> int:
+    """Total gas yang benar-benar terbakar sejak sink progres dipasang."""
+    return _GAS_WEI[0]
+
+
+def fmt_gas(chain_id: int, wei: int) -> str:
+    """'0,000045 ETH (~$0,11)' — dipakai UI di akhir tiap alur."""
+    cfg = CHAINS[chain_id]
+    s = f"{wei / 1e18:.6f} {cfg['native_symbol']}"
+    try:
+        usd = wei / 1e18 * quote_usd_price(get_w3(chain_id), chain_id, cfg["wrapped_symbol"])
+        if usd > 0:
+            s += f" (~{fmt_usd(usd)})"
+    except Exception:
+        pass
+    return s
 
 
 def _step(msg: str) -> None:
@@ -1078,8 +1102,19 @@ def wait_ok(w3: Web3, txhash: str, what: str, total_wait: int = 180):
         except Exception:
             _rebroadcast(w3, raw)
             _step(f"↻ {what} belum masuk blok setelah {int(time.time() - started)}s — disiarkan ulang")
-    if r is not None and r.status == 1:
-        _step(f"✅ {what} beres ({int(time.time() - started)}s)")
+    if r is not None:
+        # Biaya nyata = gasUsed × effectiveGasPrice. Dihitung di sini supaya SEMUA
+        # alur (mint/add/close/rebalance/compound/revoke/cleanup) ikut terlapor
+        # tanpa menyentuh fungsinya satu per satu.
+        try:
+            gp = r.get("effectiveGasPrice") or w3.eth.get_transaction(txhash).get("gasPrice") or 0
+            cost = int(r.gasUsed) * int(gp)
+            _GAS_WEI[0] += cost
+        except Exception:
+            cost = 0
+        if r.status == 1:
+            _step(f"✅ {what} beres ({int(time.time() - started)}s"
+                  + (f", gas {cost / 1e18:.6f}" if cost else "") + ")")
     if r is None:
         # Menyerah. WAJIB reset pelacak nonce: kalau tidak, tx berikutnya lahir
         # dengan lubang nonce dan ikut mati satu per satu.
@@ -6228,10 +6263,15 @@ def _poll_wallet(w3: Web3, cur: str, addr: str, min_expected: int,
 
 
 def rebalance_position(chain_id: int, pk: str, pid, mode: str, slippage_pct: float,
-                       gap: int = 1) -> dict:
+                       gap: int = 1, target_pool: dict | None = None) -> dict:
     """Close posisi → swap komposisi sesuai mode → mint ulang dengan lebar range
     sama, dipusatkan di harga sekarang. Fee unclaimed ikut ter-reinvest.
-    Hanya dana HASIL posisi ini yang dipakai (delta saldo, bukan seluruh wallet)."""
+    Hanya dana HASIL posisi ini yang dipakai (delta saldo, bukan seluruh wallet).
+
+    `target_pool` = PINDAH POOL: close di pool lama, mint di pool itu (mis. dari fee
+    tier 5% ke 2%). Syaratnya quote DAN token meme-nya sama — kalau beda, dananya
+    perlu ditukar dan itu jalur lain; ditolak dengan pesan supaya user tidak
+    kehilangan dana di tengah alur."""
     ver, ref = parse_pid(pid)
     if ver == 2:
         raise RuntimeError("Posisi v2 full-range — tidak perlu rebalance.")
@@ -6390,12 +6430,30 @@ def rebalance_position(chain_id: int, pk: str, pid, mode: str, slippage_pct: flo
         budget = q_delta / 10 ** qdec
     if budget <= 0:
         raise RuntimeError("Budget mint 0 setelah close+swap — dana aman di wallet, mint manual saja.")
+    if target_pool is not None:
+        # Quote/meme beda = dananya harus ditukar dulu; itu jalur tersendiri dan
+        # kalau gagal di tengah user sudah terlanjur close. Tolak di sini, sebelum
+        # ada tx apa pun yang menyentuh pool tujuan.
+        tq = str(target_pool.get("quote_addr", "")).lower()
+        if tq and tq != quote.lower():
+            raise RuntimeError(
+                f"Pool tujuan ber-quote {target_pool.get('quote_sym')} sedangkan posisi "
+                f"lama ber-quote {pool_info['quote_sym']} — pindah pool baru mendukung "
+                f"quote yang sama. Dana hasil close sudah aman di wallet; mint manual "
+                f"ke pool tujuan.")
 
     strategy = {"mode": mode, "low_pct": low_pct, "up_pct": up_pct, "gap": gap}
-    if ver == 3:
-        r = mint_position(chain_id, pk, pool_info, budget, strategy, slippage_pct)
+    dest = target_pool or pool_info
+    if dest is not pool_info:
+        assert_pool_orientation(w3, dest, chain_id)   # jangan pernah percaya dict dari UI
+    dest_ver = dest.get("ver", 3)
+    if dest_ver == 3:
+        r = mint_position(chain_id, pk, dest, budget, strategy, slippage_pct)
+    elif dest_ver == 4:
+        r = mint_v4(chain_id, pk, dest, budget, strategy, slippage_pct)
     else:
-        r = mint_v4(chain_id, pk, pool_info, budget, strategy, slippage_pct)
+        raise RuntimeError("Pindah ke pool v2 belum didukung — pool v2 full-range, "
+                           "close dulu lalu buat posisi v2 dari daftar pool.")
     steps += r["steps"]
 
     return {"ver": ver, "old_ref": ref, "steps": steps,

@@ -226,6 +226,12 @@ async def edit(msg, text: str, kb: InlineKeyboardMarkup | None = None):
                                          reply_markup=kb, disable_web_page_preview=True)
 
 
+def gas_line(cid: int) -> str:
+    """Baris '⛽ gas' untuk kartu hasil. Kosong kalau tidak ada tx (mis. aksi batal)."""
+    wei = ch.gas_spent_wei()
+    return f"⛽ gas terpakai: {ch.fmt_gas(cid, wei)}" if wei else ""
+
+
 async def with_progress(status, head: str, work):
     """Jalankan `work` (fungsi sinkron, di thread) sambil menyiarkan langkahnya.
 
@@ -1636,6 +1642,9 @@ async def do_mint(update: Update, ctx_data: dict):
         for label, h in r["steps"]:
             lines.append(f"{label}: {ch.tx_link(cid, h)}")
         lines.append(ch.pos_link_any(cid, pid))
+        g = gas_line(cid)
+        if g:
+            lines.append(g)
         await edit(status, "\n".join(lines), NAV_KB)
         return
 
@@ -1669,6 +1678,9 @@ async def do_mint(update: Update, ctx_data: dict):
                      f"({ch.fmt_usd(r['deposited_usd'])})"))
     if r["token_id"]:
         lines.append(ch.pos_link_any(cid, pid))
+    g = gas_line(cid)
+    if g:
+        lines.append(g)
     await edit(status, "\n".join(lines), NAV_KB)
 
 
@@ -1967,6 +1979,8 @@ def position_kb(cid: int, p: dict) -> InlineKeyboardMarkup:
                                           callback_data=f"tpsl|{pid}")])
         rows.append([InlineKeyboardButton("⚖️ Rebalance (mint ulang di harga sekarang)",
                                           callback_data=f"reb|{pid}")])
+        rows.append([InlineKeyboardButton("🔀 Pindah pool (fee tier lain)",
+                                          callback_data=f"mig|{pid}")])
     rows.append([InlineKeyboardButton("⬅️ Posisi", callback_data="menu|list"),
                  InlineKeyboardButton("🏠 Menu", callback_data="menu|main")])
     return InlineKeyboardMarkup(rows)
@@ -2147,6 +2161,9 @@ async def do_add_exec(update: Update, pid: str, val: float, is_pct: bool):
     for label, h in r["steps"]:
         lines.append(f"{label}: {ch.tx_link(cid, h)}")
     lines.append(ch.pos_link_any(cid, pid))
+    g = gas_line(cid)
+    if g:
+        lines.append(g)
     await edit(status, "\n".join(lines), NAV_KB)
 
 
@@ -2226,6 +2243,9 @@ async def do_reduce_exec(update: Update, pid: str, pct: int):
     for label, h in r["steps"]:
         lines.append(f"{label}: {ch.tx_link(cid, h)}")
     lines.append(ch.pos_link_any(cid, pid))
+    g = gas_line(cid)
+    if g:
+        lines.append(g)
     await edit(status, "\n".join(lines), NAV_KB)
 
 
@@ -2256,6 +2276,9 @@ async def do_collect(update: Update, pid: str):
              "<i>Posisi tetap jalan — liquidity tidak berubah.</i>"]
     for label, h in r["steps"]:
         lines.append(f"{label}: {ch.tx_link(cid, h)}")
+    g = gas_line(cid)
+    if g:
+        lines.append(g)
     await edit(status, "\n".join(lines), NAV_KB)
 
 
@@ -2313,6 +2336,13 @@ async def do_rebalance(update: Update, pid: str, mode: str):
                                f"cek /wallet lalu mint manual.</i>")
             return
 
+    await finish_rebalance(update, status, cid, pid, pos, r, mode=mode)
+
+
+async def finish_rebalance(update, status, cid: int, pid: str, pos, r: dict,
+                           mode: str | None = None, label: str = "Rebalanced"):
+    """Pembukuan + kartu hasil untuk rebalance DAN pindah pool — dua-duanya
+    close-lalu-mint, jadi pencatatannya harus persis sama."""
     ver, old_ref = ch.parse_pid(pid)
     ev_old = old_ref if ver == 3 else str(pid)
     # Pembukuan tidak boleh bolong: kalau snapshot posisi lama gagal dibaca (RPC lag),
@@ -2336,7 +2366,8 @@ async def do_rebalance(update: Update, pid: str, mode: str):
             store.add_ref(cid, wallet_address(), "v4", str(r["token_id"]))
     store.record_event(cid, "mint", new_pid, r["deposited_usd"], "rebalance in", wallet=wallet_address())
 
-    lines = [f"✅ <b>Rebalanced {disp_pid(pid)} → #{r['token_id']}</b> [v{ver}] · {STRAT_LABEL[mode]}",
+    lines = [f"✅ <b>{label} {disp_pid(pid)} → #{r['token_id']}</b> [v{ver}]"
+             + (f" · {STRAT_LABEL[mode]}" if mode else ""),
              f"Closed: {ch.fmt_amount(r['closed_got0'])} {esc(r['closed_sym0'])} + "
              f"{ch.fmt_amount(r['closed_got1'])} {esc(r['closed_sym1'])} (termasuk fee)",
              f"Minted: ~{ch.fmt_amount(r['deposited'])} {esc(r['deposit_sym'])} "
@@ -2345,6 +2376,9 @@ async def do_rebalance(update: Update, pid: str, mode: str):
         lines.append(f"{label}: {ch.tx_link(cid, h)}")
     if r["token_id"]:
         lines.append(ch.pos_link_any(cid, new_pid))
+    g = gas_line(cid)
+    if g:
+        lines.append(g)
     await edit(status, "\n".join(lines), NAV_KB)
 
 
@@ -2433,6 +2467,9 @@ async def do_close(update: Update, pid: str, autoswap: bool):
     lines.append(f"Withdrawal value ~{ch.fmt_usd(usd)}")
     for label, h in r["steps"]:
         lines.append(f"{label}: {ch.tx_link(cid, h)}")
+    g = gas_line(cid)
+    if g:
+        lines.append(g)
     await edit(status, "\n".join(lines), NAV_KB)
 
     if r["swaps"]:
@@ -2541,6 +2578,9 @@ async def on_callback(update: Update, _):
     if data.startswith("pos|"):
         await show_position(update, q.message, data.split("|", 1)[1])
         return
+    if data.startswith("mig|"):
+        await ask_migrate(update, data.split("|", 1)[1])
+        return
     if data.startswith("cmpok|"):
         await q.edit_message_reply_markup(None)
         await do_compound(update, data.split("|", 1)[1])
@@ -2568,8 +2608,18 @@ async def on_callback(update: Update, _):
         await show_pools_for(q.message, cid2, tok)
         return
     if data.startswith("pool|"):
-        # pilih pool → kartu konfirmasi (belum mint)
-        await show_confirm(q.message, data.split("|", 1)[1])
+        key = data.split("|", 1)[1]
+        src_pid = MIGRATE.get(update.effective_chat.id)
+        if src_pid:
+            await show_migrate_confirm(q.message, key, src_pid)
+        else:
+            # pilih pool → kartu konfirmasi (belum mint)
+            await show_confirm(q.message, key)
+        return
+    if data.startswith("migok|"):
+        _, key, mode = data.split("|")
+        await q.edit_message_reply_markup(None)
+        await do_migrate(update, key, mode)
         return
     if data.startswith("tight|"):
         key = data.split("|", 1)[1]
@@ -3100,6 +3150,9 @@ async def do_cleanup(update: Update):
         lines.append(f"<i>Sisa {r['sisa']} — jalankan /cleanup lagi.</i>")
     for label, h in r["steps"]:
         lines.append(f"{label}: {ch.tx_link(cid, h)}")
+    g = gas_line(cid)
+    if g:
+        lines.append(g)
     await edit(status, "\n".join(lines), NAV_KB)
 
 
@@ -3170,6 +3223,107 @@ async def cmd_revoke(update: Update, ctx=None):
            f"({', '.join(esc(r['symbol']) for r in fixed[:6])}) — dikunci di tak terhingga "
            f"oleh kontrak tokennya, bukan approval yang kamu berikan, dan mustahil dicabut.</i>"
            if fixed else "")), InlineKeyboardMarkup(btns))
+
+
+# Posisi asal saat alur "pindah pool" berjalan, per chat. Dipakai show_confirm untuk
+# tahu bahwa pool yang dipilih adalah TUJUAN pindah, bukan mint baru.
+MIGRATE: dict[int, str] = {}
+
+
+async def ask_migrate(update: Update, pid: str):
+    """Mulai alur pindah pool: tampilkan daftar pool token yang sama."""
+    s = store.load_settings()
+    cid = s["chain"]
+    if ch.parse_pid(pid)[0] == 2:
+        await reply(update, "ℹ️ Posisi v2 full-range — tidak ada fee tier lain untuk "
+                            "dipindahi.", NAV_KB)
+        return
+    status = await reply(update, "⏳ Membaca posisi…")
+
+    def snap():
+        return next((x for x in list_positions_all(cid) if x["pid"] == str(pid)), None)
+
+    p = await asyncio.to_thread(snap)
+    if not p:
+        await edit(status, "❌ Posisi tidak ditemukan.")
+        return
+    meme = p["token0"] if p["quote_is_token1"] else p["token1"]
+    MIGRATE[update.effective_chat.id] = str(pid)
+    await edit(status, (
+        f"🔀 <b>Pindah pool</b> — {_pos_disp(p)} ({ch.fmt_usd(p['value_usd'])})\n"
+        f"<i>Dari {esc(p.get('quote_sym') or '')} fee {p.get('fee', 0) / 10000:g}%. "
+        f"Pilih pool tujuan di bawah — harus ber-quote sama. Alurnya: close posisi "
+        f"lama → swap komposisi → mint di pool baru.</i>"))
+    await show_pools_for(status, cid, meme)
+
+
+async def show_migrate_confirm(msg, key: str, src_pid: str):
+    """Kartu konfirmasi pindah pool: pool asal vs tujuan + pilihan mode range."""
+    ctx = PENDING.get(key)
+    if not ctx:
+        await edit(msg, "⚠️ Tombol kadaluarsa (bot sempat restart). Ulangi dari posisi.")
+        return
+    cid = ctx["chain"]
+    dest = ctx["pool_info"]
+
+    def snap():
+        return next((x for x in list_positions_all(cid) if x["pid"] == str(src_pid)), None)
+
+    p = await asyncio.to_thread(snap)
+    if not p:
+        await edit(msg, "❌ Posisi asal tidak ditemukan.")
+        return
+    if str(dest.get("quote_addr", "")).lower() != (
+            p["token1"] if p["quote_is_token1"] else p["token0"]).lower():
+        await edit(msg, (
+            f"❌ Pool tujuan ber-quote <b>{esc(dest.get('quote_sym'))}</b>, posisi lama "
+            f"<b>{esc(p.get('quote_sym'))}</b>.\n<i>Pindah pool baru mendukung quote yang "
+            f"sama. Untuk pindah lintas-quote: Close dulu, lalu buat posisi baru.</i>"),
+            NAV_KB)
+        return
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("↔️ Wide (dua sisi)", callback_data=f"migok|{key}|wide")],
+        [InlineKeyboardButton("⬇️ Lower (quote saja)", callback_data=f"migok|{key}|lower"),
+         InlineKeyboardButton("⬆️ Upper (meme saja)", callback_data=f"migok|{key}|upper")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="cancel")]])
+    await edit(msg, (
+        f"🔀 <b>Pindah pool?</b>\n\n"
+        f"<b>Dari</b> {_pos_disp(p)} · {esc(p.get('quote_sym'))} "
+        f"fee {p.get('fee', 0) / 10000:g}% · {ch.fmt_usd(p['value_usd'])}\n"
+        f"<b>Ke</b> [v{dest.get('ver', 3)}] {esc(dest.get('quote_sym'))} "
+        f"fee {dest['fee'] / 10000:g}% · TVL {ch.fmt_usd(dest.get('tvl_usd') or 0)}\n\n"
+        f"Close posisi lama (fee ikut terambil) → swap komposisi → mint di pool baru.\n"
+        f"<i>Hanya dana hasil posisi ini yang dipakai. 3–5 transaksi. Lebar range "
+        f"mengikuti posisi lama; pilih bentuknya:</i>"), kb)
+
+
+async def do_migrate(update: Update, key: str, mode: str):
+    ctx = PENDING.get(key)
+    src_pid = MIGRATE.pop(update.effective_chat.id, None)
+    if not ctx or not src_pid:
+        await reply(update, "⚠️ Konteks hilang. Ulangi dari kartu posisi.")
+        return
+    s = store.load_settings()
+    cid = ctx["chain"]
+    dest = ctx["pool_info"]
+    head = f"⏳ Pindah {disp_pid(src_pid)} → [v{dest.get('ver', 3)}] fee {dest['fee'] / 10000:g}%…"
+    status = await reply(update, head)
+
+    def snap():
+        return next((x for x in list_positions_all(cid) if x["pid"] == str(src_pid)), None)
+
+    pos = await asyncio.to_thread(snap)
+    async with TX_LOCK:
+        try:
+            r = await with_progress(status, head, lambda: ch.rebalance_position(
+                cid, pk(), src_pid, mode, s["slippage_pct"], int(s.get("gap", 1)),
+                target_pool=dest))
+        except Exception as e:
+            await edit(status, f"❌ Pindah pool gagal: {esc(e)}\n"
+                               f"<i>Kalau close sudah jalan, dananya aman di wallet — "
+                               f"cek /wallet lalu mint manual.</i>")
+            return
+    await finish_rebalance(update, status, cid, src_pid, pos, r, label="Pindah pool")
 
 
 async def ask_compound(update: Update, pid: str):
@@ -3248,6 +3402,9 @@ async def do_compound(update: Update, pid: str):
     for label, h in r["steps"]:
         lines.append(f"{label}: {ch.tx_link(cid, h)}")
     lines.append(ch.pos_link_any(cid, pid))
+    g = gas_line(cid)
+    if g:
+        lines.append(g)
     await edit(status, "\n".join(lines), NAV_KB)
 
 
@@ -3281,6 +3438,9 @@ async def do_revoke(update: Update, key: str, idx: int | None):
         lines.append(f"· {esc(it['symbol'])} → {esc(it['spender_label'])}: {ch.tx_link(cid, h)}")
     for it, err in fail:
         lines.append(f"❌ {esc(it['symbol'])} → {esc(it['spender_label'])}: {esc(err)}")
+    g = gas_line(cid)
+    if g:
+        lines.append(g)
     await edit(status, "\n".join(lines), NAV_KB)
 
 

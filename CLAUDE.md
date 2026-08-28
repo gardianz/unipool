@@ -255,6 +255,29 @@ Beda per versi, jangan disamaratakan:
 - **reduce/close** (v3 `decrease+collect`, v4 `DECREASE`+`TAKE_PAIR`) — fee ditarik
   **penuh ke wallet** berapa pun pct-nya, jadi event `fees` dicatat 100%, bukan pro-rata.
 
+### Gas dilaporkan otomatis di semua alur
+
+`wait_ok()` menghitung `gasUsed × effectiveGasPrice` tiap tx dan menjumlahkannya di
+`_GAS_WEI`. Penghitung direset oleh `set_progress(fn)` — jadi tiap alur melapor
+biayanya sendiri tanpa menyentuh fungsi mana pun satu per satu. UI memanggil
+`gas_line(cid)` → `ch.fmt_gas()` di kartu hasil (terukur: "0.000010 ETH (~$0.03)"
+untuk alur 2 tx).
+
+### Pindah pool = rebalance dengan `target_pool`
+
+`rebalance_position(..., target_pool=dict)` menutup posisi di pool lama lalu mint di
+pool itu (mis. fee tier 5% → 2%). Dua penjagaan WAJIB, jangan dilemahkan:
+
+- **Quote harus sama.** Kalau beda, dananya perlu ditukar dulu — jalur tersendiri,
+  dan kalau gagal di tengah user sudah terlanjur close. Ditolak SEBELUM ada tx apa
+  pun yang menyentuh pool tujuan; UI juga menolaknya lebih awal.
+- **`assert_pool_orientation(w3, dest, chain_id)`** dipanggil untuk pool tujuan —
+  dict-nya berasal dari pilihan UI, jadi tidak boleh dipercaya begitu saja.
+
+Pembukuannya sama persis dengan rebalance (`finish_rebalance()` dipakai berdua):
+event `close` + `fees` untuk posisi lama, `mint` untuk yang baru, dan `drop_ref`/
+`add_ref` untuk v4.
+
 ### Pembukuan rebalance tidak boleh bolong
 
 `do_rebalance` (bot) dan `api_action` (web) memotret posisi lama SEBELUM eksekusi
