@@ -6095,20 +6095,23 @@ def _compound_v4(w3: Web3, chain_id: int, pk: str, tid: int, slippage_pct: float
     i0 = _v4_currency_info(w3, chain_id, key[0])
     i1 = _v4_currency_info(w3, chain_id, key[1])
     qsym, q_is_t1 = _v4_quote_side(chain_id, key[0], key[1], w3)
-    raw = (sqrtp / Q96) ** 2
+    raw = (sqrtp / Q96) ** 2      # token1-wei per token0-wei (RAW, bukan per unit manusia)
     qusd = quote_usd_price(w3, chain_id, qsym) if qsym else 0.0
+    # Konversi sisi meme ke sisi quote harus memakai `raw` apa adanya: u0/u1 juga raw.
+    # Jangan pakai harga per-unit-manusia (raw × 10**(mdec-qdec)) — itu menggandakan
+    # 10**(mdec-qdec) dua kali dan nilainya meledak (terukur $9.982.236,6 JUTA untuk
+    # compound yang sebenarnya ~$30).
     if q_is_t1:
-        qdec, mdec = i1["decimals"], i0["decimals"]
-        mprice = raw * 10 ** (mdec - qdec)
-        added = (u1 + u0 * mprice) / 10 ** qdec * qusd
+        qdec = i1["decimals"]
+        added = (u1 + u0 * raw) / 10 ** qdec * qusd
     else:
-        qdec, mdec = i0["decimals"], i1["decimals"]
-        mprice = (1 / raw) * 10 ** (mdec - qdec) if raw else 0
-        added = (u0 + u1 * mprice) / 10 ** qdec * qusd
-    # Sisa fee yang tidak muat: rasio dua sisi ditentukan range + harga sekarang,
-    # jadi lazimnya satu sisi tersisa. Ia TETAP jadi fee unclaimed dan bisa
-    # di-compound lagi nanti — bukan hilang, tapi harus disebut supaya user tidak
-    # mengira compound-nya cuma sebagian karena bug.
+        qdec = i0["decimals"]
+        added = (u0 + (u1 / raw if raw else 0)) / 10 ** qdec * qusd
+    # Sisa yang tidak muat: rasio dua sisi ditentukan range + harga sekarang, jadi
+    # lazimnya satu sisi tersisa. CLOSE_CURRENCY MENGIRIMNYA KE WALLET (bukan
+    # meninggalkannya sebagai fee) — terbukti di tx 0x268953d5: 5.705,57 CHILL
+    # masuk wallet dan fee unclaimed turun ke ~$0. Harus disebut apa adanya, kalau
+    # tidak user mengira dananya menyusut.
     return {"steps": steps, "added_usd": added, "compounded_usd": added,
             "quote_sym": qsym, "quote_in": None, "meme_in": None,
             "used0": u0 / 10 ** i0["decimals"], "used1": u1 / 10 ** i1["decimals"],

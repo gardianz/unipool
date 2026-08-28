@@ -222,8 +222,15 @@ delta-nya positif — kita yang menerima. `SETTLE_PAIR` menolak keadaan itu deng
 `DeltaNotNegative(address)` (selector `0x3351b260`, terbukti saat disimulasikan).
 `CLOSE_CURRENCY` (0x12) menyelesaikan satu currency tanpa perlu tahu arah deltanya.
 
-Sisa fee yang tidak muat **tetap jadi fee unclaimed** dan bisa di-compound lagi —
-UI wajib menyebutnya, kalau tidak user mengira compound-nya cuma sebagian karena bug.
+Sisa yang tidak muat **dikirim ke WALLET**, bukan ditinggalkan sebagai fee —
+`CLOSE_CURRENCY` mengambil delta positif. Terbukti di tx `0x268953d5…`: 5.705,57
+CHILL masuk wallet dan fee unclaimed turun ke ~$0. UI wajib menyebutnya, kalau tidak
+nilai posisi sesudahnya terlihat lebih kecil dari perkiraan dan dikira dana menyusut.
+
+**Konversi USD memakai `raw`, bukan harga per-unit-manusia.** `u0`/`u1` itu raw, jadi
+`u0 * raw` sudah menghasilkan raw sisi lawan. Memakai `raw × 10**(mdec-qdec)` menggandakan
+faktor desimal dua kali — terukur melaporkan **$9.982.236,6 juta** untuk compound yang
+sebenarnya $30,28, dan angka itu ikut tertulis ke `history.json` sebagai deposit.
 Terukur di CHILL #1011495: fee 20,3177 USDG + 9.240,35 CHILL, terpakai 20,3136 USDG
 + 3.918,96 CHILL, gas 197.924 (~0,000009 ETH).
 

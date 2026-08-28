@@ -3211,8 +3211,8 @@ async def ask_compound(update: Update, pid: str):
         f"Perkiraan sesudahnya: <b>{ch.fmt_usd(p['value_usd'] + p['unclaimed_usd'])}</b>\n"
         f"<i>{detail} Hanya fee posisi ini yang dipakai — saldo wallet lain tidak "
         f"disentuh dan tidak ada swap. Rasio dua sisi ditentukan range, jadi lazimnya "
-        f"ada sisa yang tidak muat; sisa itu tetap jadi fee unclaimed dan bisa "
-        f"di-compound lagi nanti.</i>"), kb)
+        f"ada sisa yang tidak muat; sisa itu dikirim ke wallet, bukan hilang — nilai "
+        f"posisi sesudahnya bisa lebih kecil dari perkiraan sebesar sisa itu.</i>"), kb)
 
 
 async def do_compound(update: Update, pid: str):
@@ -3242,9 +3242,9 @@ async def do_compound(update: Update, pid: str):
                      f"{ch.fmt_amount(r['used1'])} {esc(r['sym1'])}")
         if (r.get("left0") or 0) > 0 or (r.get("left1") or 0) > 0:
             lines.append(f"<i>Sisa {ch.fmt_amount(r['left0'])} {esc(r['sym0'])} + "
-                         f"{ch.fmt_amount(r['left1'])} {esc(r['sym1'])} tetap jadi fee "
-                         f"unclaimed — rasio dua sisi ditentukan range, jadi lazim ada "
-                         f"yang tidak muat. Bisa di-compound lagi nanti.</i>")
+                         f"{ch.fmt_amount(r['left1'])} {esc(r['sym1'])} dikirim ke "
+                         f"WALLET (bukan hilang) — rasio dua sisi ditentukan range, "
+                         f"jadi lazim ada yang tidak muat.</i>")
     for label, h in r["steps"]:
         lines.append(f"{label}: {ch.tx_link(cid, h)}")
     lines.append(ch.pos_link_any(cid, pid))
