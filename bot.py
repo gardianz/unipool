@@ -1958,6 +1958,7 @@ def position_kb(cid: int, p: dict) -> InlineKeyboardMarkup:
                InlineKeyboardButton("➖ Reduce", callback_data=f"red|{pid}")]
     if ver != 2:  # fee v2 auto-compound — tidak ada klaim terpisah
         actions.append(InlineKeyboardButton("💰 Fee", callback_data=f"fee|{pid}"))
+        actions.append(InlineKeyboardButton("♻️ Compound", callback_data=f"cmp|{pid}"))
     actions.append(InlineKeyboardButton("🗑 Close", callback_data=f"close|{pid}"))
     rows = [chart_buttons(cid, p["pool"], meme_ca) + [InlineKeyboardButton("🔄", callback_data=f"pos|{pid}")],
             actions]
@@ -2539,6 +2540,13 @@ async def on_callback(update: Update, _):
         return
     if data.startswith("pos|"):
         await show_position(update, q.message, data.split("|", 1)[1])
+        return
+    if data.startswith("cmpok|"):
+        await q.edit_message_reply_markup(None)
+        await do_compound(update, data.split("|", 1)[1])
+        return
+    if data.startswith("cmp|"):
+        await ask_compound(update, data.split("|", 1)[1])
         return
     if data.startswith("rvk|"):
         _, k, i = data.split("|", 2)
@@ -3162,6 +3170,85 @@ async def cmd_revoke(update: Update, ctx=None):
            f"({', '.join(esc(r['symbol']) for r in fixed[:6])}) — dikunci di tak terhingga "
            f"oleh kontrak tokennya, bukan approval yang kamu berikan, dan mustahil dicabut.</i>"
            if fixed else "")), InlineKeyboardMarkup(btns))
+
+
+async def ask_compound(update: Update, pid: str):
+    """Konfirmasi compound: reinvestasi fee unclaimed ke posisi yang sama."""
+    s = store.load_settings()
+    cid = s["chain"]
+    ver = ch.parse_pid(pid)[0]
+    if ver == 2:
+        await reply(update, "ℹ️ Fee LP v2 sudah auto-compound ke dalam posisi — "
+                            "tidak ada yang perlu di-compound.", NAV_KB)
+        return
+    msg = await reply(update, "⏳ Menghitung fee…")
+
+    def snap():
+        return next((x for x in list_positions_all(cid) if x["pid"] == str(pid)), None)
+
+    p = await asyncio.to_thread(snap)
+    if not p or p["unclaimed_usd"] <= 0:
+        await edit(msg, "ℹ️ Tidak ada fee unclaimed untuk di-compound.", NAV_KB)
+        return
+    # v3 vs v4 beda jumlah tx dan beda sumber dana — sebutkan supaya user tahu
+    detail = ("Fee dipakai langsung sebagai modal (v4 mengkreditkannya ke tagihan "
+              "settle), jadi wallet praktis tidak membayar apa-apa. 1–2 transaksi."
+              if ver == 4 else
+              "Fee di-collect ke wallet dulu, lalu ditambahkan kembali ke posisi. "
+              "2–4 transaksi.")
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"♻️ Compound {ch.fmt_usd(p['unclaimed_usd'])}",
+                              callback_data=f"cmpok|{pid}")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="cancel")]])
+    await edit(msg, (
+        f"♻️ <b>Compound {_pos_disp(p)}?</b>\n\n"
+        f"{_pool_info_line(cid, p, ver)}\n"
+        f"💼 Posisi sekarang <b>{ch.fmt_usd(p['value_usd'])}</b> · "
+        f"{'🟢 IN range' if p['in_range'] else '🔴 OUT of range'}\n"
+        f"💰 Fee unclaimed <b>{ch.fmt_usd(p['unclaimed_usd'])}</b>\n"
+        f"· {ch.fmt_amount(p['fees0'])} {esc(p['sym0'])} + "
+        f"{ch.fmt_amount(p['fees1'])} {esc(p['sym1'])}\n\n"
+        f"Perkiraan sesudahnya: <b>{ch.fmt_usd(p['value_usd'] + p['unclaimed_usd'])}</b>\n"
+        f"<i>{detail} Hanya fee posisi ini yang dipakai — saldo wallet lain tidak "
+        f"disentuh dan tidak ada swap. Rasio dua sisi ditentukan range, jadi lazimnya "
+        f"ada sisa yang tidak muat; sisa itu tetap jadi fee unclaimed dan bisa "
+        f"di-compound lagi nanti.</i>"), kb)
+
+
+async def do_compound(update: Update, pid: str):
+    s = store.load_settings()
+    cid = s["chain"]
+    head = f"⏳ Compound {disp_pid(pid)}…"
+    status = await reply(update, head)
+    pre_fee = _reinvested_fee_usd(cid, pid)
+    async with TX_LOCK:
+        try:
+            r = await with_progress(status, head, lambda: ch.compound_any(
+                cid, pk(), pid, s["slippage_pct"]))
+        except Exception as e:
+            await edit(status, f"❌ Compound gagal: {esc(e)}")
+            return
+    ev_tid = ch.parse_pid(pid)[1] if str(pid).isdigit() else str(pid)
+    # added_usd menghitung likuiditas penuh; fee yang jadi modalnya diimbangi event
+    # `fees` supaya tidak tercatat sebagai setoran baru (lihat CLAUDE.md).
+    store.record_event(cid, "mint", ev_tid, r["added_usd"], "compound", wallet=wallet_address())
+    claimed = r.get("compounded_usd") or pre_fee
+    if claimed > 0:
+        store.record_event(cid, "fees", ev_tid, claimed, "compound", wallet=wallet_address())
+    lines = [f"✅ <b>Compound {disp_pid(pid)}</b> — fee masuk kembali jadi likuiditas "
+             f"(~{ch.fmt_usd(r['added_usd'])})"]
+    if r.get("used0") is not None:
+        lines.append(f"Dipakai: {ch.fmt_amount(r['used0'])} {esc(r['sym0'])} + "
+                     f"{ch.fmt_amount(r['used1'])} {esc(r['sym1'])}")
+        if (r.get("left0") or 0) > 0 or (r.get("left1") or 0) > 0:
+            lines.append(f"<i>Sisa {ch.fmt_amount(r['left0'])} {esc(r['sym0'])} + "
+                         f"{ch.fmt_amount(r['left1'])} {esc(r['sym1'])} tetap jadi fee "
+                         f"unclaimed — rasio dua sisi ditentukan range, jadi lazim ada "
+                         f"yang tidak muat. Bisa di-compound lagi nanti.</i>")
+    for label, h in r["steps"]:
+        lines.append(f"{label}: {ch.tx_link(cid, h)}")
+    lines.append(ch.pos_link_any(cid, pid))
+    await edit(status, "\n".join(lines), NAV_KB)
 
 
 async def do_revoke(update: Update, key: str, idx: int | None):

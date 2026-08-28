@@ -201,6 +201,32 @@ token itu di wallet — token yang user pegang untuk keperluan lain ikut terjual
 Kalau selisihnya tak terbaca (RPC lag), lebih baik lewati daripada menebak: saldo
 lama tidak boleh disentuh.
 
+### Compound: reinvestasi fee ke posisi yang sama
+
+`compound_any()` — tombol ♻️ Compound di kartu posisi. Beda per versi:
+
+- **v4** (`_compound_v4`) — likuiditas dihitung LANGSUNG dari kedua sisi fee
+  (`liquidity_for_amounts(sqrtp, lo, hi, f0, f1)`), tanpa collect dan **tanpa swap**.
+  Jangan diganti dengan memanggil `add_any()`: jalur itu menghitung komposisi dari
+  budget lalu menukar sebagian dari saldo WALLET — padahal fee v4 sudah dua sisi, dan
+  wallet belum tentu punya quote sebanyak itu (terukur: fee $45,58 sedangkan wallet
+  16,69 USDG).
+- **v3** — fee mengendap di `tokensOwed`, jadi WAJIB collect dulu; jumlah yang
+  ditambahkan dihitung dari selisih saldo NYATA sebelum/sesudah collect, bukan dari
+  angka yang dilaporkan.
+- **v2** — sudah auto-compound, ditolak dengan pesan.
+
+**Aksinya `CLOSE_CURRENCY` per sisi, BUKAN `SETTLE_PAIR`.** Fee yang terpakai bisa
+lebih kecil dari fee yang tersedia (rasio ditentukan range + harga), sehingga
+delta-nya positif — kita yang menerima. `SETTLE_PAIR` menolak keadaan itu dengan
+`DeltaNotNegative(address)` (selector `0x3351b260`, terbukti saat disimulasikan).
+`CLOSE_CURRENCY` (0x12) menyelesaikan satu currency tanpa perlu tahu arah deltanya.
+
+Sisa fee yang tidak muat **tetap jadi fee unclaimed** dan bisa di-compound lagi —
+UI wajib menyebutnya, kalau tidak user mengira compound-nya cuma sebagian karena bug.
+Terukur di CHILL #1011495: fee 20,3177 USDG + 9.240,35 CHILL, terpakai 20,3136 USDG
++ 3.918,96 CHILL, gas 197.924 (~0,000009 ETH).
+
 ### Add v4 memakai fee unclaimed sebagai modal
 
 `INCREASE_LIQUIDITY` v4 mengkreditkan `feesAccrued` terhadap tagihan `SETTLE_PAIR`:

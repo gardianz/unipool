@@ -568,6 +568,10 @@ V4_UR_ABI = [
 V4_INCREASE, V4_DECREASE, V4_MINT, V4_BURN = 0x00, 0x01, 0x02, 0x03
 V4_SWAP_IN_SINGLE, V4_SETTLE_ALL, V4_SETTLE_PAIR = 0x06, 0x0C, 0x0D
 V4_TAKE_ALL, V4_TAKE_PAIR, V4_SWEEP = 0x0F, 0x11, 0x14
+# CLOSE_CURRENCY menyelesaikan satu currency TANPA perlu tahu arah delta-nya: bayar
+# kalau kurang, terima kalau lebih. Wajib untuk compound — di situ feesAccrued bisa
+# MELEBIHI yang dipakai, dan SETTLE_PAIR menolak dengan DeltaNotNegative(address).
+V4_CLOSE_CURRENCY = 0x12
 UR_CMD_V4_SWAP = 0x10
 V4_NATIVE = "0x0000000000000000000000000000000000000000"
 V4_FEE_SPACINGS = ((100, 1), (500, 10), (3000, 60), (10000, 200))
@@ -6028,6 +6032,138 @@ def reduce_any(chain_id: int, pk: str, pid, pct: int, slippage_pct: float) -> di
     if ver == 4:
         return decrease_v4(chain_id, pk, ref, pct, slippage_pct)
     return reduce_v2(chain_id, pk, ref, pct, slippage_pct, autoswap=False)
+
+
+def _compound_v4(w3: Web3, chain_id: int, pk: str, tid: int, slippage_pct: float) -> dict:
+    """Compound v4: tambah likuiditas memakai KEDUA sisi fee apa adanya, tanpa swap.
+
+    Fee v4 selalu terkumpul di dua sisi sekaligus, dan `INCREASE_LIQUIDITY`
+    mengkreditkan `feesAccrued` terhadap tagihan `SETTLE_PAIR`. Jadi likuiditas
+    dihitung LANGSUNG dari (f0, f1) dan wallet praktis tidak membayar apa-apa.
+
+    Jangan diganti dengan memanggil `add_any()`: jalur itu menghitung komposisi dari
+    budget lalu MENUKAR sebagian dari saldo wallet — padahal fee-nya sudah dua sisi,
+    dan wallet belum tentu punya quote sebanyak itu (kejadian: fee $45,58 sedangkan
+    wallet cuma 16,69 USDG)."""
+    cfg = v4_cfg(chain_id)
+    account = w3.eth.account.from_key(pk)
+    posm_addr = Web3.to_checksum_address(cfg["v4_posm"])
+    posm = _v4c(w3, chain_id, "v4_posm", V4_POSM_ABI)
+    key, info = posm.functions.getPoolAndPositionInfo(tid).call()
+    key = tuple(key)
+    lo, hi = _v4_tick_from_info(info)
+    pid_b = v4_pool_id(key)
+    liq = posm.functions.getPositionLiquidity(tid).call()
+    f0, f1 = _v4_pending_fees(w3, chain_id, pid_b, tid, lo, hi, liq)
+    if f0 <= 0 and f1 <= 0:
+        raise RuntimeError("Fee unclaimed 0 — tidak ada yang bisa di-compound.")
+    sqrtp, _ = v4_slot0(w3, chain_id, pid_b)
+    lq = int(liquidity_for_amounts(sqrtp, lo, hi, f0, f1))
+    if lq <= 0:
+        raise RuntimeError("Fee terlalu kecil untuk jadi likuiditas di range ini.")
+    lq = lq - lq // 5000 - 1          # margin pembulatan, sama seperti mint/increase
+    u0, u1 = amounts_from_liquidity(lq, sqrtp, lo, hi)
+    # plafon = jumlah fee + sedikit kelonggaran; sisanya (kalau ada) dibayar wallet
+    a0max = min(int(u0 * (1 + slippage_pct / 100)) + 2, MAX_UINT128, max(f0, 2))
+    a1max = min(int(u1 * (1 + slippage_pct / 100)) + 2, MAX_UINT128, max(f1, 2))
+    steps = []
+    for cur, amax in ((key[0], a0max), (key[1], a1max)):
+        if cur.lower() != V4_NATIVE and amax > 2:
+            steps += ensure_permit2(w3, chain_id, pk, cur, posm_addr, amax)
+    # CLOSE_CURRENCY per sisi, bukan SETTLE_PAIR: fee yang dipakai bisa lebih KECIL
+    # dari fee yang tersedia, sehingga delta-nya positif (kita yang menerima) dan
+    # SETTLE_PAIR menolak — terbukti `DeltaNotNegative(USDG)` saat disimulasikan.
+    actions = [V4_INCREASE, V4_CLOSE_CURRENCY, V4_CLOSE_CURRENCY]
+    params = [abi_encode(["uint256", "uint256", "uint128", "uint128", "bytes"],
+                         [tid, lq, a0max, a1max, b""]),
+              abi_encode(["address"], [key[0]]),
+              abi_encode(["address"], [key[1]])]
+    value = 0
+    if key[0].lower() == V4_NATIVE:
+        value = a0max
+        actions.append(V4_SWEEP)
+        params.append(abi_encode(["address", "address"], [V4_NATIVE, account.address]))
+    tx = {"to": posm_addr,
+          "data": calldata(posm.functions.modifyLiquidities(
+              _v4_unlock(actions, params), int(time.time()) + DEADLINE_SECS)),
+          "value": value}
+    _preflight(w3, account.address, tx)
+    h = send_tx(w3, pk, tx)
+    wait_ok(w3, h, "compound v4")
+    steps.append(("compound", h))
+
+    i0 = _v4_currency_info(w3, chain_id, key[0])
+    i1 = _v4_currency_info(w3, chain_id, key[1])
+    qsym, q_is_t1 = _v4_quote_side(chain_id, key[0], key[1], w3)
+    raw = (sqrtp / Q96) ** 2
+    qusd = quote_usd_price(w3, chain_id, qsym) if qsym else 0.0
+    if q_is_t1:
+        qdec, mdec = i1["decimals"], i0["decimals"]
+        mprice = raw * 10 ** (mdec - qdec)
+        added = (u1 + u0 * mprice) / 10 ** qdec * qusd
+    else:
+        qdec, mdec = i0["decimals"], i1["decimals"]
+        mprice = (1 / raw) * 10 ** (mdec - qdec) if raw else 0
+        added = (u0 + u1 * mprice) / 10 ** qdec * qusd
+    # Sisa fee yang tidak muat: rasio dua sisi ditentukan range + harga sekarang,
+    # jadi lazimnya satu sisi tersisa. Ia TETAP jadi fee unclaimed dan bisa
+    # di-compound lagi nanti — bukan hilang, tapi harus disebut supaya user tidak
+    # mengira compound-nya cuma sebagian karena bug.
+    return {"steps": steps, "added_usd": added, "compounded_usd": added,
+            "quote_sym": qsym, "quote_in": None, "meme_in": None,
+            "used0": u0 / 10 ** i0["decimals"], "used1": u1 / 10 ** i1["decimals"],
+            "left0": max(0, f0 - u0) / 10 ** i0["decimals"],
+            "left1": max(0, f1 - u1) / 10 ** i1["decimals"],
+            "sym0": i0["symbol"], "sym1": i1["symbol"],
+            "meme_sym": i0["symbol"] if q_is_t1 else i1["symbol"]}
+
+
+def compound_any(chain_id: int, pk: str, pid, slippage_pct: float = 5.0) -> dict:
+    """Reinvestasi fee unclaimed ke posisi yang SAMA. Tidak memakai saldo wallet lain.
+
+    Jalannya beda per versi karena perlakuan fee-nya memang beda:
+
+    - **v4** — `INCREASE_LIQUIDITY` mengkreditkan `feesAccrued` terhadap tagihan
+      `SETTLE_PAIR`, jadi cukup menambah likuiditas senilai fee dan wallet praktis
+      tidak membayar apa-apa. Tidak perlu collect duluan.
+    - **v3** — `increaseLiquidity` membiarkan fee mengendap di `tokensOwed`, jadi fee
+      HARUS di-collect dulu ke wallet baru bisa dipakai. Jumlah yang ditambahkan
+      dihitung dari selisih saldo NYATA sebelum/sesudah collect — bukan dari angka
+      yang dilaporkan — supaya saldo lama user tidak ikut tersedot.
+    - **v2** — fee sudah auto-compound ke dalam LP, tidak ada yang bisa dikerjakan.
+    """
+    ver, ref = parse_pid(pid)
+    if ver == 2:
+        raise RuntimeError("Fee LP v2 sudah auto-compound ke dalam posisi — "
+                           "tidak ada yang perlu di-compound.")
+    w3 = get_w3(chain_id)
+    account = w3.eth.account.from_key(pk)
+
+    if ver == 4:
+        return _compound_v4(w3, chain_id, pk, int(ref), slippage_pct)
+
+    # ---- v3: collect dulu, lalu tambahkan persis hasil collect-nya ----
+    cfg = dex_cfg(chain_id, pid_dex(chain_id, pid))
+    npm = w3.eth.contract(address=Web3.to_checksum_address(cfg["npm"]), abi=NPM_ABI)
+    p = npm.functions.positions(int(ref)).call()
+    t0, t1 = p[2], p[3]
+    qsym, q_is_t1 = resolve_quote_side(w3, chain_id, t0, t1)
+    if not qsym:
+        raise RuntimeError("Pair tanpa quote yang dikenal bot.")
+    quote = t1 if q_is_t1 else t0
+    qdec = token_info(w3, quote)["decimals"]
+    pre = erc20(w3, quote).functions.balanceOf(account.address).call()
+
+    col = collect_any(chain_id, pk, pid)
+    steps = list(col.get("steps", []))
+    got_q = poll_balance(w3, quote, account.address, pre + 1) - pre
+    if got_q <= 0:
+        raise RuntimeError("Hasil collect sisi quote terbaca 0 — coba lagi "
+                           "(fee-nya sudah masuk wallet, aman).")
+    r = add_any(chain_id, pk, pid, got_q / 10 ** qdec, slippage_pct)
+    r["steps"] = steps + list(r.get("steps", []))
+    r["compounded_usd"] = got_q / 10 ** qdec * quote_usd_price(w3, chain_id, qsym)
+    return r
 
 
 def collect_any(chain_id: int, pk: str, pid) -> dict:
