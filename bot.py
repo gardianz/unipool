@@ -792,6 +792,9 @@ async def on_address(update: Update, _):
     token = m.group(1)
     s = store.load_settings()
     cid = s["chain"]
+    # Paste alamat = mulai dari nol. Status alur lain (mis. pindah pool yang
+    # ditinggalkan) tidak boleh ikut terbawa.
+    MIGRATE.pop(update.effective_chat.id, None)
     status = await reply(update, "🔎 Mencari chain untuk token ini…")
     # Token yang ditempel belum tentu di chain aktif. Krystal memetakan token→chain
     # dalam SATU request: endpoint top_pools jalan tanpa `chainId` dan tiap entri
@@ -2525,6 +2528,10 @@ async def on_callback(update: Update, _):
             await q.edit_message_reply_markup(None)  # >48 jam tidak bisa dihapus — copot tombol saja
         return
     if data == "cancel":
+        # WAJIB dibersihkan: kalau tidak, status "sedang pindah pool" menempel dan
+        # pemilihan pool BERIKUTNYA (mis. setelah paste token lain) diperlakukan
+        # sebagai tujuan pindah — muncul "Pool tujuan bukan untuk token yang sama".
+        MIGRATE.pop(update.effective_chat.id, None)
         await q.edit_message_reply_markup(None)
         await reply(update, "❌ Cancelled.")
         return
@@ -2542,6 +2549,9 @@ async def on_callback(update: Update, _):
     if data == "noop":
         return
     # --- navigasi menu (edit in-place) ---
+    if data in ("menu|main", "go|main", "menu|list", "go|list"):
+        # kembali ke menu/daftar = keluar dari alur pindah pool
+        MIGRATE.pop(update.effective_chat.id, None)
     if data == "menu|main":
         await show_main_menu(update, msg=q.message)
         return
