@@ -345,6 +345,31 @@ juta gas ≈ 0,000045 ETH). AMAN tanpa syarat: `burn` di NPM me-require liquidit
 tokensOwed dua-duanya nol — posisi berisi ditolak kontraknya sendiri dengan
 `execution reverted: Not cleared` (sudah diuji terhadap posisi hidup).
 
+### `/recover`: baca ulang posisi v4 dari chain
+
+`find_v4_positions()` membaca event `Transfer(_, to=wallet, tokenId)` PositionManager
+dengan filter topic, jadi satu-dua request saja walau rentangnya lebar; rentangnya
+dipersempit otomatis kalau RPC menolak. Ini jaring pengaman untuk registry
+`history.json` yang bolong — v4 tidak bisa dienumerasi on-chain, jadi tanpa registry
+posisi lenyap dari UI walau dananya utuh.
+
+Terukur di satu wallet: **6 posisi hidup ditemukan dalam 8 detik** (BONER $47,77,
+CHILL $32,67, VYNEX $116,57, dan tiga lainnya) — semuanya tak terlihat di `/list`
+karena mint-nya sempat dilaporkan gagal.
+
+Hasilnya pemulihan, bukan sumber kebenaran: di RPC yang pelit cakupannya parsial.
+
+### `ensure_native_balance` JANGAN keluar saat WETH kosong
+
+Dulu ada `if wbal <= 0: return txs` tepat sebelum loop "jual quote lain". Akibatnya
+wallet tanpa WETH tapi ber-USDG banyak tetap gagal mint pool ber-quote ETH:
+*"Saldo native+WETH kurang: punya 0.016259, butuh 0.058918 + gas"* — padahal
+`compute_amount` sudah menghitung USDG itu sebagai modal. Jalur penjualan quote lain
+itulah yang menutup kekurangannya, dan ia tidak pernah tercapai.
+
+Kegagalan penjualan per-quote sekarang dilaporkan lewat `_step()`, tidak lagi
+ditelan `except: continue`.
+
 ### Mint yang sukses tapi dilaporkan gagal = dana hilang dari UI
 
 `mint_v4`/`increase_v4` mencoba 3× dan menyerah kalau `wait_ok`/`_preflight` gagal.

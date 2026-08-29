@@ -296,7 +296,8 @@ HELP = (
     "/wallets — kelola wallet: impor/buat/ekspor/hapus\n"
     "/revoke — cabut approval token yang menganggur (keamanan)\n"
     "  <code>/revoke 0xKontrak</code> — periksa kontrak di luar daftar bot\n"
-    "/cleanup — burn NFT posisi kosong (mempercepat /list)\n\n"
+    "/cleanup — burn NFT posisi kosong (mempercepat /list)\n"
+    "/recover — pulihkan posisi v4 yang ada on-chain tapi hilang dari /list\n\n"
     "<b>Custom saat kartu konfirmasi aktif:</b>\n"
     "<code>r 40 120</code> — range −40%/+120%\n"
     "<code>a 30%</code> / <code>a 0.005</code> — amount"
@@ -319,7 +320,8 @@ def menu_kb() -> InlineKeyboardMarkup:
         # Perawatan: dua-duanya sebelumnya cuma bisa lewat perintah ketik dan
         # praktis tak terlihat dari menu.
         [InlineKeyboardButton("🔐 Revoke", callback_data="menu|revoke"),
-         InlineKeyboardButton("🧹 Cleanup NFT", callback_data="menu|cleanup")],
+         InlineKeyboardButton("🧹 Cleanup NFT", callback_data="menu|cleanup"),
+         InlineKeyboardButton("🩹 Recover", callback_data="menu|recover")],
         [InlineKeyboardButton("⛓ Chain", callback_data="menu|chain"),
          InlineKeyboardButton("❓ Bantuan", callback_data="menu|help")],
         [InlineKeyboardButton("🔄 Segarkan", callback_data="menu|main")],
@@ -2546,6 +2548,9 @@ async def on_callback(update: Update, _):
     if data == "menu|cleanup":
         await cmd_cleanup(update, None)
         return
+    if data == "menu|recover":
+        await cmd_recover(update, None)
+        return
     if data == "menu|help":
         await edit(q.message, HELP, InlineKeyboardMarkup([BACK_ROW]))
         return
@@ -3100,6 +3105,7 @@ async def post_init(app):
             BotCommand("chain", "Ganti chain aktif"),
             BotCommand("revoke", "Cabut approval token yang menganggur"),
             BotCommand("cleanup", "Burn NFT posisi kosong (mempercepat /list)"),
+            BotCommand("recover", "Pulihkan posisi v4 yang hilang dari daftar"),
             BotCommand("help", "Bantuan & daftar perintah"),
         ])
     except Exception as e:
@@ -3166,6 +3172,56 @@ def _revoke_line(i: int, r: dict) -> str:
            else f"{r['amount'] / 10 ** r['decimals']:,.4f}")
     tag = "🔑 Permit2" if r["kind"] == "permit2" else "📝 ERC20"
     return f"{i}. {tag} · <b>{esc(r['symbol'])}</b> → {esc(r['spender_label'])}\n     jumlah {amt}"
+
+
+async def cmd_recover(update: Update, _=None):
+    """Pulihkan posisi v4 yang ada on-chain tapi hilang dari registry bot.
+
+    v4 tidak bisa dienumerasi, jadi bot bergantung `history.json`. Kalau mint sukses
+    tapi dilaporkan gagal, ref-nya tidak pernah tercatat dan posisinya lenyap dari
+    /list padahal dananya utuh. Ini membacanya kembali dari event Transfer on-chain."""
+    if not authorized(update):
+        return
+    cid = store.load_settings()["chain"]
+    status = await reply(update, f"🔎 Memindai posisi v4 on-chain di "
+                                 f"{esc(ch.CHAINS[cid]['name'])}…")
+    try:
+        tids = await asyncio.to_thread(ch.find_v4_positions, cid, pk())
+    except Exception as e:
+        await edit(status, f"❌ Gagal memindai: {esc(e)}")
+        return
+    w = wallet_address()
+    known = {str(x).lower() for x in store.refs(cid, w, "v4")}
+
+    def scan():
+        out = []
+        for t in tids:
+            try:
+                out.append((t, ch._v4_position_detail(ch.get_w3(cid), cid, int(t), w)))
+            except Exception:
+                out.append((t, None))
+        return out
+
+    rows = await asyncio.to_thread(scan)
+    baru, kosong = [], 0
+    for t, d in rows:
+        if not d:
+            kosong += 1
+            continue
+        if str(t).lower() in known:
+            continue
+        store.add_ref(cid, w, "v4", str(t))
+        baru.append((t, d))
+    if not baru:
+        await edit(status, (f"✅ Tidak ada posisi yang hilang — {len(tids)} NFT v4 "
+                            f"diperiksa ({kosong} sudah kosong)."), NAV_KB)
+        return
+    lines = [f"🩹 <b>{len(baru)} posisi dipulihkan</b> ke daftar:"]
+    for t, d in baru:
+        lines.append(f"· v4:{t} {esc(d['sym0'])}/{esc(d['sym1'])} — "
+                     f"{ch.fmt_usd(d['value_usd'])} (fee {ch.fmt_usd(d['unclaimed_usd'])})")
+    lines.append("<i>Buka /list untuk melihatnya.</i>")
+    await edit(status, "\n".join(lines), NAV_KB)
 
 
 async def cmd_revoke(update: Update, ctx=None):
@@ -3507,6 +3563,7 @@ def main():
     app.add_handler(CommandHandler("orders", cmd_orders))
     app.add_handler(CommandHandler("cleanup", cmd_cleanup))
     app.add_handler(CommandHandler("revoke", cmd_revoke))
+    app.add_handler(CommandHandler("recover", cmd_recover))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_address))
     app.add_error_handler(on_error)

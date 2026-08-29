@@ -3197,6 +3197,57 @@ def _recover_sent(w3: Web3, sent: list, steps: list, label: str):
     return None
 
 
+def find_v4_positions(chain_id: int, pk: str, lookback_blocks: int = 400_000) -> list[int]:
+    """tokenId posisi v4 yang DIMILIKI wallet ini, dibaca dari event Transfer PosM.
+
+    v4 tidak bisa dienumerasi on-chain (PositionManager bukan ERC721Enumerable), jadi
+    bot mengandalkan registry `history.json`. Kalau registry itu bolong — mis. mint
+    sukses tapi dilaporkan gagal — posisinya lenyap dari UI padahal dananya utuh.
+    Fungsi ini memulihkannya: `Transfer(_, to=wallet, tokenId)` difilter pakai topic,
+    jadi satu-dua request saja walau rentangnya lebar.
+
+    Rentang dipersempit otomatis kalau RPC menolak; hasilnya tetap parsial di RPC
+    yang pelit. Itu wajar — pemulihan, bukan sumber kebenaran."""
+    if not has_v4(chain_id, v4_dex(chain_id)):
+        return []
+    w3 = get_w3(chain_id)
+    me = w3.eth.account.from_key(pk).address
+    posm = Web3.to_checksum_address(v4_cfg(chain_id)["v4_posm"])
+    topic = "0x" + Web3.keccak(text="Transfer(address,address,uint256)").hex().removeprefix("0x")
+    to_topic = "0x" + me[2:].lower().rjust(64, "0")
+    bn = w3.eth.block_number
+    span = lookback_blocks
+    seen: dict[int, int] = {}
+    start = bn
+    for _ in range(12):
+        if start <= 0 or bn - start >= lookback_blocks:
+            break
+        lo = max(0, start - span)
+        try:
+            for lg in w3.eth.get_logs({"address": posm, "topics": [topic, None, to_topic],
+                                       "fromBlock": lo, "toBlock": start}):
+                seen[int(lg["topics"][3].hex(), 16)] = lg["blockNumber"]
+        except Exception:
+            if span > 5000:            # RPC menolak rentang lebar → kecilkan, coba lagi
+                span = max(5000, span // 8)
+                continue
+            break
+        start = lo
+    out = []
+    for tid in sorted(seen, key=lambda t: -seen[t]):
+        try:
+            if posm_owner_of(w3, chain_id, tid).lower() == me.lower():
+                out.append(tid)
+        except Exception:
+            continue
+    return out
+
+
+def posm_owner_of(w3: Web3, chain_id: int, tid: int) -> str:
+    posm = _v4c(w3, chain_id, "v4_posm", V4_POSM_ABI)
+    return posm.functions.ownerOf(tid).call()
+
+
 def approval_spenders(chain_id: int) -> list[tuple[str, str]]:
     """Semua kontrak yang PERNAH diberi approval oleh bot ini: [(label, alamat)].
 
@@ -5347,8 +5398,10 @@ def ensure_native_balance(w3: Web3, chain_id: int, pk: str, need_wei: int,
     deficit = need_wei - bal
     wrapped = Web3.to_checksum_address(CHAINS[chain_id]["wrapped"])
     wbal = erc20(w3, wrapped).functions.balanceOf(account.address).call()
-    if wbal <= 0:
-        return txs
+    # JANGAN keluar di sini kalau WETH kosong: jalur "jual quote lain" di bawah
+    # itulah yang menutup kekurangan buat user yang modalnya USDG. Dulu ada
+    # `if wbal <= 0: return txs` dan akibatnya mint pool ber-quote ETH gagal
+    # "Saldo native+WETH kurang" padahal USDG-nya lebih dari cukup.
     weth = w3.eth.contract(address=wrapped, abi=WETH_ABI)
     if wbal > 0:
         # Unwrap LEBIH dari kekurangan: tx unwrap (dan swap di bawah) membakar gas dari
@@ -5395,7 +5448,8 @@ def ensure_native_balance(w3: Web3, chain_id: int, pk: str, need_wei: int,
             wait_ok(w3, h, "unwrap")
             txs.append(("unwrap", h))
             deficit = need_wei - w3.eth.get_balance(account.address)
-        except Exception:
+        except Exception as e:
+            _step(f"⚠️ gagal menjual {sym} untuk menutup kekurangan native: {str(e)[:70]}")
             continue
     return txs
 
