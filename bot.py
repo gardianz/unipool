@@ -1737,7 +1737,19 @@ async def cmd_list(update: Update, _, status_msg=None):
             label += f" · {m['pnl_pct']:+.0f}%"
         label += f" · {m['age']}"
         buttons.append([InlineKeyboardButton(label, callback_data=f"pos|{p['pid']}")])
+    # Posisi tanpa event mint (mis. hasil /recover, atau mint yang sempat dilaporkan
+    # gagal) menambah open_value TANPA deposit pembanding — PnL jadi terlalu bagus.
+    # Sebut jumlahnya, jangan diam-diam.
+    tanpa_deposit = [p for p in positions if store.mint_usd(cid, p["token_id"]) is None]
+    if tanpa_deposit:
+        nilai = sum(p["value_usd"] for p in tanpa_deposit)
+        lines.insert(len(lines) - 1,
+                     f"<i>⚠️ {len(tanpa_deposit)} posisi ({ch.fmt_usd(nilai)}) tidak punya "
+                     f"catatan deposit — PnL di atas terlalu bagus sebesar itu.</i>")
     buttons.insert(0, [InlineKeyboardButton("🔄 Refresh", callback_data="refresh")])
+    if unclaimed > 0:
+        buttons.insert(1, [InlineKeyboardButton(
+            f"💰 Claim semua fee ({ch.fmt_usd(unclaimed)})", callback_data="claimall")])
     buttons.append(BACK_ROW)
     await edit(status, "\n".join(lines), InlineKeyboardMarkup(buttons))
 
@@ -2502,6 +2514,10 @@ async def on_callback(update: Update, _):
         await q.edit_message_reply_markup(None)
         await reply(update, "❌ Cancelled.")
         return
+    if data == "claimall":
+        await q.edit_message_reply_markup(None)
+        await do_claim_all(update)
+        return
     if data == "refresh":
         await cmd_list(update, None, status_msg=q.message)
         return
@@ -3172,6 +3188,63 @@ def _revoke_line(i: int, r: dict) -> str:
            else f"{r['amount'] / 10 ** r['decimals']:,.4f}")
     tag = "🔑 Permit2" if r["kind"] == "permit2" else "📝 ERC20"
     return f"{i}. {tag} · <b>{esc(r['symbol'])}</b> → {esc(r['spender_label'])}\n     jumlah {amt}"
+
+
+async def do_claim_all(update: Update):
+    """Klaim fee SEMUA posisi yang punya unclaimed. Satu tx per posisi (fee ada di
+    kontrak masing-masing, tidak bisa dibatch)."""
+    s = store.load_settings()
+    cid = s["chain"]
+    status = await reply(update, "🔎 Mencari posisi ber-fee…")
+
+    def snap():
+        return [p for p in list_positions_all(cid)
+                if p.get("unclaimed_usd", 0) > 0 and p.get("ver") != 2]
+
+    try:
+        target = await asyncio.to_thread(snap)
+    except Exception as e:
+        await edit(status, f"❌ Gagal membaca posisi: {esc(e)}")
+        return
+    if not target:
+        await edit(status, "ℹ️ Tidak ada fee yang bisa diklaim.", NAV_KB)
+        return
+    total = sum(p["unclaimed_usd"] for p in target)
+    head = f"⏳ Klaim fee {len(target)} posisi ({ch.fmt_usd(total)})…"
+    await edit(status, head)
+
+    def work():
+        ok, gagal = [], []
+        for p in target:
+            try:
+                ok.append((p, ch.collect_any(cid, pk(), p["pid"])))
+            except Exception as e:
+                gagal.append((p, str(e)[:80]))
+        return ok, gagal
+
+    async with TX_LOCK:
+        try:
+            ok, gagal = await with_progress(status, head, work)
+        except Exception as e:
+            await edit(status, f"❌ Claim gagal: {esc(e)}")
+            return
+    klaim = 0.0
+    for p, _r in ok:
+        klaim += p["unclaimed_usd"]
+        ev = ch.parse_pid(p["pid"])[1] if str(p["pid"]).isdigit() else str(p["pid"])
+        store.record_event(cid, "fees", ev, p["unclaimed_usd"], "claim all",
+                           wallet=wallet_address())
+    lines = [f"✅ <b>Fee {ch.fmt_usd(klaim)} diklaim</b> dari {len(ok)} posisi"]
+    for p, r in ok:
+        h = (r.get("steps") or [("collect", "")])[-1][1]
+        lines.append(f"· {esc(p['sym0'])}/{esc(p['sym1'])} {_pos_disp(p)}: "
+                     + (ch.tx_link(cid, h) if h else "ok"))
+    for p, err in gagal:
+        lines.append(f"❌ {_pos_disp(p)}: {esc(err)}")
+    g = gas_line(cid)
+    if g:
+        lines.append(g)
+    await edit(status, "\n".join(lines), NAV_KB)
 
 
 async def cmd_recover(update: Update, _=None):
