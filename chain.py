@@ -1217,25 +1217,30 @@ def quote_usd_price(w3: Web3, chain_id: int, quote_sym: str, _cache={}) -> float
     hit = _cache.get(key)
     if hit and time.time() - hit[1] < 60:
         return hit[0]
-    factory = w3.eth.contract(address=Web3.to_checksum_address(cfg["factory"]), abi=FACTORY_ABI)
     wrapped = Web3.to_checksum_address(cfg["wrapped"])
     for stable_sym in cfg["stable_syms"]:
         stable = Web3.to_checksum_address(cfg["quotes"][stable_sym])
-        t0, t1 = sort_tokens(wrapped, stable)
-        for fee in fee_tiers(chain_id):
-            pool = factory.functions.getPool(t0, t1, fee).call()
-            if int(pool, 16) == 0:
-                continue
-            raw = _pool_price_t1_per_t0(w3, pool)
-            dec_w = 18
-            dec_s = token_info(w3, stable)["decimals"]
-            if t0 == wrapped:
-                price = raw * 10 ** (dec_w - dec_s)   # stable per wrapped
-            else:
-                price = (1 / raw) * 10 ** (dec_w - dec_s)
-            if price > 0:
-                _cache[key] = (price, time.time())
-                return price
+        # Pool TERDALAM lintas DEX, bukan tier pertama yang kebetulan ada.
+        # Dulu di sini ada loop `for fee in fee_tiers(...)` yang mengembalikan pool
+        # pertama apa pun kedalamannya — pool debu ber-fee 0,01% menang atas pool
+        # yang benar-benar diperdagangkan, dan HARGA WRAPPED-nya meleset jauh.
+        # Terukur di HyperEVM: WHYPE terbaca $62,50 padahal harga pasar $80,22 (−28%),
+        # dan seluruh nilai posisi di chain itu ikut salah karena sisi meme pun
+        # dihargai dalam wrapped. find_pool_dex sudah mensyaratkan liquidity() > 0
+        # dan memilih yang terdalam.
+        pool, _fee, _dex = find_pool_dex(w3, chain_id, wrapped, stable)
+        if not pool:
+            continue
+        t0, _t1 = sort_tokens(wrapped, stable)
+        raw = _pool_price_t1_per_t0(w3, pool)
+        if not raw:
+            continue
+        dec_w = 18
+        dec_s = token_info(w3, stable)["decimals"]
+        price = (raw if t0 == wrapped else 1 / raw) * 10 ** (dec_w - dec_s)
+        if price > 0:
+            _cache[key] = (price, time.time())
+            return price
     return 0.0
 
 
@@ -3197,6 +3202,43 @@ def _recover_sent(w3: Web3, sent: list, steps: list, label: str):
     return None
 
 
+_KRYSTAL_POS = "https://api.krystal.app/all/v1/lp/userPositions"
+
+
+def krystal_user_positions(address: str, _cache={}, ttl: int = 30) -> list[dict]:
+    """Posisi LP wallet LINTAS CHAIN dari Krystal — sumber yang sama dengan
+    defi.krystal.app/account/<addr>/positions.
+
+    Dipakai sebagai sumber TAMBAHAN untuk memulihkan registry: indexer Uniswap cuma
+    tahu posisi Uniswap, sedangkan Krystal mengindeks banyak protokol sekaligus dan
+    terbukti menemukan posisi yang indexer lewatkan. Tetap bukan otoritatif — tiap
+    tokenId diverifikasi on-chain sebelum dipakai."""
+    key = str(address).lower()
+    hit = _cache.get(key)
+    if hit and time.time() - hit[1] < ttl:
+        return hit[0]
+    try:
+        r = _cf_get(_KRYSTAL_POS, params={"addresses": key, "positionStatus": "OPEN"},
+                    headers=_KRYSTAL_HDR, timeout=20)
+        raw = (r.json() or {}).get("positions") or []
+    except Exception:
+        return hit[0] if hit else []
+    out = []
+    for p in raw:
+        try:
+            cid = int(p.get("chainId") or 0)
+            tid = str(p.get("tokenId") or "")
+            if cid in CHAINS and tid.isdigit():
+                out.append({"chain_id": cid, "token_id": int(tid),
+                            "protocol": str((p.get("pool") or {}).get("project") or ""),
+                            "value_usd": float(p.get("currentPositionValue") or 0)})
+        except Exception:
+            continue
+    if out:
+        _cache[key] = (out, time.time())
+    return out
+
+
 def uniswap_v4_token_ids(chain_id: int, address: str, _cache={}, ttl: int = 20) -> list[int] | None:
     """tokenId posisi v4 aktif dari API resmi Uniswap — sumber yang sama dengan
     app.uniswap.org/positions.
@@ -3251,9 +3293,18 @@ def find_v4_positions(chain_id: int, pk: str, lookback_blocks: int = 400_000) ->
     # getLogs dibatasi rentang blok — di RPC yang pelit cakupannya cuma beberapa jam
     # dan posisi lama tidak akan pernah ketemu (terukur: /recover melaporkan 0 NFT
     # padahal indexer menyebut 8).
-    ids = uniswap_v4_token_ids(chain_id, me)
+    ids = list(uniswap_v4_token_ids(chain_id, me) or [])
+    # Krystal mengindeks lebih banyak protokol dan terbukti menemukan posisi yang
+    # indexer Uniswap lewatkan (terukur: indexer 8, Krystal 12 di wallet yang sama).
+    # Digabung, bukan menggantikan — tiap tokenId tetap diverifikasi on-chain.
+    try:
+        for p in krystal_user_positions(me):
+            if p["chain_id"] == chain_id and "v4" in p["protocol"].lower():
+                ids.append(p["token_id"])
+    except Exception:
+        pass
     if ids:
-        return ids
+        return list(dict.fromkeys(ids))
     posm = Web3.to_checksum_address(v4_cfg(chain_id)["v4_posm"])
     topic = "0x" + Web3.keccak(text="Transfer(address,address,uint256)").hex().removeprefix("0x")
     to_topic = "0x" + me[2:].lower().rjust(64, "0")

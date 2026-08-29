@@ -360,9 +360,23 @@ juta gas ≈ 0,000045 ETH). AMAN tanpa syarat: `burn` di NPM me-require liquidit
 tokensOwed dua-duanya nol — posisi berisi ditolak kontraknya sendiri dengan
 `execution reverted: Not cleared` (sudah diuji terhadap posisi hidup).
 
+### Harga wrapped: pool TERDALAM, bukan tier pertama
+
+`quote_usd_price()` dulu memakai `for fee in fee_tiers(...)` dan mengembalikan pool
+pertama yang ada, apa pun kedalamannya — pool debu ber-fee 0,01% menang atas pool
+yang benar-benar diperdagangkan. Terukur di HyperEVM: **WHYPE terbaca $62,50 padahal
+pasar $80,22 (−28%)**, dan SELURUH nilai posisi di chain itu ikut salah karena sisi
+meme pun dihargai dalam wrapped. Sekarang lewat `find_pool_dex()` yang mensyaratkan
+`liquidity() > 0` dan memilih terdalam lintas DEX; sesudahnya WHYPE $80,36 (meleset
+0,17% dari GeckoTerminal).
+
 ### `/recover`: baca ulang posisi v4 dari chain
 
-`find_v4_positions()` memakai **indexer Uniswap dulu** (`uniswap_v4_token_ids()`,
+`find_v4_positions()` menggabungkan **indexer Uniswap** dan **Krystal**
+(`krystal_user_positions()`, endpoint `all/v1/lp/userPositions?addresses=` — sumber
+yang sama dengan defi.krystal.app/account/<addr>/positions). Krystal mengindeks lebih
+banyak protokol dan terbukti menemukan posisi yang indexer lewatkan: terukur di satu
+wallet **indexer 8, gabungan 11**. Keduanya dipakai (`uniswap_v4_token_ids()`,
 endpoint yang sama dengan app.uniswap.org/positions): ia tahu SEMUA posisi wallet
 berapa pun umurnya. Jalur event `Transfer` PositionManager cuma cadangan — getLogs
 dibatasi rentang blok, dan di RPC pelit cakupannya cuma beberapa jam sehingga posisi
