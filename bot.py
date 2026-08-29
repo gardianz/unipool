@@ -297,7 +297,8 @@ HELP = (
     "/revoke — cabut approval token yang menganggur (keamanan)\n"
     "  <code>/revoke 0xKontrak</code> — periksa kontrak di luar daftar bot\n"
     "/cleanup — burn NFT posisi kosong (mempercepat /list)\n"
-    "/recover — pulihkan posisi v4 yang ada on-chain tapi hilang dari /list\n\n"
+    "/recover — pulihkan posisi v4 yang ada on-chain tapi hilang dari /list\n"
+    "/all — ringkasan posisi di semua chain sekaligus\n\n"
     "<b>Custom saat kartu konfirmasi aktif:</b>\n"
     "<code>r 40 120</code> — range −40%/+120%\n"
     "<code>a 30%</code> / <code>a 0.005</code> — amount"
@@ -313,6 +314,7 @@ def menu_kb() -> InlineKeyboardMarkup:
                      for i in range(min(n, 8))])
     rows += [
         [InlineKeyboardButton("📊 Posisi LP", callback_data="menu|list"),
+         InlineKeyboardButton("🌐 Semua chain", callback_data="menu|all"),
          InlineKeyboardButton("🎯 Pesanan", callback_data="menu|orders")],
         [InlineKeyboardButton("👛 Dompet", callback_data="menu|wallet"),
          InlineKeyboardButton("🔑 Wallet", callback_data="menu|wallets"),
@@ -2579,6 +2581,9 @@ async def on_callback(update: Update, _):
     if data == "menu|recover":
         await cmd_recover(update, None)
         return
+    if data == "menu|all":
+        await cmd_all(update, None)
+        return
     if data == "menu|help":
         await edit(q.message, HELP, InlineKeyboardMarkup([BACK_ROW]))
         return
@@ -3134,6 +3139,7 @@ async def post_init(app):
             BotCommand("revoke", "Cabut approval token yang menganggur"),
             BotCommand("cleanup", "Burn NFT posisi kosong (mempercepat /list)"),
             BotCommand("recover", "Pulihkan posisi v4 yang hilang dari daftar"),
+            BotCommand("all", "Ringkasan posisi di semua chain"),
             BotCommand("help", "Bantuan & daftar perintah"),
         ])
     except Exception as e:
@@ -3257,6 +3263,54 @@ async def do_claim_all(update: Update):
     if g:
         lines.append(g)
     await edit(status, "\n".join(lines), NAV_KB)
+
+
+async def cmd_all(update: Update, _=None):
+    """Ringkasan posisi di SEMUA chain, bukan cuma yang aktif.
+
+    /list sengaja tetap per-chain (detail + tombol aksi butuh chain aktif); ini
+    pelengkapnya supaya tidak perlu ganti chain satu per satu untuk tahu di mana
+    dana tersebar."""
+    if not authorized(update):
+        return
+    status = await reply(update, "🌐 Membaca posisi di semua chain…")
+
+    def scan():
+        out = []
+        for cid in ch.CHAINS:
+            try:
+                out.append((cid, list_positions_all(cid), None))
+            except Exception as e:
+                out.append((cid, None, str(e)[:60]))
+        return out
+
+    rows = await asyncio.to_thread(scan)
+    lines, total_v, total_f = [], 0.0, 0.0
+    for cid, pos, err in rows:
+        nama = esc(ch.CHAINS[cid]["name"])
+        if err is not None:
+            lines.append(f"· <b>{nama}</b> — gagal dibaca: {esc(err)}")
+            continue
+        v = sum(p["value_usd"] for p in pos)
+        f = sum(p["unclaimed_usd"] for p in pos)
+        total_v += v
+        total_f += f
+        if not pos:
+            lines.append(f"· <b>{nama}</b> — tidak ada posisi")
+            continue
+        lines.append(f"· <b>{nama}</b> — {len(pos)} posisi · {ch.fmt_usd(v)} "
+                     f"(fee {ch.fmt_usd(f)})")
+        for p in sorted(pos, key=lambda x: -x["value_usd"])[:5]:
+            m = "🟢" if p["in_range"] else "🔴"
+            sym = p["sym0"] if p["quote_is_token1"] else p["sym1"]
+            lines.append(f"    {m} {esc(sym)} {_pos_disp(p)} · {ch.fmt_usd(p['value_usd'])}")
+        if len(pos) > 5:
+            lines.append(f"    <i>… +{len(pos) - 5} lagi</i>")
+    head = (f"🌐 <b>Semua chain</b> · {wallet_label()}\n"
+            f"Total posisi <b>{ch.fmt_usd(total_v)}</b> · fee belum diklaim "
+            f"{ch.fmt_usd(total_f)}\n"
+            f"<i>Ganti chain lewat ⛓ Chain untuk aksi (add/close/rebalance).</i>\n")
+    await edit(status, head + "\n".join(lines), NAV_KB)
 
 
 async def cmd_recover(update: Update, _=None):
@@ -3649,6 +3703,7 @@ def main():
     app.add_handler(CommandHandler("cleanup", cmd_cleanup))
     app.add_handler(CommandHandler("revoke", cmd_revoke))
     app.add_handler(CommandHandler("recover", cmd_recover))
+    app.add_handler(CommandHandler("all", cmd_all))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_address))
     app.add_error_handler(on_error)
