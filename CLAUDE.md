@@ -402,6 +402,23 @@ itulah yang menutup kekurangannya, dan ia tidak pernah tercapai.
 Kegagalan penjualan per-quote sekarang dilaporkan lewat `_step()`, tidak lagi
 ditelan `except: continue`.
 
+### Allowance Permit2 DIPOTONG tiap dipakai — jangan approve pas-pasan
+
+`AllowanceTransfer` Permit2 mengurangi allowance setiap kali spender menariknya.
+`ensure_permit2()` dulu meng-approve persis `need_wei`, jadi begitu satu tx sukses
+sisanya ~0 dan percobaan berikutnya gagal `InsufficientAllowance(uint256)` (selector
+`0xf96fb071`; argumennya = sisa allowance, terukur 10000 wei).
+
+Akibatnya jauh lebih buruk dari sekadar gagal: mint/add yang tx pertamanya SUKSES
+dilaporkan "gagal 3×" karena dua percobaan sisanya mentok di preflight — dan user
+menambah dana dua kali.
+
+Dua penjagaan sekarang:
+
+- approve dengan **margin 2×** jumlah tx itu (tetap terbatas, kedaluwarsa tetap 1 jam);
+- kalau preflight tetap balas `0xf96fb071`, allowance disetel ulang sebelum percobaan
+  berikutnya, bukan mengulang tiga kali dengan sebab yang sama.
+
 ### Mint yang sukses tapi dilaporkan gagal = dana hilang dari UI
 
 `mint_v4`/`increase_v4` mencoba 3× dan menyerah kalau `wait_ok`/`_preflight` gagal.

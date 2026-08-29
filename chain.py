@@ -5358,7 +5358,13 @@ def ensure_permit2(w3: Web3, chain_id: int, pk: str, token: str, spender: str,
     amt, exp, _ = p2.functions.allowance(account.address, token, spender).call()
     now = int(time.time())
     if amt < need_wei or exp < now + DEADLINE_SECS:
-        need160 = min(need_wei, 2 ** 160 - 1)
+        # Beri MARGIN, jangan pas-pasan. Permit2 MEMOTONG allowance tiap kali dipakai
+        # (AllowanceTransfer), jadi approve sebesar kebutuhan persis membuat percobaan
+        # berikutnya — dan pembulatan sekecil apa pun — gagal
+        # `InsufficientAllowance(uint256)` (selector 0xf96fb071). Terbukti bikin add
+        # dilaporkan gagal padahal tx pertamanya sukses, lalu user menambah dua kali.
+        # Tetap terbatas: 2x jumlah tx ini, kedaluwarsa 1 jam.
+        need160 = min(int(need_wei * 2) + 1, 2 ** 160 - 1)
         h = send_tx(w3, pk, {"to": p2_addr,
                              "data": calldata(p2.functions.approve(token, spender, need160, now + 3600))})
         wait_ok(w3, h, "permit2 approve")
@@ -5691,6 +5697,17 @@ def mint_v4(chain_id: int, pk: str, pool_info: dict, budget: float,
             break
         except Exception as e:
             last_err = e
+            # InsufficientAllowance(uint256): allowance Permit2 habis terpakai tx
+            # sebelumnya. Setel ulang sebelum mencoba lagi, kalau tidak ketiga
+            # percobaan gagal dengan sebab yang sama.
+            if "f96fb071" in str(e):
+                for cur, amax in ((key[0], a0max), (key[1], a1max)):
+                    if cur.lower() != V4_NATIVE and amax > 2:
+                        try:
+                            steps += ensure_permit2(w3, chain_id, pk, cur, posm_addr,
+                                                    int(amax * 2) + 1)
+                        except Exception:
+                            pass
             if attempt < 2:
                 time.sleep(2)
     if receipt is None:
@@ -5983,6 +6000,14 @@ def increase_v4(chain_id: int, pk: str, tid: int, budget_quote: float,
             break
         except Exception as e:
             last_err = e
+            if "f96fb071" in str(e):      # InsufficientAllowance — lihat mint_v4
+                for cur, amax in ((key[0], a0max), (key[1], a1max)):
+                    if cur.lower() != V4_NATIVE and amax > 2:
+                        try:
+                            steps += ensure_permit2(w3, chain_id, pk, cur, posm_addr,
+                                                    int(amax * 2) + 1)
+                        except Exception:
+                            pass
             if attempt < 2:
                 time.sleep(2)
     receipt = receipt or _recover_sent(w3, sent, steps, "increase")
