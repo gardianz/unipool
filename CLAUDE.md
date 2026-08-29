@@ -362,9 +362,12 @@ tokensOwed dua-duanya nol — posisi berisi ditolak kontraknya sendiri dengan
 
 ### `/recover`: baca ulang posisi v4 dari chain
 
-`find_v4_positions()` membaca event `Transfer(_, to=wallet, tokenId)` PositionManager
-dengan filter topic, jadi satu-dua request saja walau rentangnya lebar; rentangnya
-dipersempit otomatis kalau RPC menolak. Ini jaring pengaman untuk registry
+`find_v4_positions()` memakai **indexer Uniswap dulu** (`uniswap_v4_token_ids()`,
+endpoint yang sama dengan app.uniswap.org/positions): ia tahu SEMUA posisi wallet
+berapa pun umurnya. Jalur event `Transfer` PositionManager cuma cadangan — getLogs
+dibatasi rentang blok, dan di RPC pelit cakupannya cuma beberapa jam sehingga posisi
+lama tidak akan pernah ketemu (terukur di VPS: `/recover` melaporkan **0 NFT**
+padahal indexer menyebut **8**). Ini jaring pengaman untuk registry
 `history.json` yang bolong — v4 tidak bisa dienumerasi on-chain, jadi tanpa registry
 posisi lenyap dari UI walau dananya utuh.
 

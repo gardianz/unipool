@@ -3197,6 +3197,41 @@ def _recover_sent(w3: Web3, sent: list, steps: list, label: str):
     return None
 
 
+def uniswap_v4_token_ids(chain_id: int, address: str, _cache={}, ttl: int = 20) -> list[int] | None:
+    """tokenId posisi v4 aktif dari API resmi Uniswap — sumber yang sama dengan
+    app.uniswap.org/positions.
+
+    Jauh lebih andal daripada memindai log untuk memulihkan registry: indexer tahu
+    SEMUA posisi wallet tanpa peduli seberapa lama, sedangkan getLogs dibatasi
+    rentang blok dan di RPC pelit cakupannya cuma beberapa jam. None kalau chain-nya
+    bukan Uniswap atau API-nya gagal → caller jatuh ke jalur log."""
+    if not uni_api_dex(chain_id):
+        return None
+    key = (chain_id, address.lower())
+    hit = _cache.get(key)
+    if hit and time.time() - hit[1] < ttl:
+        return hit[0]
+    body = {"address": Web3.to_checksum_address(address), "chainIds": [chain_id],
+            "protocolVersions": ["PROTOCOL_VERSION_V4"],
+            "positionStatuses": ["POSITION_STATUS_IN_RANGE", "POSITION_STATUS_OUT_OF_RANGE"],
+            "pageSize": 100, "includeHidden": True}
+    try:
+        r = _cf_post(_UNI_POS_API, headers=_UNI_HDR, json=body, timeout=10)
+        raw = r.json().get("positions")
+        if not isinstance(raw, list):
+            return None
+        ids = []
+        for p in raw:
+            d = p.get("v4Position") or {}
+            tid = d.get("tokenId") or (d.get("poolPosition") or {}).get("tokenId")
+            if str(tid or "").isdigit():
+                ids.append(int(tid))
+        _cache[key] = (ids, time.time())
+        return ids
+    except Exception:
+        return None
+
+
 def find_v4_positions(chain_id: int, pk: str, lookback_blocks: int = 400_000) -> list[int]:
     """tokenId posisi v4 yang DIMILIKI wallet ini, dibaca dari event Transfer PosM.
 
@@ -3212,6 +3247,13 @@ def find_v4_positions(chain_id: int, pk: str, lookback_blocks: int = 400_000) ->
         return []
     w3 = get_w3(chain_id)
     me = w3.eth.account.from_key(pk).address
+    # Indexer Uniswap DULU: ia tahu semua posisi wallet berapa pun umurnya, sedangkan
+    # getLogs dibatasi rentang blok — di RPC yang pelit cakupannya cuma beberapa jam
+    # dan posisi lama tidak akan pernah ketemu (terukur: /recover melaporkan 0 NFT
+    # padahal indexer menyebut 8).
+    ids = uniswap_v4_token_ids(chain_id, me)
+    if ids:
+        return ids
     posm = Web3.to_checksum_address(v4_cfg(chain_id)["v4_posm"])
     topic = "0x" + Web3.keccak(text="Transfer(address,address,uint256)").hex().removeprefix("0x")
     to_topic = "0x" + me[2:].lower().rjust(64, "0")
