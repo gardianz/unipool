@@ -231,6 +231,18 @@ def withdrawn_usd(chain_id: int, token_id) -> float:
                if e["kind"] == "close" and e["token_id"] == token_id)
 
 
+def churn_count(chain_id: int, wallet: str = "") -> int:
+    """Berapa kali dana yang SAMA didaur ulang (rebalance / pindah pool / compound).
+
+    Tiap siklus mencatat close + mint baru, jadi `deposits` dan `withdrawals`
+    menggelembung tanpa ada modal segar yang masuk. Angka ini dipakai UI untuk
+    menjelaskan kenapa dua angka itu jauh lebih besar dari modal sebenarnya."""
+    ev = [e for e in _hist()["events"].get(str(chain_id), [])
+          if e.get("wallet", "") == wallet.lower()]
+    return sum(1 for e in ev if e["kind"] == "mint"
+               and str(e.get("detail", "")).startswith(("rebalance", "compound")))
+
+
 def portfolio_summary(chain_id: int, wallet: str = "") -> dict:
     """PnL per wallet — event lama tanpa field wallet tidak ikut dihitung."""
     ev = [e for e in _hist()["events"].get(str(chain_id), [])

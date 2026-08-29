@@ -1711,16 +1711,28 @@ async def cmd_list(update: Update, _, status_msg=None):
     unclaimed = sum(p["unclaimed_usd"] for p in positions)
     deposits = summary["deposits"]
     pnl = summary["withdrawals"] + summary["fees_claimed"] + open_value + unclaimed - deposits
-    pnl_pct = (pnl / deposits * 100) if deposits else 0.0
+    # Persennya HARUS terhadap modal bersih (deposits − withdrawals), bukan deposits
+    # kumulatif. Tiap rebalance/pindah pool/compound mencatat close + mint baru,
+    # jadi deposits menggelembung oleh dana yang sama didaur ulang berkali-kali dan
+    # persentasenya jadi terlihat jauh lebih kecil dari yang benar-benar dirasakan
+    # (terukur: −3,19% terhadap deposit kumulatif $67,4k vs −26,48% terhadap modal
+    # bersih $8,1k, dari 541 siklus).
+    net_in = max(0.0, deposits - summary["withdrawals"])
+    base = net_in or deposits
+    pnl_pct = (pnl / base * 100) if base else 0.0
+    churn = store.churn_count(cid, wallet_address())
 
     lines = []
     if len(all_pks()) > 1:
         waddr = wallet_address()
         lines.append(f"👛 {esc(wallet_label())} <code>{esc(waddr[:6])}…{esc(waddr[-4:])}</code>")
     lines += [
-        f"<b>Portfolio PnL {ch.fmt_usd(pnl)} ({pnl_pct:+.2f}%)</b>",
+        f"<b>Portfolio PnL {ch.fmt_usd(pnl)} ({pnl_pct:+.2f}% dari modal bersih "
+        f"{ch.fmt_usd(net_in)})</b>",
         (f"deposits {ch.fmt_usd(deposits)} | withdrawals {ch.fmt_usd(summary['withdrawals'])} | "
          f"fees claimed {ch.fmt_usd(summary['fees_claimed'])}"),
+        (f"<i>deposits/withdrawals termasuk {churn} siklus rebalance — dana yang sama "
+         f"didaur ulang, bukan modal segar.</i>" if churn else ""),
         f"open value {ch.fmt_usd(open_value)} | unclaimed fees {ch.fmt_usd(unclaimed)}",
         "",
     ]

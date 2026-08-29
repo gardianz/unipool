@@ -285,6 +285,21 @@ Pembukuannya sama persis dengan rebalance (`finish_rebalance()` dipakai berdua):
 event `close` + `fees` untuk posisi lama, `mint` untuk yang baru, dan `drop_ref`/
 `add_ref` untuk v4.
 
+### Persen PnL: terhadap modal BERSIH, bukan deposit kumulatif
+
+Tiap rebalance / pindah pool / compound mencatat `close` + `mint` baru, jadi
+`deposits` dan `withdrawals` menggelembung oleh dana yang sama didaur ulang. Memakai
+`deposits` sebagai penyebut membuat kerugian terlihat jauh lebih kecil dari yang
+dirasakan — terukur di satu wallet: **−3,19% terhadap deposit kumulatif $67,4k**
+padahal **−26,48% terhadap modal bersih $8,1k**, dari 541 siklus.
+
+Penyebutnya `deposits − withdrawals`, dan UI menyebut jumlah siklusnya
+(`store.churn_count()`) supaya dua angka besar itu tidak disalahartikan sebagai
+modal segar.
+
+Angka PnL dolarnya sendiri sudah benar sejak awal:
+`withdrawals + fees_claimed + open_value + unclaimed − deposits`.
+
 ### Pembukuan rebalance tidak boleh bolong
 
 `do_rebalance` (bot) dan `api_action` (web) memotret posisi lama SEBELUM eksekusi
