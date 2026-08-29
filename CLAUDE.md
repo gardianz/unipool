@@ -402,6 +402,22 @@ itulah yang menutup kekurangannya, dan ia tidak pernah tercapai.
 Kegagalan penjualan per-quote sekarang dilaporkan lewat `_step()`, tidak lagi
 ditelan `except: continue`.
 
+### Aksi ke posisi yang sudah tertutup
+
+Dua alur yang berjalan berdekatan (tombol Close tertekan dua kali) membuat yang
+kedua mengirim tx ke posisi yang sudah di-burn: tx masuk blok lalu revert
+`NOT_MINTED`, gas terbakar percuma, dan pesannya bikin user mengira close-nya gagal
+padahal yang pertama sukses. Terbukti di #1102018 — burn sukses di blok 48918344,
+tx kedua revert 26 blok kemudian.
+
+`close_any()` memanggil `assert_position_open()` lebih dulu dan menolak dengan
+pesan "sudah tertutup" tanpa mengirim apa pun.
+
+**`wait_ok()` juga mendekode alasan revert**: kalau receipt status 0, call-nya
+diulang di blok sebelumnya untuk mendapat sebabnya. "Tx close v4 FAILED" tanpa
+alasan memaksa user menebak; sekarang pesannya menyertakan `NOT_MINTED`, `STF`,
+dan sejenisnya.
+
 ### Allowance Permit2 DIPOTONG tiap dipakai — jangan approve pas-pasan
 
 `AllowanceTransfer` Permit2 mengurangi allowance setiap kali spender menariknya.

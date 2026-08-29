@@ -1125,7 +1125,17 @@ def wait_ok(w3: Web3, txhash: str, what: str, total_wait: int = 180):
             f"ulang berkali-kali — kemungkinan besar dibuang mempool RPC. "
             f"Tidak ada dana yang berpindah di langkah ini; ulangi saja. ({txhash})")
     if r.status != 1:
-        hint = ""
+        # Ulangi call-nya di blok sebelum tx itu untuk mendapat ALASAN revert —
+        # "FAILED" saja memaksa user menebak. Murah: satu eth_call, read-only.
+        why = ""
+        try:
+            t = w3.eth.get_transaction(txhash)
+            w3.eth.call({"from": t["from"], "to": t["to"], "data": t["input"],
+                         "value": t.get("value", 0)}, block_identifier=r.blockNumber - 1)
+        except Exception as e:
+            m = str(e)
+            why = f" — {m[:160]}" if m else ""
+        hint = why
         try:
             # gasUsed mepet limit = kehabisan gas, bukan require() yang gagal.
             # Bedanya penting: yang satu tinggal naikkan limit, yang satu salah angka.
@@ -6328,6 +6338,27 @@ def _compound_v4(w3: Web3, chain_id: int, pk: str, tid: int, slippage_pct: float
             "meme_sym": i0["symbol"] if q_is_t1 else i1["symbol"]}
 
 
+def assert_position_open(w3: Web3, chain_id: int, pid) -> None:
+    """Gagalkan LEBIH AWAL kalau posisinya sudah tidak ada.
+
+    Dua alur yang berjalan berdekatan (mis. tombol Close tertekan dua kali) bikin
+    yang kedua mengirim tx ke posisi yang sudah di-burn: tx-nya masuk blok lalu
+    revert `NOT_MINTED`, gas terbakar percuma, dan pesan errornya bikin user
+    mengira close-nya gagal padahal yang pertama sukses."""
+    ver, ref = parse_pid(pid)
+    if ver != 4:
+        return
+    try:
+        posm = _v4c(w3, chain_id, "v4_posm", V4_POSM_ABI)
+        posm.functions.ownerOf(int(ref)).call()
+    except Exception as e:
+        if "NOT_MINTED" in str(e) or "nonexistent" in str(e).lower():
+            raise RuntimeError(
+                f"Posisi {pid} sudah tertutup — tidak ada yang perlu dikerjakan. "
+                f"Kalau ini di luar dugaan, cek /list (dananya sudah di wallet).")
+        # error lain (RPC) jangan dijadikan alasan membatalkan
+
+
 def compound_any(chain_id: int, pk: str, pid, slippage_pct: float = 5.0) -> dict:
     """Reinvestasi fee unclaimed ke posisi yang SAMA. Tidak memakai saldo wallet lain.
 
@@ -6386,6 +6417,9 @@ def collect_any(chain_id: int, pk: str, pid) -> dict:
 
 
 def close_any(chain_id: int, pk: str, pid, slippage_pct: float, autoswap: bool) -> dict:
+    # Gagalkan lebih awal kalau posisinya sudah tertutup — kalau tidak, tx-nya
+    # terkirim, revert NOT_MINTED, dan gasnya terbakar percuma.
+    assert_position_open(get_w3(chain_id), chain_id, pid)
     ver, ref = parse_pid(pid)
     if ver == 3:
         return close_position(chain_id, pk, ref, slippage_pct, autoswap,
