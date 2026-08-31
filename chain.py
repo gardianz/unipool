@@ -633,6 +633,57 @@ def amounts_from_liquidity(liquidity: int, sqrtp_x96: int, tick_lower: int, tick
     return liquidity * (sb - sp) / (sp * sb), liquidity * (sp - sa)
 
 
+# Sisi posisi tidak boleh bisa membulat ke nol. 1000 wei itu ambang kasar tapi
+# cukup: yang mau ditangkap adalah rentang yang secara matematis mustahil membayar
+# balik, bukan selisih pembulatan biasa.
+_MIN_SIDE_WEI = 1000
+
+
+def _sqrt_at_tick(tick: int) -> int:
+    """sqrtPriceX96 pada satu tick. Decimal presisi tinggi — di tick ekstrem
+    (±887k) float64 kehabisan digit signifikan."""
+    from decimal import Decimal, localcontext
+    with localcontext() as ctx:
+        ctx.prec = 80
+        return int((Decimal("1.0001") ** (Decimal(tick) / 2)) * (Decimal(2) ** 96))
+
+
+def assert_range_recoverable(lq: int, tick_lower: int, tick_upper: int,
+                             sym0: str = "token0", sym1: str = "token1") -> None:
+    """Tolak rentang yang modalnya TIDAK AKAN PERNAH bisa kembali.
+
+    Posisi LP menukar sisi saat harga melintasi rentang. Kalau jumlah sisi lawan
+    membulat ke nol wei, penukaran itu memusnahkan modal, bukan memindahkannya —
+    dan tidak ada tanda apa pun sampai harga benar-benar melintas.
+
+    Kejadian nyata (Robinhood, HOME): 119.485,589 HOME masuk ke posisi #1281406 di
+    tick 876240..887220 dengan likuiditas cuma 15.373. Di batas ATAS posisi itu
+    memegang 1,19e23 wei HOME; di batas BAWAH ia memegang **6,1e-16 wei** token0 —
+    di bawah satu wei, jadi nol. Harga turun melintasi rentang, HOME diambil trader
+    lawan, dan burn mengembalikan NOL. Uangnya tidak nyangkut di kontrak, sudah
+    pindah ke lawan trading.
+
+    Penyebabnya rentang mepet MAX_TICK (887272; tick atasnya cuma 52 dari batas)
+    di pool ber-rasio harga ~1e38, sehingga satu wei sisi lawan bernilai ~1e20
+    token — granularitas wei sendiri yang menelan posisinya."""
+    if tick_upper >= MAX_TICK - 100 or tick_lower <= MIN_TICK + 100:
+        raise RuntimeError(
+            f"Rentang mepet batas kisi Uniswap (tick {tick_lower}..{tick_upper}, "
+            f"batas ±{MAX_TICK}). Di harga seekstrem itu satu wei sisi lawan bernilai "
+            f"ribuan token, jadi posisi bisa membulat jadi nol saat harga melintas. "
+            f"Mint dibatalkan — dana masih utuh di wallet.")
+    a0_lo, _ = amounts_from_liquidity(lq, _sqrt_at_tick(tick_lower), tick_lower, tick_upper)
+    _, a1_hi = amounts_from_liquidity(lq, _sqrt_at_tick(tick_upper), tick_lower, tick_upper)
+    if a0_lo < _MIN_SIDE_WEI or a1_hi < _MIN_SIDE_WEI:
+        kosong = sym0 if a0_lo < _MIN_SIDE_WEI else sym1
+        raise RuntimeError(
+            f"Rentang ini tidak bisa mengembalikan modal: pada likuiditas {lq:,} sisi "
+            f"{kosong} cuma {min(a0_lo, a1_hi):.3g} wei saat harga di batasnya — "
+            f"membulat jadi NOL. Kalau harga melintas, posisi hilang seluruhnya. "
+            f"Mint dibatalkan — dana masih utuh di wallet. "
+            f"Pool ini rasio harganya ekstrem; pakai pool lain atau range lebih sempit.")
+
+
 def liquidity_for_amounts(sqrtp_x96: int, tick_lower: int, tick_upper: int,
                           amount0: int, amount1: int) -> float:
     """Liquidity maksimal dari pasangan amount (kebalikan amounts_from_liquidity)."""
@@ -3820,6 +3871,12 @@ def mint_position(chain_id: int, pk: str, pool_info: dict, budget: float,
             else:
                 a0d, a1d, a0m, a1m = dep_wei, 0, int(dep_wei * slip), 0
 
+        # Semua cabang mode lewat sini, jadi penjagaan rentang dipasang di satu titik
+        # (cabang single-sided tidak menghitung `liq` sendiri).
+        _lq = int(liquidity_for_amounts(slot0[0], tick_lower, tick_upper, a0d, a1d))
+        if _lq > 0:
+            assert_range_recoverable(_lq, tick_lower, tick_upper)
+
         params = (pool_info["token0"], pool_info["token1"], pool_info["fee"], tick_lower, tick_upper,
                   a0d, a1d, a0m, a1m, account.address, int(time.time()) + DEADLINE_SECS)
         try:
@@ -4510,6 +4567,7 @@ def increase_position(chain_id: int, pk: str, token_id: int, budget_quote: float
             raise RuntimeError(
                 "Liquidity terhitung 0 — posisi in-range butuh dua sisi tapi salah satu "
                 "sisi kosong (saldo meme 0 dan swap ter-skip). Coba amount lebih besar.")
+        assert_range_recoverable(lq, tick_lo, tick_hi)
         u0, u1 = amounts_from_liquidity(lq, s0[0], tick_lo, tick_hi)
         a0m, a1m = int(u0 * slip * 0.95), int(u1 * slip * 0.95)
         params = (token_id, a0d, a1d, a0m, a1m, int(time.time()) + DEADLINE_SECS)
@@ -5780,6 +5838,7 @@ def mint_v4(chain_id: int, pk: str, pool_info: dict, budget: float,
         if lq <= 0:
             raise RuntimeError("Liquidity terhitung 0 — cek amount / salah satu sisi kosong.")
         lq = lq - lq // 5000 - 1  # margin pembulatan: jumlah yang ditarik posm ≤ desired
+        assert_range_recoverable(lq, tick_lower, tick_upper)
         u0, u1 = amounts_from_liquidity(lq, sqrtp, tick_lower, tick_upper)
         a0max = min(int(u0 * (1 + slippage_pct / 100)) + 2, MAX_UINT128, max(a0d, 2))
         a1max = min(int(u1 * (1 + slippage_pct / 100)) + 2, MAX_UINT128, max(a1d, 2))
@@ -6085,6 +6144,7 @@ def increase_v4(chain_id: int, pk: str, tid: int, budget_quote: float,
             raise RuntimeError(
                 "Liquidity terhitung 0 — posisi in-range butuh dua sisi tapi salah satu kosong.")
         lq = lq - lq // 5000 - 1
+        assert_range_recoverable(lq, tick_lo, tick_hi)
         u0, u1 = amounts_from_liquidity(lq, sqrtp, tick_lo, tick_hi)
         a0max = min(int(u0 * (1 + slippage_pct / 100)) + 2, MAX_UINT128, max(a0d, 2))
         a1max = min(int(u1 * (1 + slippage_pct / 100)) + 2, MAX_UINT128, max(a1d, 2))

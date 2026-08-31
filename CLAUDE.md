@@ -496,6 +496,43 @@ menghapus perubahan proses lain.
 Aturannya: jalur satu-posisi pakai `position_one()`/`position_by_pid()`, jalur daftar
 pakai `list_all_positions()`. Jangan mencari satu posisi lewat daftar.
 
+### Rentang yang modalnya tidak bisa kembali (kerugian nyata)
+
+`assert_range_recoverable()` dipanggil di SEMUA jalur yang memasukkan dana ke posisi
+(mint v3/v4, add v3/v4) dan membatalkan sebelum tx dikirim.
+
+Kejadian nyata di Robinhood: **119.485,589 HOME** masuk ke posisi v4 #1281406 di tick
+**876240..887220** dengan likuiditas cuma **15.373** (tx `0x6c2687cd…`). Empat menit
+kemudian posisi dibakar (`0x7d8e839e…`, `ModifyLiquidity −15.373`) dan
+mengembalikan **NOL** — tx itu cuma punya 2 log, tanpa satu pun transfer token, dan
+sapuan penuh kedua wallet di seluruh rentang blok (56/56 query sukses) menemukan
+hanya SATU transfer: 119.485 HOME keluar. Uangnya tidak nyangkut di kontrak, sudah
+pindah ke lawan trading.
+
+Sebabnya granularitas wei, bukan bug pembacaan:
+
+```
+L=15373, tick 876240..887220
+  di batas ATAS : token1 = 1,19e23 wei  (119.485,589 HOME — seluruh modal)
+  di batas BAWAH: token0 = 6,1e-16 wei  (di bawah SATU wei → nol)
+```
+
+Tick atasnya cuma **52** dari MAX_TICK (887272). Di rasio harga ~1e38, satu wei sisi
+lawan bernilai ~1e20 token, jadi begitu harga melintas turun, sisi yang seharusnya
+diterima posisi membulat jadi nol dan modal lenyap seluruhnya. Ini TIDAK terlihat
+sampai harga benar-benar melintas.
+
+Dua aturannya, keduanya perlu:
+
+- **Rentang tidak boleh mepet batas kisi** (±887272, margin 100 tick).
+- **Tiap sisi ≥ `_MIN_SIDE_WEI` (1000 wei)** saat harga ada di batasnya —
+  `amounts_from_liquidity` dievaluasi di `_sqrt_at_tick(lo)` dan `_sqrt_at_tick(hi)`.
+  `_sqrt_at_tick` memakai `Decimal` presisi 80: di tick ±887k float64 kehabisan digit.
+
+Diuji: kasus HOME ditolak, `L=1` dan `L=1000` di tick normal ditolak, dan **6 posisi
+hidup sungguhan lolos semua** (L 1e15–4,6e19). Jangan longgarkan tanpa menguji ulang
+terhadap posisi hidup — penjagaan yang salah tuning memblokir mint yang sah.
+
 ### Gagal dibaca ≠ tidak ada
 
 `list_all_positions()` dulu membuang exception per-posisi sama seperti hasil `None`.
