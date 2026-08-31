@@ -479,6 +479,37 @@ Konsekuensi untuk kode baru: mutator apa pun WAJIB `with _hist_write():` dan
 memutasinya mengubah apa yang dilihat pemanggil lain, dan menulis dari salinan basi
 menghapus perubahan proses lain.
 
+### Satu tombol = satu posisi, dan gagal baca BUKAN "tidak ditemukan"
+
+`position_by_pid()` membaca satu posisi langsung dari pid-nya. Dulu 17 tempat di
+`bot.py` memindai seluruh `list_all_positions()` lalu menyaring pid — dua kerugian:
+
+- **Mahal.** Terukur `reb|v4:1277501` 24,7 detik, dan langsung 3,12s vs 15,14s
+  untuk 17 posisi (nilai identik). Ongkos RPC-nya ikut ~5× lebih kecil, jadi ini
+  juga yang paling meredakan 429.
+- **Rapuh.** `list_all_positions` sengaja menelan kegagalan per-posisi supaya daftar
+  tetap tampil. Satu 429 membuat posisi yang dicari lenyap dari hasil dan UI melapor
+  **"tidak ditemukan (sudah ditutup?)"** — user mengira dananya hilang, lalu mengklik
+  ulang dan beraksi dua kali. `position_by_pid` MELEMPAR kegagalan baca; hanya `None`
+  yang berarti benar-benar tidak ada.
+
+Aturannya: jalur satu-posisi pakai `position_one()`/`position_by_pid()`, jalur daftar
+pakai `list_all_positions()`. Jangan mencari satu posisi lewat daftar.
+
+### Rate limit RPC: rotasi endpoint, bukan menunggu
+
+`get_w3` men-cache satu endpoint 5 menit. Failover-nya dulu cuma ada di pemilihan
+AWAL, padahal jatah habis di tengah jalan justru yang lazim — begitu endpoint itu
+kena 429, semua panggilan gagal sampai cache kedaluwarsa dan user melihat
+*"Collect gagal: … too many 429 error responses"*.
+
+`_Provider.make_request` menandai endpoint-nya di `_RPC_BAD` lalu membuang cache
+chain, jadi panggilan berikutnya memilih endpoint lain sendiri. `_is_rate_limited()`
+mencocokkan teks exception karena urllib3 menghabiskan retry lalu melempar
+`MaxRetryError`/`RetryError` — bukan objek HTTP yang status code-nya bisa dibaca.
+Endpoint bertanda dilewati `_RPC_BAD_COOLDOWN` (120 detik), **tapi hanya kalau masih
+ada pilihan lain** supaya chain ber-RPC tunggal tidak jadi mati total.
+
 ### Nilai event mustahil = PnL rusak selamanya
 
 PnL portfolio itu **jumlah**, bukan rata-rata — tidak ada yang meredam satu nilai

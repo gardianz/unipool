@@ -775,6 +775,46 @@ def _poa(w3: Web3) -> Web3:
     return w3
 
 
+_RPC_BAD: dict[str, float] = {}     # url -> kapan terakhir kena rate limit
+_RPC_BAD_COOLDOWN = 120             # detik endpoint dilewati setelah 429
+
+
+def _is_rate_limited(e: Exception) -> bool:
+    """Kenali kehabisan jatah RPC dari exception apa pun bentuknya.
+
+    urllib3 menghabiskan retry lalu melempar `MaxRetryError`/`RetryError` yang
+    pesannya "too many 429 error responses" — bukan objek HTTP yang bisa dibaca
+    status code-nya. Sebagian RPC membalas 429 sebagai error JSON-RPC biasa."""
+    s = f"{type(e).__name__}: {e}".lower()
+    return "429" in s or "too many request" in s or "rate limit" in s or "rate-limit" in s
+
+
+class _Provider(Web3.HTTPProvider):
+    """HTTPProvider yang menandai endpoint-nya saat kena rate limit.
+
+    Tanpa ini `get_w3` memegang satu endpoint 5 menit penuh: begitu endpoint itu
+    kehabisan jatah, SEMUA panggilan gagal sampai cache-nya kedaluwarsa, dan
+    user melihat "Collect gagal: too many 429 error responses". Failover-nya cuma
+    ada di pemilihan awal, padahal jatah habis di tengah jalan justru yang lazim.
+    Di sini endpoint ditandai lalu cache chain dibuang, jadi panggilan berikutnya
+    memilih endpoint lain sendiri."""
+
+    def __init__(self, *a, _chain_id: int | None = None, **kw):
+        self._chain_id = _chain_id
+        super().__init__(*a, **kw)
+
+    def make_request(self, method, params):
+        try:
+            return super().make_request(method, params)
+        except Exception as e:
+            if _is_rate_limited(e):
+                _RPC_BAD[self.endpoint_uri] = time.time()
+                hit = _W3_CACHE.get(self._chain_id)
+                if hit and getattr(hit[0].provider, "endpoint_uri", None) == self.endpoint_uri:
+                    _W3_CACHE.pop(self._chain_id, None)
+            raise
+
+
 def get_w3(chain_id: int, fresh: bool = False) -> Web3:
     """Failover multi-RPC: coba tiap endpoint (env override dulu), verifikasi
     chain_id, cache yang jalan 5 menit."""
@@ -790,12 +830,18 @@ def get_w3(chain_id: int, fresh: bool = False) -> Web3:
     if akey and cfg.get("alchemy"):
         rpcs.append(f"https://{cfg['alchemy']}.g.alchemy.com/v2/{akey}")
     rpcs += cfg["rpcs"]
+    # Endpoint yang baru saja kehabisan jatah dilewati dulu — tapi hanya kalau masih
+    # ada pilihan lain, supaya chain ber-RPC tunggal tidak jadi mati total.
+    fresh_rpcs = [r for r in rpcs if time.time() - _RPC_BAD.get(r, 0) > _RPC_BAD_COOLDOWN]
+    if fresh_rpcs:
+        rpcs = fresh_rpcs
     errs = []
     for rpc in rpcs:
         # (connect, read): endpoint mati/diblokir DNS ketahuan dalam 5 detik, bukan 30 —
         # `get_w3` mencoba beberapa endpoint berurutan, jadi timeout konek yang lama
         # berlipat ganda sebelum sampai ke endpoint yang hidup.
-        provider = Web3.HTTPProvider(rpc, request_kwargs={"timeout": (5, 30)}, session=_rpc_session())
+        provider = _Provider(rpc, request_kwargs={"timeout": (5, 30)},
+                             session=_rpc_session(), _chain_id=chain_id)
         provider.cache_allowed_requests = True  # eth_chainId dkk tidak di-query berulang
         candidates = [_poa(Web3(provider))]
         for i, w3 in enumerate(candidates):
@@ -6257,6 +6303,40 @@ def make_pid(chain_id: int, ver: int, ref, dex: str | None = None) -> str:
     if dex and dex != dex_name(chain_id):
         return f"{dex_slug(dex)}:{ref}"
     return str(ref)
+
+
+def position_by_pid(chain_id: int, pk: str, pid) -> dict | None:
+    """Baca SATU posisi langsung dari pid-nya. `None` = benar-benar tidak ada.
+
+    Dulu UI mencari satu posisi dengan memindai `list_all_positions()` lalu
+    menyaring pid — dua kerugian sekaligus. Mahal: klik satu tombol membayar
+    pembacaan SEMUA posisi (terukur `reb|v4:1277501` 24,7 detik untuk 8 posisi).
+    Dan rapuh: `list_all_positions` sengaja menelan kegagalan per-posisi supaya
+    daftarnya tetap tampil, jadi satu 429 dari RPC membuat posisi yang dicari
+    lenyap dari hasil dan UI melapor "tidak ditemukan (sudah ditutup?)" — padahal
+    posisinya hidup dan dananya utuh. Di sini kegagalan baca DILEMPAR, biar
+    pemanggil bisa membedakan "gagal dibaca" dari "memang tidak ada".
+    """
+    ver, ref = parse_pid(pid)
+    w3 = get_w3(chain_id)
+    addr = w3.eth.account.from_key(pk).address
+    if ver == 4:
+        p = _v4_position_detail(w3, chain_id, int(ref), addr)
+    elif ver == 2:
+        p = _v2_position_detail(w3, chain_id, str(ref), addr)
+    else:
+        dname = pid_dex(chain_id, pid)
+        cfg = dex_cfg(chain_id, dname)
+        npm = w3.eth.contract(address=Web3.to_checksum_address(cfg["npm"]), abi=NPM_ABI)
+        factory = w3.eth.contract(address=Web3.to_checksum_address(cfg["factory"]), abi=FACTORY_ABI)
+        account = w3.eth.account.from_key(pk)
+        raw = npm.functions.positions(int(ref)).call()
+        p = _position_detail(w3, chain_id, npm, factory, account, int(ref), raw)
+        if p is not None:
+            p.setdefault("ver", 3)
+            p["dex"] = dname
+            p["pid"] = make_pid(chain_id, 3, p["token_id"], dname)
+    return p
 
 
 def list_all_positions(chain_id: int, pk: str, v2_refs: list[str] = (),

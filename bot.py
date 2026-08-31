@@ -185,6 +185,22 @@ def list_positions_all(cid: int, key: str | None = None) -> list[dict]:
                                  store.refs(cid, w, "v2"), store.refs(cid, w, "v4"))
 
 
+def position_one(cid: int, pid, key: str | None = None) -> dict | None:
+    """Satu posisi, dibaca LANGSUNG dari pid-nya. `None` = memang tidak ada.
+
+    Dulu tiap tombol mencari posisinya dengan memindai seluruh `list_positions_all`
+    lalu menyaring pid. Mahal (terukur `reb|v4:1277501` 24,7 detik untuk 8 posisi
+    padahal yang dibutuhkan satu) dan RAPUH: daftar itu sengaja menelan kegagalan
+    per-posisi supaya tetap tampil, jadi satu 429 dari RPC membuat posisi yang
+    dicari lenyap dan UI melapor "tidak ditemukan (sudah ditutup?)" — pesan yang
+    membuat user mengira dananya hilang, lalu mengklik ulang dan beraksi dua kali.
+    Sekarang gagal baca dilempar sebagai error yang menyebut sebabnya."""
+    try:
+        return ch.position_by_pid(cid, key or pk(), pid)
+    except Exception as e:
+        raise RuntimeError(f"Gagal membaca posisi {disp_pid(pid)}: {e}") from e
+
+
 def wallet_address() -> str:
     return _addr_of(pk())
 
@@ -1501,7 +1517,7 @@ async def handle_awaiting(update: Update) -> bool:
         cid = store.load_settings()["chain"]
 
         def snap():
-            return next((p for p in list_positions_all(cid) if p["pid"] == str(pid)), None)
+            return position_one(cid, pid)
 
         p = await asyncio.to_thread(snap)
         mc_now = (p.get("mc_now") or 0.0) if p else 0.0
@@ -1836,7 +1852,7 @@ def add_confirm_text(cid: int, pid: str, val: float, is_pct: bool) -> str:
     menulis "Konfirmasi tambah dana ke posisi X", jadi user menyetujui tanpa tahu
     pool mana, berapa yang benar-benar masuk, dan komposisinya jadi apa."""
     s = store.load_settings()
-    p = next((x for x in list_positions_all(cid) if x["pid"] == str(pid)), None)
+    p = position_one(cid, pid)
     if not p:
         return f"Konfirmasi tambah dana ke posisi {disp_pid(pid)}:"
     ver = p.get("ver", 3)
@@ -2024,7 +2040,7 @@ async def show_position(update: Update, msg, pid: str):
     await edit(msg, f"⏳ Memuat posisi {disp_pid(pid)}...")
 
     def work():
-        return next((p for p in list_positions_all(cid) if p["pid"] == str(pid)), None)
+        return position_one(cid, pid)
 
     try:
         p = await asyncio.to_thread(work)
@@ -2058,7 +2074,7 @@ async def ask_add(update: Update, pid: str):
 
     def info():
         """Quote posisi + modal yang benar-benar tersedia — bukan tebakan 'umumnya WETH'."""
-        pos = next((p for p in list_positions_all(cid) if p["pid"] == str(pid)), None)
+        pos = position_one(cid, pid)
         if not pos:
             return None
         w3 = ch.get_w3(cid)
@@ -2123,7 +2139,7 @@ def _reinvested_fee_usd(cid: int, pid: str) -> float:
     if ch.parse_pid(str(pid))[0] != 4:
         return 0.0
     try:
-        pos = next((x for x in list_positions_all(cid) if x["pid"] == str(pid)), None)
+        pos = position_one(cid, pid)
         return max(0.0, float(pos["unclaimed_usd"])) if pos else 0.0
     except Exception:
         return 0.0
@@ -2140,7 +2156,7 @@ async def do_add_exec(update: Update, pid: str, val: float, is_pct: bool):
         if is_pct:
             w3 = ch.get_w3(cid)
             cfg = ch.CHAINS[cid]
-            pos = next((x for x in list_positions_all(cid) if x["pid"] == str(pid)), None)
+            pos = position_one(cid, pid)
             if not pos:
                 raise RuntimeError("Posisi tidak ditemukan.")
             quote = pos["token1"] if pos["quote_is_token1"] else pos["token0"]
@@ -2208,7 +2224,7 @@ async def ask_reduce(update: Update, pid: str):
     cid = s["chain"]
 
     def snap():
-        return next((p for p in list_positions_all(cid) if p["pid"] == str(pid)), None)
+        return position_one(cid, pid)
 
     head = ""
     try:
@@ -2251,7 +2267,7 @@ async def do_reduce_exec(update: Update, pid: str, pct: int):
     cid = s["chain"]
 
     def snapshot():
-        return next((p for p in list_positions_all(cid) if p["pid"] == str(pid)), None)
+        return position_one(cid, pid)
 
     pos = await asyncio.to_thread(snapshot)
     head = f"⏳ Menarik {pct}% dari {disp_pid(pid)}..."
@@ -2287,7 +2303,7 @@ async def do_collect(update: Update, pid: str):
     cid = s["chain"]
 
     def find_pos():
-        return next((p for p in list_positions_all(cid) if p["pid"] == str(pid)), None)
+        return position_one(cid, pid)
 
     pos = await asyncio.to_thread(find_pos)
     status = await reply(update, f"⏳ Collect fee {disp_pid(pid)}...")
@@ -2323,7 +2339,7 @@ async def ask_rebalance(update: Update, pid: str):
         return
 
     def work():
-        return next((p for p in list_positions_all(cid) if p["pid"] == str(pid)), None)
+        return position_one(cid, pid)
 
     p = await asyncio.to_thread(work)
     if not p:
@@ -2353,7 +2369,7 @@ async def do_rebalance(update: Update, pid: str, mode: str):
     cid = s["chain"]
 
     def snapshot():
-        return next((p for p in list_positions_all(cid) if p["pid"] == str(pid)), None)
+        return position_one(cid, pid)
 
     pos = await asyncio.to_thread(snapshot)
     head = f"⏳ Rebalance {disp_pid(pid)} → {mode}... (close → swap → mint)"
@@ -2420,7 +2436,7 @@ async def ask_close(update: Update, pid: str):
     cid = s["chain"]
 
     def work():
-        return next((p for p in list_positions_all(cid) if p["pid"] == str(pid)), None)
+        return position_one(cid, pid)
 
     p = await asyncio.to_thread(work)
     if not p:
@@ -2467,7 +2483,7 @@ async def do_close(update: Update, pid: str, autoswap: bool):
     cid = s["chain"]
 
     def find_pos():
-        return next((p for p in list_positions_all(cid) if p["pid"] == str(pid)), None)
+        return position_one(cid, pid)
 
     pos = await asyncio.to_thread(find_pos)
     usd = (pos["value_usd"] + pos["unclaimed_usd"]) if pos else 0.0
@@ -2861,7 +2877,7 @@ async def ask_tpsl(update: Update, pid: str):
     cid = s["chain"]
 
     def work():
-        return next((p for p in list_positions_all(cid) if p["pid"] == str(pid)), None)
+        return position_one(cid, pid)
 
     p = await asyncio.to_thread(work)
     if not p:
@@ -2891,7 +2907,7 @@ async def do_create_order(update: Update, pid: str, tp_s: str, sl_s: str, autosw
     cid = s["chain"]
 
     def snap():
-        return next((p for p in list_positions_all(cid) if p["pid"] == str(pid)), None)
+        return position_one(cid, pid)
 
     p = await asyncio.to_thread(snap)
     if not p:
@@ -3521,7 +3537,7 @@ async def ask_migrate(update: Update, pid: str):
     status = await reply(update, "⏳ Membaca posisi…")
 
     def snap():
-        return next((x for x in list_positions_all(cid) if x["pid"] == str(pid)), None)
+        return position_one(cid, pid)
 
     p = await asyncio.to_thread(snap)
     if not p:
@@ -3625,7 +3641,7 @@ async def ask_compound(update: Update, pid: str):
     msg = await reply(update, "⏳ Menghitung fee…")
 
     def snap():
-        return next((x for x in list_positions_all(cid) if x["pid"] == str(pid)), None)
+        return position_one(cid, pid)
 
     p = await asyncio.to_thread(snap)
     if not p or p["unclaimed_usd"] <= 0:
