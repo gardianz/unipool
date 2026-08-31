@@ -1047,6 +1047,17 @@ Empat sumber lambat yang sudah diukur dan diperbaiki — jangan dibalik:
   `get_w3`, bukan dengan menunggu lebih lama di endpoint yang sama.
 - **Timeout konek 5 detik** (`request_kwargs={"timeout": (5, 30)}`). `get_w3` mencoba
   endpoint berurutan, jadi 30 detik per endpoint mati berlipat sebelum sampai yang hidup.
+- **Daftar kandidat indexer Uniswap pakai stale-while-revalidate** (`_swr()`).
+  Terukur dari VPS ber-Alchemy: satu panggilan indexer **2,07 detik**, sedangkan
+  membaca detail satu posisi on-chain cuma **0,19 detik** — jadi `/list` didominasi
+  menunggu indexer, bukan RPC, dan dengan ttl 20 detik hampir tiap refresh
+  membayarnya lagi. Sekarang hasil basi (sampai `_SWR_MAX_STALE` = 600 detik)
+  dikembalikan SEKARANG dan penyegaran jalan di thread latar (satu thread per key,
+  dijaga `_SWR_BUSY`). Aman dibuat basi karena daftar itu CUMA kandidat:
+  `list_positions()` selalu meng-union-kan dengan enumerasi NFT terbaru on-chain
+  (indexer memang bisa telat berjam-jam) dan detail tiap posisi selalu dibaca
+  on-chain. Basi berarti "kandidat lama ikut diperiksa", bukan "posisi baru tidak
+  terlihat". Terukur: 1,52s → 0,000s, hasil identik.
 - **`store._hist()` di-cache** dengan kunci `(mtime_ns, ukuran)`. Kartu `/list`
   memanggil `mint_usd`/`fees_claimed_usd`/`withdrawn_usd`/`mint_ts` per posisi, jadi
   satu refresh mem-parse `history.json` puluhan kali. Kunci mtime membuat tulisan dari
@@ -1070,6 +1081,21 @@ BSC memakai extraData 280 byte, jauh di atas 32 byte yang divalidasi web3, jadi
 `price_history()` (chart) dan pembacaan timestamp blok di web.py mati diam-diam di
 chain itu. `_poa()` dipasang di `get_w3()` dan `_forced_ip_w3()`; aman untuk chain
 non-PoA karena middleware-nya cuma memangkas extraData yang kepanjangan.
+
+### `chain.py` TIDAK memuat `.env`
+
+Hanya `bot.py` (di dalam `main()`) dan `web.py` (saat import) memanggil `load_dotenv`.
+Akibatnya script diagnostik yang cuma `import chain` jalan **tanpa**
+`ALCHEMY_API_KEY`, jatuh ke RPC publik, dan mengukur latensi yang sama sekali bukan
+yang dipakai bot — terukur Robinhood **247 ms tanpa .env vs 17,7 ms dengan Alchemy**,
+dan kesimpulan "perlu self-host" yang ditarik dari angka itu salah total. Script
+apa pun yang mengukur atau meniru jalur bot WAJIB `load_dotenv(Path(...)/".env")`
+dengan path eksplisit — `find_dotenv()` melempar AssertionError kalau dijalankan
+dari stdin (`python3 - <<EOF`).
+
+Alchemy per-network: `base-mainnet` menjawab 4xx kalau network itu belum di-enable
+di dashboard app-nya, dan `get_w3` diam-diam jatuh ke RPC publik (terukur 279 ms vs
+98 ms `base-rpc.publicnode.com`). Gejalanya cuma "lambat", bukan error.
 
 ### Jaringan
 

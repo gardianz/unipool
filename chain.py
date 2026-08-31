@@ -902,6 +902,7 @@ def _poa(w3: Web3) -> Web3:
 
 _RPC_BAD: dict[str, float] = {}     # url -> kapan terakhir kena rate limit
 _RPC_BAD_COOLDOWN = 120             # detik endpoint dilewati setelah 429
+_SWR_MAX_STALE = 600                # detik hasil indexer boleh basi (disegarkan di latar)
 
 
 def _is_rate_limited(e: Exception) -> bool:
@@ -3487,28 +3488,28 @@ def uniswap_v4_token_ids(chain_id: int, address: str, _cache={}, ttl: int = 20) 
     if not uni_api_dex(chain_id):
         return None
     key = (chain_id, address.lower())
-    hit = _cache.get(key)
-    if hit and time.time() - hit[1] < ttl:
-        return hit[0]
-    body = {"address": Web3.to_checksum_address(address), "chainIds": [chain_id],
-            "protocolVersions": ["PROTOCOL_VERSION_V4"],
-            "positionStatuses": ["POSITION_STATUS_IN_RANGE", "POSITION_STATUS_OUT_OF_RANGE"],
-            "pageSize": 100, "includeHidden": True}
-    try:
-        r = _cf_post(_UNI_POS_API, headers=_UNI_HDR, json=body, timeout=10)
-        raw = r.json().get("positions")
-        if not isinstance(raw, list):
+
+    def _fetch():
+        body = {"address": Web3.to_checksum_address(address), "chainIds": [chain_id],
+                "protocolVersions": ["PROTOCOL_VERSION_V4"],
+                "positionStatuses": ["POSITION_STATUS_IN_RANGE", "POSITION_STATUS_OUT_OF_RANGE"],
+                "pageSize": 100, "includeHidden": True}
+        try:
+            r = _cf_post(_UNI_POS_API, headers=_UNI_HDR, json=body, timeout=10)
+            raw = r.json().get("positions")
+            if not isinstance(raw, list):
+                return None
+            ids = []
+            for p in raw:
+                d = p.get("v4Position") or {}
+                tid = d.get("tokenId") or (d.get("poolPosition") or {}).get("tokenId")
+                if str(tid or "").isdigit():
+                    ids.append(int(tid))
+            return ids
+        except Exception:
             return None
-        ids = []
-        for p in raw:
-            d = p.get("v4Position") or {}
-            tid = d.get("tokenId") or (d.get("poolPosition") or {}).get("tokenId")
-            if str(tid or "").isdigit():
-                ids.append(int(tid))
-        _cache[key] = (ids, time.time())
-        return ids
-    except Exception:
-        return None
+
+    return _swr(_cache, key, ttl, _SWR_MAX_STALE, _fetch)
 
 
 def find_v4_positions(chain_id: int, pk: str, lookback_blocks: int = 400_000) -> list[int]:
@@ -4104,6 +4105,49 @@ _UNI_HDR = {
 }
 
 
+_SWR_LOCK = threading.Lock()
+_SWR_BUSY: set = set()
+
+
+def _swr(cache: dict, key, ttl: float, max_stale: float, fetch):
+    """Cache 'stale-while-revalidate': hasil basi dikembalikan SEKARANG, penyegaran
+    jalan di latar.
+
+    Dipakai untuk daftar kandidat dari indexer Uniswap. Terukur dari VPS: satu
+    panggilan indexer **2,07 detik**, sedangkan membaca detail satu posisi on-chain
+    cuma 0,19 detik — jadi `/list` didominasi menunggu indexer, bukan RPC. Dengan
+    ttl 20 detik lama, hampir setiap refresh membayarnya lagi.
+
+    Aman dibuat basi karena daftar ini CUMA kandidat: `list_positions()` selalu
+    meng-union-kan dengan enumerasi NFT terbaru on-chain (indexer memang bisa telat
+    berjam-jam) dan detail tiap posisi selalu dibaca on-chain. Jadi basi berarti
+    "kandidat lama masih ikut diperiksa", bukan "posisi baru tidak terlihat"."""
+    now = time.time()
+    hit = cache.get(key)
+    if hit and now - hit[1] < ttl:
+        return hit[0]
+    if hit and now - hit[1] < max_stale:
+        with _SWR_LOCK:
+            start = key not in _SWR_BUSY
+            if start:
+                _SWR_BUSY.add(key)
+        if start:
+            def _bg():
+                try:
+                    v = fetch()
+                    if v is not None:
+                        cache[key] = (v, time.time())
+                finally:
+                    with _SWR_LOCK:
+                        _SWR_BUSY.discard(key)
+            threading.Thread(target=_bg, daemon=True).start()
+        return hit[0]
+    v = fetch()
+    if v is not None:
+        cache[key] = (v, time.time())
+    return v
+
+
 def uniswap_v3_token_ids(chain_id: int, address: str, _cache={}, ttl: int = 20) -> list[int] | None:
     """Set tokenId posisi v3 aktif dari API resmi Uniswap (sama seperti
     app.uniswap.org). Dipakai HANYA sebagai daftar kandidat yang lengkap — detail
@@ -4121,27 +4165,23 @@ def uniswap_v3_token_ids(chain_id: int, address: str, _cache={}, ttl: int = 20) 
     if not uni_api_dex(chain_id):
         return None
     key = (chain_id, address.lower())
-    hit = _cache.get(key)
-    if hit and time.time() - hit[1] < ttl:
-        return hit[0]
-    body = {"address": Web3.to_checksum_address(address), "chainIds": [chain_id],
-            "protocolVersions": ["PROTOCOL_VERSION_V3"],
-            "positionStatuses": ["POSITION_STATUS_IN_RANGE", "POSITION_STATUS_OUT_OF_RANGE"],
-            "pageSize": 100, "includeHidden": True}
-    try:
-        r = _cf_post(_UNI_POS_API, headers=_UNI_HDR, json=body, timeout=10)
-        raw = r.json().get("positions")
-        if not isinstance(raw, list):
+
+    def _fetch():
+        body = {"address": Web3.to_checksum_address(address), "chainIds": [chain_id],
+                "protocolVersions": ["PROTOCOL_VERSION_V3"],
+                "positionStatuses": ["POSITION_STATUS_IN_RANGE", "POSITION_STATUS_OUT_OF_RANGE"],
+                "pageSize": 100, "includeHidden": True}
+        try:
+            r = _cf_post(_UNI_POS_API, headers=_UNI_HDR, json=body, timeout=10)
+            raw = r.json().get("positions")
+            if not isinstance(raw, list):
+                return None
+            return [int(d["tokenId"]) for p in raw
+                    if (d := p.get("v3Position")) and str(d.get("tokenId", "")).isdigit()]
+        except Exception:
             return None
-        ids = []
-        for p in raw:
-            d = p.get("v3Position")
-            if d and str(d.get("tokenId", "")).isdigit():
-                ids.append(int(d["tokenId"]))
-        _cache[key] = (ids, time.time())
-        return ids
-    except Exception:
-        return None
+
+    return _swr(_cache, key, ttl, _SWR_MAX_STALE, _fetch)
 
 
 def list_positions(chain_id: int, pk: str, max_positions: int = 40,
