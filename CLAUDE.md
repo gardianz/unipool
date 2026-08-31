@@ -807,6 +807,27 @@ Sink itu global — aman karena semua alur tx diserialisasi `TX_LOCK` per proses
 `with_progress()` yang mengedit pesan Telegram dari sisi async (ticker 5 detik, 5
 baris terakhir) dan WAJIB melepas sink di `finally`.
 
+### Update Telegram diproses PARALEL
+
+`Application.builder().concurrent_updates(True)` — tanpa itu PTB memproses update
+**satu per satu**, jadi satu `/list` yang lama menahan seluruh klik berikutnya di
+antrean. Query callback punya masa berlaku pendek sehingga yang mengantre mati
+sebelum sempat dijawab: terukur di VPS `Telegram menolak pesan: Query is too old and
+response timeout expired or query id is invalid`, dan di sisi user tombolnya cuma
+berputar. `q.answer()` sudah ada di baris pertama router — bukan handler-nya yang
+telat, melainkan update-nya belum kebagian giliran.
+
+Aman untuk jalur dana karena penjagaannya tidak bergantung urutan update:
+`TX_LOCK` menyerialkan **12 alur** pemindah dana (mint/add/reduce/collect/rebalance/
+close/trigger order/cleanup/claim-all/migrate/compound/revoke) sehingga nonce tidak
+bisa dobel, dan `assert_position_open()` menolak aksi ke posisi yang sudah tertutup.
+Sink `set_progress` + `_GAS_WEI` global juga tetap benar: semua `with_progress`
+dipasang DI DALAM `TX_LOCK`. Kalau menambah alur tx baru, dua syarat itu wajib ikut.
+
+`monitor_loop` dijalankan lewat `job_queue.run_once(..., when=1)`, bukan
+`app.create_task()` di `post_init` — task yang dibuat saat aplikasi belum jalan tidak
+ikut di-await PTB (PTBUserWarning) sehingga error di dalamnya hilang diam-diam.
+
 ### Serialisasi transaksi & eksekutor tunggal
 
 Masing-masing proses punya lock nonce sendiri (`TX_LOCK`: `asyncio.Lock` di bot.py,

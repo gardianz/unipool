@@ -3154,7 +3154,13 @@ async def post_init(app):
         ])
     except Exception as e:
         log.warning("set_my_commands gagal: %s", e)
-    app.create_task(monitor_loop(app))
+    # Dijadwalkan lewat job queue, bukan create_task langsung: task yang dibuat
+    # saat aplikasi BELUM jalan tidak ikut di-await PTB (PTBUserWarning), jadi
+    # error di dalamnya bisa hilang diam-diam.
+    if app.job_queue is not None:
+        app.job_queue.run_once(lambda c: c.application.create_task(monitor_loop(c.application)), when=1)
+    else:
+        app.create_task(monitor_loop(app))
 
 
 async def cmd_cleanup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -3697,9 +3703,18 @@ def main():
 
     # Timeout HTTP Telegram dinaikkan dari default (5 detik): VPS ini berkali-kali
     # kena ReadTimeout ke api.telegram.org, dan long polling memang menahan koneksi.
+    #
+    # `concurrent_updates` WAJIB: default PTB memproses update SATU PER SATU, jadi
+    # satu /list yang lama menahan semua klik berikutnya di antrean. Query callback
+    # punya masa berlaku pendek, sehingga yang mengantre mati sebelum sempat dijawab
+    # dan bot melempar "Query is too old and response timeout expired or query id is
+    # invalid" — tombolnya berputar terus di sisi user. Aman untuk jalur dana karena
+    # TX_LOCK tetap menyerialkan tiap alur tx (nonce tidak bisa dobel) dan
+    # assert_position_open() menolak aksi ke posisi yang sudah tertutup.
     app = (Application.builder().token(token)
            .connect_timeout(20).read_timeout(40).write_timeout(40).pool_timeout(20)
            .get_updates_connect_timeout(20).get_updates_read_timeout(40)
+           .concurrent_updates(True)
            .post_init(post_init).build())
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
