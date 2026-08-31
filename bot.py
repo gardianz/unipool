@@ -7,6 +7,7 @@ Jalankan:  python3 bot.py
 Env (.env): TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, PRIVATE_KEY, [RPC_4663, RPC_56, RPC_8453, RPC_999]
 """
 import asyncio
+from contextlib import asynccontextmanager
 import functools
 import html
 import logging
@@ -2160,74 +2161,110 @@ def _reinvested_fee_usd(cid: int, pid: str) -> float:
         return 0.0
 
 
-async def do_add_exec(update: Update, pid: str, val: float, is_pct: bool):
-    s = store.load_settings()
-    cid = s["chain"]
-    status = await reply(update, f"⏳ Menambah dana ke {disp_pid(pid)}...")
+# Satu posisi = satu aksi pada satu waktu.
+#
+# `concurrent_updates` membuat dua klik diproses PARALEL. TX_LOCK menyerialkan
+# transaksinya, tapi kedua alur sudah membaca posisi SEBELUM lock — jadi keduanya
+# memakai snapshot yang sama dan menghitung jumlah dari angka yang sudah basi.
+# Terbukti di v4:1300787: "Reduce 50%" diklik dua kali, tiap alur menghapus
+# 3.760.957.351.020.571 likuiditas (setengah dari NILAI AWAL), sehingga yang kedua
+# menghabiskan seluruh sisa dan posisi tinggal liquidity=1. Dananya utuh
+# (2 x 49,99 USDG kembali), tapi user melihat "posisi jadi $0".
+_BUSY_PIDS: set = set()
+_BUSY_LOCK = asyncio.Lock()
 
-    def work():
-        budget = val
-        pre_fee = _reinvested_fee_usd(cid, pid)
-        if is_pct:
-            w3 = ch.get_w3(cid)
-            cfg = ch.CHAINS[cid]
-            pos = position_one(cid, pid)
-            if not pos:
-                raise RuntimeError("Posisi tidak ditemukan.")
-            quote = pos["token1"] if pos["quote_is_token1"] else pos["token0"]
-            gas_reserve = ch.gas_reserve_wei(cid, w3)
-            if quote.lower() == ch.V4_NATIVE:
-                bal = max(0, w3.eth.get_balance(wallet_address()) - gas_reserve)
-                try:    # WETH 1:1, di-unwrap otomatis saat eksekusi
-                    bal += ch.erc20(w3, cfg["wrapped"]).functions.balanceOf(wallet_address()).call()
-                except Exception:
-                    pass
-                qdec = 18
-            else:
-                qc = ch.erc20(w3, quote)
-                bal = qc.functions.balanceOf(wallet_address()).call()
-                qdec = qc.functions.decimals().call()
-                if quote.lower() == cfg["wrapped"].lower():
-                    bal += max(0, w3.eth.get_balance(wallet_address()) - gas_reserve)
-                else:
-                    try:
-                        wbal = ch.erc20(w3, cfg["wrapped"]).functions.balanceOf(wallet_address()).call()
-                        wtotal = wbal + max(0, w3.eth.get_balance(wallet_address()) - gas_reserve)
-                        rate = ch.wrapped_per_quote_wei(w3, cid, quote)
-                        if wtotal > 0 and rate > 0:
-                            bal += int(wtotal / rate * 0.98)
+
+@asynccontextmanager
+async def position_busy(update: Update, pid) -> "AsyncIterator[bool]":
+    """Klaim posisi untuk satu aksi. Yield False kalau sedang dipakai alur lain."""
+    key = str(pid)
+    async with _BUSY_LOCK:
+        taken = key in _BUSY_PIDS
+        if not taken:
+            _BUSY_PIDS.add(key)
+    if taken:
+        await reply(update, f"⏳ Aksi untuk {disp_pid(pid)} masih berjalan — "
+                            f"tunggu sampai selesai, jangan klik dua kali.")
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        async with _BUSY_LOCK:
+            _BUSY_PIDS.discard(key)
+
+
+async def do_add_exec(update: Update, pid: str, val: float, is_pct: bool):
+    async with position_busy(update, pid) as _ok:
+        if not _ok:
+            return
+        s = store.load_settings()
+        cid = s["chain"]
+        status = await reply(update, f"⏳ Menambah dana ke {disp_pid(pid)}...")
+
+        def work():
+            budget = val
+            pre_fee = _reinvested_fee_usd(cid, pid)
+            if is_pct:
+                w3 = ch.get_w3(cid)
+                cfg = ch.CHAINS[cid]
+                pos = position_one(cid, pid)
+                if not pos:
+                    raise RuntimeError("Posisi tidak ditemukan.")
+                quote = pos["token1"] if pos["quote_is_token1"] else pos["token0"]
+                gas_reserve = ch.gas_reserve_wei(cid, w3)
+                if quote.lower() == ch.V4_NATIVE:
+                    bal = max(0, w3.eth.get_balance(wallet_address()) - gas_reserve)
+                    try:    # WETH 1:1, di-unwrap otomatis saat eksekusi
+                        bal += ch.erc20(w3, cfg["wrapped"]).functions.balanceOf(wallet_address()).call()
                     except Exception:
                         pass
-            budget = (bal * val / 100) / 10 ** qdec
-        return ch.add_any(cid, pk(), pid, budget, s["slippage_pct"]), pre_fee
+                    qdec = 18
+                else:
+                    qc = ch.erc20(w3, quote)
+                    bal = qc.functions.balanceOf(wallet_address()).call()
+                    qdec = qc.functions.decimals().call()
+                    if quote.lower() == cfg["wrapped"].lower():
+                        bal += max(0, w3.eth.get_balance(wallet_address()) - gas_reserve)
+                    else:
+                        try:
+                            wbal = ch.erc20(w3, cfg["wrapped"]).functions.balanceOf(wallet_address()).call()
+                            wtotal = wbal + max(0, w3.eth.get_balance(wallet_address()) - gas_reserve)
+                            rate = ch.wrapped_per_quote_wei(w3, cid, quote)
+                            if wtotal > 0 and rate > 0:
+                                bal += int(wtotal / rate * 0.98)
+                        except Exception:
+                            pass
+                budget = (bal * val / 100) / 10 ** qdec
+            return ch.add_any(cid, pk(), pid, budget, s["slippage_pct"]), pre_fee
 
-    head = f"⏳ Menambah dana ke {disp_pid(pid)}..."
-    async with TX_LOCK:
-        try:
-            r, pre_fee = await with_progress(status, head, work)
-        except Exception as e:
-            await edit(status, f"❌ Add gagal: {esc(e)}")
-            return
-    ev_tid = ch.parse_pid(pid)[1] if str(pid).isdigit() else str(pid)
-    store.record_event(cid, "mint", ev_tid, r["added_usd"], "add", wallet=wallet_address())
-    if pre_fee > 0:
-        store.record_event(cid, "fees", ev_tid, pre_fee, "reinvest saat add",
-                           wallet=wallet_address())
-    lines = [f"✅ <b>Added {disp_pid(pid)}</b> (~{ch.fmt_usd(r['added_usd'])})"]
-    if r.get("quote_in") is not None:
-        lines.append(f"Masuk: {ch.fmt_amount(r['quote_in'])} {r['quote_sym']}"
-                     f" + {ch.fmt_amount(r['meme_in'])} {r['meme_sym']}"
-                     f" <i>(meme dari wallet dipakai duluan)</i>")
-    if pre_fee > 0:
-        lines.append(f"♻️ Fee unclaimed {ch.fmt_usd(pre_fee)} ikut jadi modal "
-                     f"(tidak keluar ke wallet) — dihitung sebagai fee, bukan setoran baru.")
-    for label, h in r["steps"]:
-        lines.append(f"{label}: {ch.tx_link(cid, h)}")
-    lines.append(ch.pos_link_any(cid, pid))
-    g = gas_line(cid)
-    if g:
-        lines.append(g)
-    await edit(status, "\n".join(lines), NAV_KB)
+        head = f"⏳ Menambah dana ke {disp_pid(pid)}..."
+        async with TX_LOCK:
+            try:
+                r, pre_fee = await with_progress(status, head, work)
+            except Exception as e:
+                await edit(status, f"❌ Add gagal: {esc(e)}")
+                return
+        ev_tid = ch.parse_pid(pid)[1] if str(pid).isdigit() else str(pid)
+        store.record_event(cid, "mint", ev_tid, r["added_usd"], "add", wallet=wallet_address())
+        if pre_fee > 0:
+            store.record_event(cid, "fees", ev_tid, pre_fee, "reinvest saat add",
+                               wallet=wallet_address())
+        lines = [f"✅ <b>Added {disp_pid(pid)}</b> (~{ch.fmt_usd(r['added_usd'])})"]
+        if r.get("quote_in") is not None:
+            lines.append(f"Masuk: {ch.fmt_amount(r['quote_in'])} {r['quote_sym']}"
+                         f" + {ch.fmt_amount(r['meme_in'])} {r['meme_sym']}"
+                         f" <i>(meme dari wallet dipakai duluan)</i>")
+        if pre_fee > 0:
+            lines.append(f"♻️ Fee unclaimed {ch.fmt_usd(pre_fee)} ikut jadi modal "
+                         f"(tidak keluar ke wallet) — dihitung sebagai fee, bukan setoran baru.")
+        for label, h in r["steps"]:
+            lines.append(f"{label}: {ch.tx_link(cid, h)}")
+        lines.append(ch.pos_link_any(cid, pid))
+        g = gas_line(cid)
+        if g:
+            lines.append(g)
+        await edit(status, "\n".join(lines), NAV_KB)
 
 
 async def ask_reduce(update: Update, pid: str):
@@ -2278,71 +2315,77 @@ async def ask_reduce_custom(update: Update, pid: str):
 
 
 async def do_reduce_exec(update: Update, pid: str, pct: int):
-    s = store.load_settings()
-    cid = s["chain"]
-
-    def snapshot():
-        return position_one(cid, pid)
-
-    pos = await asyncio.to_thread(snapshot)
-    head = f"⏳ Menarik {pct}% dari {disp_pid(pid)}..."
-    status = await reply(update, head)
-    async with TX_LOCK:
-        try:
-            r = await with_progress(status, head,
-                                    lambda: ch.reduce_any(cid, pk(), pid, pct, s["slippage_pct"]))
-        except Exception as e:
-            await edit(status, f"❌ Reduce gagal: {esc(e)}")
+    async with position_busy(update, pid) as _ok:
+        if not _ok:
             return
-    ev_tid = ch.parse_pid(pid)[1] if str(pid).isdigit() else str(pid)
-    if pos:
-        store.record_event(cid, "close", ev_tid, pos["value_usd"] * pct / 100,
-                           f"reduce {pct}%", wallet=wallet_address())
-        if pos["unclaimed_usd"] > 0:
-            store.record_event(cid, "fees", ev_tid, pos["unclaimed_usd"], wallet=wallet_address())
-    lines = [f"✅ <b>Reduced {disp_pid(pid)} −{pct}%</b>",
-             f"Received ~{ch.fmt_amount(r['got0'])} {esc(r['sym0'])} + "
-             f"{ch.fmt_amount(r['got1'])} {esc(r['sym1'])} (termasuk fee)"]
-    for label, h in r["steps"]:
-        lines.append(f"{label}: {ch.tx_link(cid, h)}")
-    lines.append(ch.pos_link_any(cid, pid))
-    g = gas_line(cid)
-    if g:
-        lines.append(g)
-    await edit(status, "\n".join(lines), NAV_KB)
+        s = store.load_settings()
+        cid = s["chain"]
+
+        def snapshot():
+            return position_one(cid, pid)
+
+        pos = await asyncio.to_thread(snapshot)
+        head = f"⏳ Menarik {pct}% dari {disp_pid(pid)}..."
+        status = await reply(update, head)
+        async with TX_LOCK:
+            try:
+                r = await with_progress(status, head,
+                                        lambda: ch.reduce_any(cid, pk(), pid, pct, s["slippage_pct"]))
+            except Exception as e:
+                await edit(status, f"❌ Reduce gagal: {esc(e)}")
+                return
+        ev_tid = ch.parse_pid(pid)[1] if str(pid).isdigit() else str(pid)
+        if pos:
+            store.record_event(cid, "close", ev_tid, pos["value_usd"] * pct / 100,
+                               f"reduce {pct}%", wallet=wallet_address())
+            if pos["unclaimed_usd"] > 0:
+                store.record_event(cid, "fees", ev_tid, pos["unclaimed_usd"], wallet=wallet_address())
+        lines = [f"✅ <b>Reduced {disp_pid(pid)} −{pct}%</b>",
+                 f"Received ~{ch.fmt_amount(r['got0'])} {esc(r['sym0'])} + "
+                 f"{ch.fmt_amount(r['got1'])} {esc(r['sym1'])} (termasuk fee)"]
+        for label, h in r["steps"]:
+            lines.append(f"{label}: {ch.tx_link(cid, h)}")
+        lines.append(ch.pos_link_any(cid, pid))
+        g = gas_line(cid)
+        if g:
+            lines.append(g)
+        await edit(status, "\n".join(lines), NAV_KB)
 
 
 # ---------- Collect fee ----------
 async def do_collect(update: Update, pid: str):
-    s = store.load_settings()
-    cid = s["chain"]
-
-    def find_pos():
-        return position_one(cid, pid)
-
-    pos = await asyncio.to_thread(find_pos)
-    status = await reply(update, f"⏳ Collect fee {disp_pid(pid)}...")
-    async with TX_LOCK:
-        try:
-            r = await asyncio.to_thread(ch.collect_any, cid, pk(), pid)
-        except Exception as e:
-            await edit(status, f"❌ Collect gagal: {esc(e)}")
+    async with position_busy(update, pid) as _ok:
+        if not _ok:
             return
-    ev_tid = ch.parse_pid(pid)[1] if str(pid).isdigit() else str(pid)
-    usd_txt = ""
-    if pos and pos["unclaimed_usd"] > 0:
-        store.record_event(cid, "fees", ev_tid, pos["unclaimed_usd"], wallet=wallet_address())
-        usd_txt = f" (~{ch.fmt_usd(pos['unclaimed_usd'])})"
-    lines = [f"✅ <b>Fee terklaim {disp_pid(pid)}</b>{usd_txt}",
-             f"Received {ch.fmt_amount(r['got0'])} {esc(r['sym0'])} + "
-             f"{ch.fmt_amount(r['got1'])} {esc(r['sym1'])}",
-             "<i>Posisi tetap jalan — liquidity tidak berubah.</i>"]
-    for label, h in r["steps"]:
-        lines.append(f"{label}: {ch.tx_link(cid, h)}")
-    g = gas_line(cid)
-    if g:
-        lines.append(g)
-    await edit(status, "\n".join(lines), NAV_KB)
+        s = store.load_settings()
+        cid = s["chain"]
+
+        def find_pos():
+            return position_one(cid, pid)
+
+        pos = await asyncio.to_thread(find_pos)
+        status = await reply(update, f"⏳ Collect fee {disp_pid(pid)}...")
+        async with TX_LOCK:
+            try:
+                r = await asyncio.to_thread(ch.collect_any, cid, pk(), pid)
+            except Exception as e:
+                await edit(status, f"❌ Collect gagal: {esc(e)}")
+                return
+        ev_tid = ch.parse_pid(pid)[1] if str(pid).isdigit() else str(pid)
+        usd_txt = ""
+        if pos and pos["unclaimed_usd"] > 0:
+            store.record_event(cid, "fees", ev_tid, pos["unclaimed_usd"], wallet=wallet_address())
+            usd_txt = f" (~{ch.fmt_usd(pos['unclaimed_usd'])})"
+        lines = [f"✅ <b>Fee terklaim {disp_pid(pid)}</b>{usd_txt}",
+                 f"Received {ch.fmt_amount(r['got0'])} {esc(r['sym0'])} + "
+                 f"{ch.fmt_amount(r['got1'])} {esc(r['sym1'])}",
+                 "<i>Posisi tetap jalan — liquidity tidak berubah.</i>"]
+        for label, h in r["steps"]:
+            lines.append(f"{label}: {ch.tx_link(cid, h)}")
+        g = gas_line(cid)
+        if g:
+            lines.append(g)
+        await edit(status, "\n".join(lines), NAV_KB)
 
 
 # ---------- Rebalance ----------
@@ -2380,26 +2423,29 @@ async def ask_rebalance(update: Update, pid: str):
 
 
 async def do_rebalance(update: Update, pid: str, mode: str):
-    s = store.load_settings()
-    cid = s["chain"]
-
-    def snapshot():
-        return position_one(cid, pid)
-
-    pos = await asyncio.to_thread(snapshot)
-    head = f"⏳ Rebalance {disp_pid(pid)} → {mode}... (close → swap → mint)"
-    status = await reply(update, head)
-    async with TX_LOCK:
-        try:
-            r = await with_progress(status, head, lambda: ch.rebalance_position(
-                cid, pk(), pid, mode, s["slippage_pct"], int(s.get("gap", 1))))
-        except Exception as e:
-            await edit(status, f"❌ Rebalance gagal: {esc(e)}\n"
-                               f"<i>Kalau close sudah jalan, dananya aman di wallet — "
-                               f"cek /wallet lalu mint manual.</i>")
+    async with position_busy(update, pid) as _ok:
+        if not _ok:
             return
+        s = store.load_settings()
+        cid = s["chain"]
 
-    await finish_rebalance(update, status, cid, pid, pos, r, mode=mode)
+        def snapshot():
+            return position_one(cid, pid)
+
+        pos = await asyncio.to_thread(snapshot)
+        head = f"⏳ Rebalance {disp_pid(pid)} → {mode}... (close → swap → mint)"
+        status = await reply(update, head)
+        async with TX_LOCK:
+            try:
+                r = await with_progress(status, head, lambda: ch.rebalance_position(
+                    cid, pk(), pid, mode, s["slippage_pct"], int(s.get("gap", 1))))
+            except Exception as e:
+                await edit(status, f"❌ Rebalance gagal: {esc(e)}\n"
+                                   f"<i>Kalau close sudah jalan, dananya aman di wallet — "
+                                   f"cek /wallet lalu mint manual.</i>")
+                return
+
+        await finish_rebalance(update, status, cid, pid, pos, r, mode=mode)
 
 
 async def finish_rebalance(update, status, cid: int, pid: str, pos, r: dict,
@@ -2494,55 +2540,58 @@ async def ask_close(update: Update, pid: str):
 
 
 async def do_close(update: Update, pid: str, autoswap: bool):
-    s = store.load_settings()
-    cid = s["chain"]
-
-    def find_pos():
-        return position_one(cid, pid)
-
-    pos = await asyncio.to_thread(find_pos)
-    usd = (pos["value_usd"] + pos["unclaimed_usd"]) if pos else 0.0
-    ver, ref = ch.parse_pid(pid)
-    head = f"⏳ Closing {disp_pid(pid)} (v{ver})..."
-    status = await reply(update, head)
-    async with TX_LOCK:
-        try:
-            r = await with_progress(status, head, lambda: ch.close_any(
-                cid, pk(), pid, s["slippage_pct"], autoswap))
-        except Exception as e:
-            await edit(status, f"❌ Close gagal: {esc(e)}")
+    async with position_busy(update, pid) as _ok:
+        if not _ok:
             return
+        s = store.load_settings()
+        cid = s["chain"]
 
-    ev_tid = ref if ver == 3 else str(pid)
-    if ver == 4:
-        store.drop_ref(cid, wallet_address(), "v4", str(ref))
-    elif ver == 2:   # dulu tidak pernah dibersihkan — registry & patokan fee jadi basi
-        store.drop_ref(cid, wallet_address(), "v2", str(ref))
-        store.drop_v2_basis(cid, wallet_address(), str(ref))
-    store.record_event(cid, "close", ev_tid, pos["value_usd"] if pos else usd, wallet=wallet_address())
-    if pos and pos["unclaimed_usd"] > 0:
-        store.record_event(cid, "fees", ev_tid, pos["unclaimed_usd"], wallet=wallet_address())
-    lines = [f"✅ <b>Closed {disp_pid(pid)}</b>",
-             f"Received ~{ch.fmt_amount(r['got0'])} {esc(r['sym0'])} + {ch.fmt_amount(r['got1'])} {esc(r['sym1'])}"]
-    if pos:
-        lines.append(f"💰 Fee terklaim: {ch.fmt_amount(pos['fees0'])} {esc(pos['sym0'])} + "
-                     f"{ch.fmt_amount(pos['fees1'])} {esc(pos['sym1'])} (~{ch.fmt_usd(pos['unclaimed_usd'])})")
-    lines.append(f"Withdrawal value ~{ch.fmt_usd(usd)}")
-    for label, h in r["steps"]:
-        lines.append(f"{label}: {ch.tx_link(cid, h)}")
-    g = gas_line(cid)
-    if g:
-        lines.append(g)
-    await edit(status, "\n".join(lines), NAV_KB)
+        def find_pos():
+            return position_one(cid, pid)
 
-    if r["swaps"]:
-        lines = ["🔄 Auto-swap hasil close:"]
-        for sym, h in r["swaps"]:
-            if str(h).startswith("0x"):
-                lines.append(f"swapped {esc(sym)} → {esc(ch.CHAINS[cid]['wrapped_symbol'])}: {ch.tx_link(cid, h)}")
-            else:
-                lines.append(f"{esc(sym)}: {esc(h)}")
-        await reply(update, "\n".join(lines), DEL_KB)
+        pos = await asyncio.to_thread(find_pos)
+        usd = (pos["value_usd"] + pos["unclaimed_usd"]) if pos else 0.0
+        ver, ref = ch.parse_pid(pid)
+        head = f"⏳ Closing {disp_pid(pid)} (v{ver})..."
+        status = await reply(update, head)
+        async with TX_LOCK:
+            try:
+                r = await with_progress(status, head, lambda: ch.close_any(
+                    cid, pk(), pid, s["slippage_pct"], autoswap))
+            except Exception as e:
+                await edit(status, f"❌ Close gagal: {esc(e)}")
+                return
+
+        ev_tid = ref if ver == 3 else str(pid)
+        if ver == 4:
+            store.drop_ref(cid, wallet_address(), "v4", str(ref))
+        elif ver == 2:   # dulu tidak pernah dibersihkan — registry & patokan fee jadi basi
+            store.drop_ref(cid, wallet_address(), "v2", str(ref))
+            store.drop_v2_basis(cid, wallet_address(), str(ref))
+        store.record_event(cid, "close", ev_tid, pos["value_usd"] if pos else usd, wallet=wallet_address())
+        if pos and pos["unclaimed_usd"] > 0:
+            store.record_event(cid, "fees", ev_tid, pos["unclaimed_usd"], wallet=wallet_address())
+        lines = [f"✅ <b>Closed {disp_pid(pid)}</b>",
+                 f"Received ~{ch.fmt_amount(r['got0'])} {esc(r['sym0'])} + {ch.fmt_amount(r['got1'])} {esc(r['sym1'])}"]
+        if pos:
+            lines.append(f"💰 Fee terklaim: {ch.fmt_amount(pos['fees0'])} {esc(pos['sym0'])} + "
+                         f"{ch.fmt_amount(pos['fees1'])} {esc(pos['sym1'])} (~{ch.fmt_usd(pos['unclaimed_usd'])})")
+        lines.append(f"Withdrawal value ~{ch.fmt_usd(usd)}")
+        for label, h in r["steps"]:
+            lines.append(f"{label}: {ch.tx_link(cid, h)}")
+        g = gas_line(cid)
+        if g:
+            lines.append(g)
+        await edit(status, "\n".join(lines), NAV_KB)
+
+        if r["swaps"]:
+            lines = ["🔄 Auto-swap hasil close:"]
+            for sym, h in r["swaps"]:
+                if str(h).startswith("0x"):
+                    lines.append(f"swapped {esc(sym)} → {esc(ch.CHAINS[cid]['wrapped_symbol'])}: {ch.tx_link(cid, h)}")
+                else:
+                    lines.append(f"{esc(sym)}: {esc(h)}")
+            await reply(update, "\n".join(lines), DEL_KB)
 
 
 # ---------- Callback router ----------
@@ -3716,42 +3765,45 @@ async def ask_compound(update: Update, pid: str):
 
 
 async def do_compound(update: Update, pid: str):
-    s = store.load_settings()
-    cid = s["chain"]
-    head = f"⏳ Compound {disp_pid(pid)}…"
-    status = await reply(update, head)
-    pre_fee = _reinvested_fee_usd(cid, pid)
-    async with TX_LOCK:
-        try:
-            r = await with_progress(status, head, lambda: ch.compound_any(
-                cid, pk(), pid, s["slippage_pct"]))
-        except Exception as e:
-            await edit(status, f"❌ Compound gagal: {esc(e)}")
+    async with position_busy(update, pid) as _ok:
+        if not _ok:
             return
-    ev_tid = ch.parse_pid(pid)[1] if str(pid).isdigit() else str(pid)
-    # added_usd menghitung likuiditas penuh; fee yang jadi modalnya diimbangi event
-    # `fees` supaya tidak tercatat sebagai setoran baru (lihat CLAUDE.md).
-    store.record_event(cid, "mint", ev_tid, r["added_usd"], "compound", wallet=wallet_address())
-    claimed = r.get("compounded_usd") or pre_fee
-    if claimed > 0:
-        store.record_event(cid, "fees", ev_tid, claimed, "compound", wallet=wallet_address())
-    lines = [f"✅ <b>Compound {disp_pid(pid)}</b> — fee masuk kembali jadi likuiditas "
-             f"(~{ch.fmt_usd(r['added_usd'])})"]
-    if r.get("used0") is not None:
-        lines.append(f"Dipakai: {ch.fmt_amount(r['used0'])} {esc(r['sym0'])} + "
-                     f"{ch.fmt_amount(r['used1'])} {esc(r['sym1'])}")
-        if (r.get("left0") or 0) > 0 or (r.get("left1") or 0) > 0:
-            lines.append(f"<i>Sisa {ch.fmt_amount(r['left0'])} {esc(r['sym0'])} + "
-                         f"{ch.fmt_amount(r['left1'])} {esc(r['sym1'])} dikirim ke "
-                         f"WALLET (bukan hilang) — rasio dua sisi ditentukan range, "
-                         f"jadi lazim ada yang tidak muat.</i>")
-    for label, h in r["steps"]:
-        lines.append(f"{label}: {ch.tx_link(cid, h)}")
-    lines.append(ch.pos_link_any(cid, pid))
-    g = gas_line(cid)
-    if g:
-        lines.append(g)
-    await edit(status, "\n".join(lines), NAV_KB)
+        s = store.load_settings()
+        cid = s["chain"]
+        head = f"⏳ Compound {disp_pid(pid)}…"
+        status = await reply(update, head)
+        pre_fee = _reinvested_fee_usd(cid, pid)
+        async with TX_LOCK:
+            try:
+                r = await with_progress(status, head, lambda: ch.compound_any(
+                    cid, pk(), pid, s["slippage_pct"]))
+            except Exception as e:
+                await edit(status, f"❌ Compound gagal: {esc(e)}")
+                return
+        ev_tid = ch.parse_pid(pid)[1] if str(pid).isdigit() else str(pid)
+        # added_usd menghitung likuiditas penuh; fee yang jadi modalnya diimbangi event
+        # `fees` supaya tidak tercatat sebagai setoran baru (lihat CLAUDE.md).
+        store.record_event(cid, "mint", ev_tid, r["added_usd"], "compound", wallet=wallet_address())
+        claimed = r.get("compounded_usd") or pre_fee
+        if claimed > 0:
+            store.record_event(cid, "fees", ev_tid, claimed, "compound", wallet=wallet_address())
+        lines = [f"✅ <b>Compound {disp_pid(pid)}</b> — fee masuk kembali jadi likuiditas "
+                 f"(~{ch.fmt_usd(r['added_usd'])})"]
+        if r.get("used0") is not None:
+            lines.append(f"Dipakai: {ch.fmt_amount(r['used0'])} {esc(r['sym0'])} + "
+                         f"{ch.fmt_amount(r['used1'])} {esc(r['sym1'])}")
+            if (r.get("left0") or 0) > 0 or (r.get("left1") or 0) > 0:
+                lines.append(f"<i>Sisa {ch.fmt_amount(r['left0'])} {esc(r['sym0'])} + "
+                             f"{ch.fmt_amount(r['left1'])} {esc(r['sym1'])} dikirim ke "
+                             f"WALLET (bukan hilang) — rasio dua sisi ditentukan range, "
+                             f"jadi lazim ada yang tidak muat.</i>")
+        for label, h in r["steps"]:
+            lines.append(f"{label}: {ch.tx_link(cid, h)}")
+        lines.append(ch.pos_link_any(cid, pid))
+        g = gas_line(cid)
+        if g:
+            lines.append(g)
+        await edit(status, "\n".join(lines), NAV_KB)
 
 
 async def do_revoke(update: Update, key: str, idx: int | None):

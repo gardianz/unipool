@@ -402,6 +402,27 @@ itulah yang menutup kekurangannya, dan ia tidak pernah tercapai.
 Kegagalan penjualan per-quote sekarang dilaporkan lewat `_step()`, tidak lagi
 ditelan `except: continue`.
 
+### Satu posisi = satu aksi pada satu waktu
+
+`concurrent_updates` membuat dua klik diproses PARALEL. `TX_LOCK` menyerialkan
+**transaksinya**, tapi kedua alur sudah membaca posisi SEBELUM lock — jadi keduanya
+memakai snapshot yang sama dan menghitung jumlah dari angka yang sudah basi.
+
+Terbukti di v4:1300787 (NBHOODS): "Reduce 50%" terklik dua kali, dan tiap alur
+menghapus **3.760.957.351.020.571** likuiditas — setengah dari nilai AWAL, bukan
+setengah dari sisa. Yang kedua karena itu menghabiskan seluruh sisanya dan posisi
+tinggal `liquidity = 1`. Dananya utuh (2 × 49,99 USDG kembali ke wallet, total
+99,98 dari deposit 99,98), tapi hanya satu penarikan yang tercatat sehingga kartu
+melapor "Rugi −$49,99 (−50%)" dan user melihat posisinya jadi $0.
+
+`position_busy(update, pid)` mengklaim posisi di awal `do_add_exec`,
+`do_reduce_exec`, `do_collect`, `do_rebalance`, `do_close`, dan `do_compound`.
+Klik kedua ditolak dengan pesan, bukan dijalankan. Pid berbeda tidak saling
+menghalangi.
+
+`assert_position_open()` TIDAK cukup untuk kasus ini — posisinya memang masih
+terbuka saat alur kedua jalan; yang salah jumlahnya, bukan keberadaannya.
+
 ### Aksi ke posisi yang sudah tertutup
 
 Dua alur yang berjalan berdekatan (tombol Close tertekan dua kali) membuat yang
