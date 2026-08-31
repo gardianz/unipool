@@ -1628,14 +1628,33 @@ def _cf_request(method: str, url: str, **kw):
     Urutannya: langsung dulu (host sehat tidak membayar apa pun), lalu proxy satu
     per satu kalau jawabannya 4xx/5xx atau error. Cloudflare menolak dengan 403 +
     halaman HTML, bukan exception, jadi status code ikut diperiksa."""
+    # `timeout` diperlakukan sebagai batas WAKTU TOTAL, bukan per percobaan. Fungsi
+    # ini mencoba jalur langsung LALU tiap proxy berurutan, dan `_try` sendiri
+    # mencoba curl_cffi dulu baru requests — jadi timeout=20 dengan 1 proxy bisa
+    # jadi 80 detik nyata. Itu duduk persis di jalur klik tombol (kartu detail
+    # memanggil dexscreener), makanya "responnya lama sampai menit-menit".
+    # Jalur yang diblokir menjawab 403 dengan CEPAT, jadi proxy tetap kebagian
+    # jatah; yang dipotong cuma kasus benar-benar menggantung.
+    budget = float(kw.pop("timeout", 10) or 10)
+    deadline = time.time() + budget
+
+    def _left() -> float:
+        return deadline - time.time()
+
     def _try(proxies):
+        t = _left()
+        if t <= 0:
+            raise TimeoutError("budget habis")
         if _cffi_requests is not None:
             try:
                 fn = getattr(_cffi_requests, method)
-                return fn(url, impersonate="chrome", proxies=proxies, **kw)
+                return fn(url, impersonate="chrome", proxies=proxies, timeout=t, **kw)
             except Exception:
                 pass
-        return getattr(requests, method)(url, proxies=proxies, **kw)
+        t = _left()
+        if t <= 0:
+            raise TimeoutError("budget habis")
+        return getattr(requests, method)(url, proxies=proxies, timeout=t, **kw)
 
     proxies = _proxy_list()
     # Di host yang diblokir, jalur langsung SELALU gagal — mencobanya tiap request
@@ -1654,6 +1673,8 @@ def _cf_request(method: str, url: str, **kw):
         if proxies:
             _DIRECT_BAD[0] = time.time()
     for i in range(len(proxies)):
+        if _left() <= 0:
+            break
         p = proxies[(_PROXY_GOOD[0] + i) % len(proxies)]
         try:
             r = _try({"http": p, "https": p})

@@ -15,6 +15,7 @@ import os
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 import uuid
 
 from dotenv import load_dotenv
@@ -2517,8 +2518,30 @@ async def do_close(update: Update, pid: str, autoswap: bool):
 async def on_callback(update: Update, _):
     if not authorized(update):
         return
+    t0 = time.monotonic()
+    try:
+        return await _route_callback(update)
+    finally:
+        dt = time.monotonic() - t0
+        # Klik yang lama dicatat bersama lag event loop saat itu, supaya "lambat"
+        # bisa dibedakan: kerja RPC yang memang berat vs event loop yang tertahan
+        # panggilan blocking (lag tinggi = ada yang lupa dibungkus to_thread).
+        if dt > 3:
+            log.warning("callback %s makan %.1fs (lag loop %.1fs)",
+                        (update.callback_query.data or "?")[:40], dt, _LOOP_LAG[0])
+
+
+async def _route_callback(update: Update):
     q = update.callback_query
-    await q.answer()
+    # Query callback punya masa berlaku pendek. Kalau sudah lewat, answer() melempar
+    # BadRequest "Query is too old" — dan dulu itu membatalkan SELURUH handler
+    # sebelum aksinya sempat jalan, lalu on_error mengirim "aksinya kemungkinan sudah
+    # jalan" yang justru terbalik. Gagal menghentikan spinner bukan alasan untuk
+    # tidak mengerjakan permintaan user.
+    try:
+        await q.answer()
+    except Exception as e:
+        log.warning("answer callback gagal (%s) — aksi tetap dijalankan", e)
     data = q.data or ""
 
     if data == "del":
@@ -3101,6 +3124,25 @@ async def _gather_positions(cid: int):
     return positions, by_wallet
 
 
+_LOOP_LAG = [0.0]   # lag event loop terakhir (detik), diisi _loop_watchdog
+
+
+async def _loop_watchdog():
+    """Ukur seberapa telat event loop bangun dari sleep 1 detik.
+
+    Lag mendekati 0 = loop sehat, lambatnya murni dari kerja RPC. Lag beberapa
+    detik = ada panggilan blocking yang tidak dibungkus `asyncio.to_thread`, dan
+    itu menahan SEMUA hal termasuk menjawab query callback (gejalanya "Query is
+    too old"). Tanpa angka ini keduanya terlihat sama dari luar."""
+    while True:
+        t = time.monotonic()
+        await asyncio.sleep(1)
+        lag = time.monotonic() - t - 1
+        _LOOP_LAG[0] = max(0.0, lag)
+        if lag > 2:
+            log.warning("event loop tertahan %.1f detik", lag)
+
+
 async def monitor_loop(app):
     """Cek berkala: alert in/out range (chain aktif) + eksekusi order TP/SL.
     Order dicek di SEMUA chain yang punya pesanan aktif — jadi TP/SL tetap jalan
@@ -3157,10 +3199,21 @@ async def post_init(app):
     # Dijadwalkan lewat job queue, bukan create_task langsung: task yang dibuat
     # saat aplikasi BELUM jalan tidak ikut di-await PTB (PTBUserWarning), jadi
     # error di dalamnya bisa hilang diam-diam.
+    # Executor default `asyncio.to_thread` = min(32, cpu+4); di VPS 2 core cuma 6
+    # worker, jadi pembacaan posisi milik monitor_loop dan klik user berebut slot
+    # dan yang kalah MENUNGGU giliran — terlihat persis seperti RPC lambat.
+    # Semuanya kerja I/O (nunggu jaringan), jadi jumlah worker tidak perlu ikut core.
+    try:
+        asyncio.get_running_loop().set_default_executor(
+            ThreadPoolExecutor(max_workers=32, thread_name_prefix="unipool"))
+    except Exception as e:
+        log.warning("set executor gagal: %s", e)
     if app.job_queue is not None:
         app.job_queue.run_once(lambda c: c.application.create_task(monitor_loop(c.application)), when=1)
+        app.job_queue.run_once(lambda c: c.application.create_task(_loop_watchdog()), when=1)
     else:
         app.create_task(monitor_loop(app))
+        app.create_task(_loop_watchdog())
 
 
 async def cmd_cleanup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):

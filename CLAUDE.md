@@ -622,6 +622,15 @@ tampilan belaka dan tiap pool tetap diverifikasi on-chain, jadi operator proxy t
 bisa mengarahkan transaksi. Menyalurkan RPC lewat pihak ketiga akan membuang jaminan
 itu — jangan dilakukan.
 
+`timeout` yang dikirim pemanggil diperlakukan `_cf_request()` sebagai batas **waktu
+total**, bukan per percobaan. Fungsi ini mencoba jalur langsung LALU tiap proxy
+berurutan, dan tiap percobaan mencoba curl_cffi dulu baru `requests` — jadi dulu
+`timeout=6` dengan 2 proxy terukur **18,0 detik** (dan di host ber-curl_cffi bisa
+dua kali lipat lagi). Itu duduk persis di jalur klik tombol: kartu detail memanggil
+dexscreener lewat `pool_stats`, `timeout=8` jadi puluhan detik. Jalur yang diblokir
+menjawab 403 dengan cepat sehingga proxy tetap kebagian jatah; yang dipotong hanya
+kasus benar-benar menggantung.
+
 `proxies.txt` ada di `.gitignore` — isinya kredensial, jangan pernah di-commit.
 Contohnya `proxies.txt.example`.
 
@@ -827,6 +836,22 @@ dipasang DI DALAM `TX_LOCK`. Kalau menambah alur tx baru, dua syarat itu wajib i
 `monitor_loop` dijalankan lewat `job_queue.run_once(..., when=1)`, bukan
 `app.create_task()` di `post_init` — task yang dibuat saat aplikasi belum jalan tidak
 ikut di-await PTB (PTBUserWarning) sehingga error di dalamnya hilang diam-diam.
+
+**`q.answer()` yang gagal TIDAK boleh membatalkan aksinya.** Query kedaluwarsa cuma
+berarti spinner tombol tidak bisa dihentikan; dulu BadRequest-nya melempar keluar
+sebelum aksinya sempat jalan, dan `on_error` mengirim "aksinya kemungkinan sudah
+jalan" yang justru terbalik dari kenyataan.
+
+Dua alat ukur dipasang supaya "lambat" tidak perlu ditebak lagi:
+`_loop_watchdog()` mencatat lag event loop (lag ~0 = lambatnya murni kerja RPC; lag
+beberapa detik = ada panggilan blocking yang lupa dibungkus `asyncio.to_thread`), dan
+router callback mencatat klik yang >3 detik berikut lag saat itu.
+
+Executor default `asyncio.to_thread` disetel eksplisit **32 worker**. Default-nya
+`min(32, cpu+4)` — di VPS 2 core cuma 6, sehingga pembacaan posisi milik
+`monitor_loop` dan klik user berebut slot dan yang kalah menunggu giliran, persis
+terlihat seperti RPC lambat. Semuanya kerja I/O, jadi jumlahnya tidak perlu ikut
+jumlah core.
 
 ### Serialisasi transaksi & eksekutor tunggal
 
