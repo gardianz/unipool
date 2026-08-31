@@ -713,6 +713,12 @@ def assert_pool_price_sane(w3: Web3, chain_id: int, pool_info: dict) -> None:
     pool_usd = per_meme * qusd
     if pool_usd <= 0 or mkt <= 0:
         return
+    # Patokan pasar bisa ikut rusak (diambil dari pool yang harganya mentok di batas
+    # kisi). Kalau angkanya sendiri mustahil, ia tidak boleh dipakai memblokir mint —
+    # terukur: RAM "seharga" $3,4e50 membatalkan rebalance ke pool yang harganya
+    # justru wajar ($0,295).
+    if not (1e-30 < mkt < 1e7):
+        return
     ratio = max(pool_usd / mkt, mkt / pool_usd)
     if ratio > _POOL_PRICE_MAX_RATIO:
         raise RuntimeError(
@@ -4544,6 +4550,16 @@ def token_usd_price(w3: Web3, chain_id: int, token_addr: str, _cache={}) -> floa
                     continue  # dust / kalah likuid dari kandidat sebelumnya
                 raw = _pool_price_t1_per_t0(w3, pool)
             except Exception:
+                continue
+            # Pool yang harganya MENTOK di batas kisi bukan harga pasar. Di MAX_TICK
+            # (887272) raw price ~3,4e38, dan pool begitu tetap lolos filter saldo
+            # karena masih memegang >$10 quote. Terukur: RAM di Robinhood dihargai
+            # $3,40257e+50 (= 3,402568e38 x 1e12 selisih desimal) dari pool semacam
+            # itu, lalu angka itu dipakai sebagai "harga pasar" pembanding dan
+            # membatalkan rebalance yang sah. Batas 1e36 hanya menangkap pool di
+            # ujung kisi: pasangan desimal 18/6 dengan token semurah 1e-18 pun cuma
+            # menghasilkan raw ~1e30.
+            if not (1e-36 < raw < 1e36):
                 continue
             in_q = raw * 10 ** (mdec - qd) if token == t0 else ((1 / raw) * 10 ** (mdec - qd) if raw else 0)
             price = in_q * qusd

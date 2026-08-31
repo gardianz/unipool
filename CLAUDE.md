@@ -539,6 +539,24 @@ Dua penjagaan:
   `_POOL_PRICE_MAX_RATIO` = 20x. Longgar disengaja: yang dikejar pool rusak, bukan
   pool mahal. Kalau salah satu harga tak terbaca, mint TIDAK dihalangi.
 
+**Patokan pasarnya sendiri bisa rusak, dan itu memblokir mint yang SAH.**
+`token_usd_price()` memilih pool ber-saldo quote terbesar, dan pool yang harganya
+mentok di batas kisi tetap lolos filter itu karena masih memegang >$10 quote.
+Terukur: RAM di Robinhood dihargai **$3,40257e+50** (= raw 3,402568e38 di MAX_TICK
+× 1e12 selisih desimal), lalu angka itu dipakai sebagai pembanding dan membatalkan
+rebalance ke pool yang harganya justru wajar ($0,295 vs pasar $0,180 — cuma 1,64x).
+
+Dua penambalan, keduanya perlu:
+
+- `token_usd_price()` membuang pool ber-`raw` di luar `1e-36..1e36`. Batas itu
+  HANYA menangkap ujung kisi: pasangan desimal 18/6 dengan token semurah 1e-18 pun
+  cuma menghasilkan raw ~1e30.
+- `assert_pool_price_sane()` mengabaikan patokan yang di luar `1e-30..1e7` — angka
+  mustahil tidak boleh dipakai memblokir apa pun.
+
+Sesudahnya: RAM $0,180, RADIO $0,001206, HOME $0,0003841, WETH $2.465,45 (semuanya
+wajar), pool HOME rusak TETAP ditolak, dan 8 pool posisi hidup lolos semua.
+
 **Orientasi desimal gampang terbalik dan gagalnya senyap.** `quote_is_token1` False
 berarti quote itu **token0**, jadi `dec0 = desimal quote`. Terbalik sekali saat
 ditulis, dan akibatnya SEMUA pool sehat ditolak dengan deviasi ~1e24 (persis faktor
