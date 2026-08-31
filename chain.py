@@ -648,6 +648,80 @@ def _sqrt_at_tick(tick: int) -> int:
         return int((Decimal("1.0001") ** (Decimal(tick) / 2)) * (Decimal(2) ** 96))
 
 
+# Selisih harga pool vs pasar yang masih dianggap wajar untuk MINT. Longgar sekali
+# (20x) — ini bukan filter kualitas, cuma pagar terhadap pool yang harganya rusak.
+_POOL_PRICE_MAX_RATIO = 20.0
+
+
+def assert_pool_price_sane(w3: Web3, chain_id: int, pool_info: dict) -> None:
+    """Tolak mint ke pool yang harganya rusak. Panggil SEBELUM tx apa pun.
+
+    Kejadian nyata: pool HOME/USDG fee 3,60% di Robinhood harganya terkunci di tick
+    **887271** — satu tick dari MAX_TICK. Pool itu menghargai 1 HOME = 2,94e-27 USDG
+    sedangkan pasar $0,00030730, meleset ~1e23 kali. Bot menampilkan "MC $0.00" dan
+    "Value deposited ... ($0.00)" — jadi ia SUDAH tahu angkanya omong kosong — lalu
+    tetap mint 119.517 HOME ke sana, dan modalnya lenyap.
+
+    Pool semacam ini lolos saringan harga karena datang dari jalur Krystal, yang
+    sengaja cuma MENANDAI deviasi (`p["deviation"]`) tanpa membuang. Untuk sekadar
+    ditampilkan itu benar; untuk memasukkan dana, tidak.
+
+    Dua penjagaan:
+
+    - **Harga pool tidak boleh mepet batas kisi.** Tick di ±887272 berarti harga
+      sudah mentok, bukan harga pasar.
+    - **Harga pool harus sebanding dengan harga pasar** token itu (dari
+      `token_usd_price`, yang punya sumber independen). Ambangnya sengaja longgar
+      20x: yang dikejar pool rusak, bukan pool mahal.
+    """
+    ver = pool_info.get("ver", 3)
+    q_is_t1 = bool(pool_info.get("quote_is_token1"))
+    t0, t1 = pool_info.get("token0"), pool_info.get("token1")
+    meme = t0 if q_is_t1 else t1
+    quote = t1 if q_is_t1 else t0
+    if ver == 4:
+        sqrtp, tick = v4_slot0(w3, chain_id, pool_info["pool_id"])
+        d_meme = _v4_currency_info(w3, chain_id, meme)["decimals"]
+        d_quote = _v4_currency_info(w3, chain_id, quote)["decimals"]
+    elif ver == 3:
+        pc = w3.eth.contract(address=Web3.to_checksum_address(pool_info["pool"]), abi=POOL_ABI)
+        s0 = pc.functions.slot0().call()
+        sqrtp, tick = s0[0], s0[1]
+        d_meme = token_info(w3, meme)["decimals"]
+        d_quote = token_info(w3, quote)["decimals"]
+    else:
+        return                                  # v2 tidak punya tick
+    if abs(tick) >= MAX_TICK - 100:
+        raise RuntimeError(
+            f"Harga pool ini mentok di batas kisi (tick {tick}, batas ±{MAX_TICK}) — "
+            f"itu bukan harga pasar, dan modal yang masuk ke sana tidak bisa kembali. "
+            f"Mint dibatalkan, dana masih utuh di wallet. Pilih pool lain.")
+    # harga quote per 1 meme (satuan manusia)
+    raw = (sqrtp / Q96) ** 2                    # token1 per token0, raw
+    # q_is_t1 True  -> token0 = meme,  token1 = quote
+    # q_is_t1 False -> token0 = quote, token1 = meme
+    dec0, dec1 = (d_meme, d_quote) if q_is_t1 else (d_quote, d_meme)
+    human = raw * 10 ** (dec0 - dec1)           # token1 per token0
+    per_meme = human if q_is_t1 else (1 / human if human else 0)
+    if per_meme <= 0:
+        raise RuntimeError("Harga pool terbaca 0 — mint dibatalkan, dana masih utuh di wallet.")
+    try:
+        qusd = quote_usd_price(w3, chain_id, pool_info.get("quote_sym") or "")
+        mkt = token_usd_price(w3, chain_id, meme)
+    except Exception:
+        return                                  # tidak bisa dibandingkan → jangan halangi
+    pool_usd = per_meme * qusd
+    if pool_usd <= 0 or mkt <= 0:
+        return
+    ratio = max(pool_usd / mkt, mkt / pool_usd)
+    if ratio > _POOL_PRICE_MAX_RATIO:
+        raise RuntimeError(
+            f"Harga pool meleset {ratio:,.0f}x dari harga pasar "
+            f"(pool ${pool_usd:.3g} vs pasar ${mkt:.3g} per token). Pool ini rusak atau "
+            f"dimanipulasi — dana yang masuk jadi modal untuk menyeret harganya balik. "
+            f"Mint dibatalkan, dana masih utuh di wallet.")
+
+
 def assert_range_recoverable(lq: int, tick_lower: int, tick_upper: int,
                              sym0: str = "token0", sym1: str = "token1") -> None:
     """Tolak rentang yang modalnya TIDAK AKAN PERNAH bisa kembali.
@@ -3755,6 +3829,7 @@ def mint_position(chain_id: int, pk: str, pool_info: dict, budget: float,
     # pool_cfg, BUKAN CHAINS[chain_id]: di chain ber-DEX ganda, NPM harus milik DEX
     # pool ini. Salah NPM = dana mendarat di pool DEX lain dengan token+fee sama.
     cfg = pool_cfg(chain_id, pool_info)
+    assert_pool_price_sane(w3, chain_id, pool_info)   # sebelum tx apa pun
     account = w3.eth.account.from_key(pk)
     npm_addr = Web3.to_checksum_address(cfg["npm"])
     mode = strategy["mode"]
@@ -5753,6 +5828,9 @@ def mint_v4(chain_id: int, pk: str, pool_info: dict, budget: float,
     # dict pool bisa datang dari indexer (API Uniswap) → pastikan PoolKey autentik
     # (hash == poolId) dan tanpa hooks sebelum dana bergerak.
     assert_pool_orientation(w3, pool_info)
+    # Harga pool diperiksa SEBELUM tx apa pun (termasuk approve/permit2): pool yang
+    # harganya rusak menelan modal tanpa jejak, dan itu tidak terlihat dari kartu.
+    assert_pool_price_sane(w3, chain_id, pool_info)
     account = w3.eth.account.from_key(pk)
     posm_addr = Web3.to_checksum_address(cfg["v4_posm"])
     posm = _v4c(w3, chain_id, "v4_posm", V4_POSM_ABI)

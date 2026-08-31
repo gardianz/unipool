@@ -496,6 +496,35 @@ menghapus perubahan proses lain.
 Aturannya: jalur satu-posisi pakai `position_one()`/`position_by_pid()`, jalur daftar
 pakai `list_all_positions()`. Jangan mencari satu posisi lewat daftar.
 
+### Harga pool rusak = mint harus DITOLAK, bukan cuma ditandai
+
+`assert_pool_price_sane(w3, cid, pool_info)` dipanggil di awal `mint_position()` dan
+`mint_v4()`, SEBELUM tx apa pun (termasuk approve/permit2).
+
+Kejadian nyata: pool HOME/USDG fee 3,60% di Robinhood harganya terkunci di tick
+**887271** — satu tick dari MAX_TICK. Pool itu menghargai 1 HOME = **2,94e-27 USDG**
+sedangkan pasar **$0,00030730**: meleset ~1e23 kali. Kartu konfirmasi menampilkan
+"MC $0.00", "Value deposited 119.517,82 HOME ($0.00)", dan "Current price 0.0₂₀0" —
+bot SUDAH tahu angkanya omong kosong, lalu tetap mint. Modalnya lenyap.
+
+Pool ini lolos karena datang dari **jalur Krystal**, yang sengaja cuma MENANDAI
+deviasi (`p["deviation"]`) tanpa membuang (lihat bagian Krystal). Untuk ditampilkan
+itu benar; untuk memasukkan dana, tidak.
+
+Dua penjagaan:
+
+- **Tick pool tidak boleh mepet ±887272.** Harga mentok = bukan harga pasar.
+- **Harga pool vs `token_usd_price()`** (sumber independen) maksimal
+  `_POOL_PRICE_MAX_RATIO` = 20x. Longgar disengaja: yang dikejar pool rusak, bukan
+  pool mahal. Kalau salah satu harga tak terbaca, mint TIDAK dihalangi.
+
+**Orientasi desimal gampang terbalik dan gagalnya senyap.** `quote_is_token1` False
+berarti quote itu **token0**, jadi `dec0 = desimal quote`. Terbalik sekali saat
+ditulis, dan akibatnya SEMUA pool sehat ditolak dengan deviasi ~1e24 (persis faktor
+`10**(18-6)` dikuadratkan). Uji apa pun perubahan di sini terhadap pool posisi hidup
+dengan kedua orientasi quote — 8 pool nyata dipakai saat ini, termasuk HOOD10/USDG
+dan INJOH/USDG yang quote-nya token1.
+
 ### Rentang yang modalnya tidak bisa kembali (kerugian nyata)
 
 `assert_range_recoverable()` dipanggil di SEMUA jalur yang memasukkan dana ke posisi
