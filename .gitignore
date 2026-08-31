@@ -23,3 +23,5 @@ wallets.json
 
 # Kredensial proxy — jangan pernah di-commit
 proxies.txt
+.history.lock
+history.json.*.tmp

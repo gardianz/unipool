@@ -452,6 +452,33 @@ mint error 22:16:31.
 sebelum menyerah, dan memakai yang statusnya 1. Jangan hapus: tanpa itu satu
 kekeliruan pembacaan sama dengan kehilangan posisi.
 
+### Menulis `history.json`: tiga syarat, semuanya sudah pernah bocor
+
+Tiga hal ini bersama-sama pernah **menghapus seluruh registry posisi** begitu
+`concurrent_updates` dinyalakan. Terukur pada 8 thread × 40 event: registry
+**0 dari 50 ref** tersisa dan cuma **1 dari 320 event** tersimpan. Gejalanya persis
+"posisi saya hilang" — padahal dananya utuh on-chain.
+
+- **Nama file sementara harus unik per penulis.** `_write()` dulu memakai
+  `path.with_suffix(".tmp")`, satu nama untuk semua. Dua penulis (bot multi-thread,
+  atau bot + web) menulis ke tmp yang sama lalu sama-sama rename, jadi yang mendarat
+  bisa sambungan dua JSON. Sekarang `history.json.<pid>.<tid>.tmp`; rename POSIX
+  tetap atomik jadi file tidak pernah setengah jadi.
+- **Baca yang gagal JANGAN di-cache.** File yang sempat rusak membuat `_hist()`
+  balik `{"events": {}}`, dan dulu default itu ikut tersimpan sampai mtime berubah —
+  registry terlihat kosong padahal isinya ada. Lebih buruk: mutator berikutnya
+  menulis ulang dari isi kosong itu, jadi kerusakan sementara menjadi permanen.
+- **Baca-ubah-tulis harus dikunci.** Semua mutator polanya sama, jadi dua penulis
+  membaca isi yang sama lalu saling menimpa. `_hist_write()` memegang `RLock`
+  (antar-thread) **dan** `fcntl.flock` di `.history.lock` (antar-proses — `web.py`
+  proses terpisah yang menulis file yang sama). Sesudahnya: 3 proses × 4 thread ×
+  40 event = **480/480 tersimpan, 50/50 ref utuh**.
+
+Konsekuensi untuk kode baru: mutator apa pun WAJIB `with _hist_write():` dan
+`_hist(fresh=True)`. Objek dari `_hist()` polos dipakai bersama semua pembaca —
+memutasinya mengubah apa yang dilihat pemanggil lain, dan menulis dari salinan basi
+menghapus perubahan proses lain.
+
 ### Registry posisi (kenapa `history.json` penting)
 
 Posisi v3 bisa dienumerasi on-chain (ERC721Enumerable), tapi **PositionManager v4 tidak
@@ -892,6 +919,7 @@ Empat sumber lambat yang sudah diukur dan diperbaiki — jangan dibalik:
   memanggil `mint_usd`/`fees_claimed_usd`/`withdrawn_usd`/`mint_ts` per posisi, jadi
   satu refresh mem-parse `history.json` puluhan kali. Kunci mtime membuat tulisan dari
   proses lain (web.py) tetap terbaca — file ditulis atomik lewat rename.
+  **Cache itu HANYA untuk pembaca** — lihat bagian di bawah.
 
 `provider.cache_allowed_requests = True` **dipertahankan** untuk pembacaan posisi
 (terukur 11 vs 18 panggilan RPC, 3,3 vs 5,1 detik), tapi **dimatikan di jalur polling

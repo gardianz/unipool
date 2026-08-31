@@ -2,10 +2,13 @@
 store.py — Penyimpanan JSON sederhana: settings bot + riwayat deposit/withdraw
 untuk hitung PnL portfolio ala /list.
 """
+import fcntl
 import json
+import threading
 import os
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 BASE = Path(__file__).parent
@@ -35,9 +38,25 @@ def _read(path: Path, default):
 
 
 def _write(path: Path, data):
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, indent=2))
-    tmp.replace(path)
+    """Tulis atomik. Nama sementara HARUS unik per penulis.
+
+    Dulu `path.with_suffix(".tmp")` — satu nama untuk semua penulis. Dua penulis
+    bersamaan (bot.py multi-thread, atau bot.py + web.py yang memang berbagi file
+    ini) menulis ke tmp yang SAMA lalu sama-sama rename, jadi yang mendarat bisa
+    potongan dua JSON yang disambung. File rusak = `_read` gagal = registry posisi
+    v2/v4 dianggap kosong, dan posisi lenyap dari UI walau dananya utuh on-chain.
+    Dengan nama unik, rename POSIX tetap atomik: penulis terakhir menang, tapi
+    file tidak pernah setengah jadi."""
+    blob = json.dumps(data, indent=2)      # serialisasi DULU: kalau gagal, file lama utuh
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident():x}.tmp")
+    try:
+        tmp.write_text(blob)
+        tmp.replace(path)
+    finally:
+        try:
+            tmp.unlink()                   # kalau replace sudah jalan, ini no-op
+        except OSError:
+            pass
 
 
 # ---------- Brankas wallet (di luar .env) ----------
@@ -113,51 +132,106 @@ def save_settings(s: dict):
 
 
 # ---------- Riwayat PnL ----------
-_HIST_CACHE: dict = {}      # (mtime, size) -> isi file, biar tidak diparse berulang
+_HIST_CACHE: dict = {"key": None, "val": None}   # (mtime, size) -> isi file
+_HIST_LOCK = threading.Lock()
 
 
-def _hist() -> dict:
+def _hist(fresh: bool = False) -> dict:
     """Isi history.json, di-cache selama file-nya belum berubah.
 
     Kartu /list memanggil mint_usd/fees_claimed_usd/withdrawn_usd/mint_ts per posisi,
     jadi tanpa cache satu refresh mem-parse file yang sama puluhan kali. Kunci
     cache-nya (mtime, ukuran) supaya perubahan dari proses lain (web.py) tetap
-    terbaca — file ditulis atomik lewat rename, jadi mtime pasti berubah."""
+    terbaca — file ditulis atomik lewat rename, jadi mtime pasti berubah.
+
+    `fresh=True` WAJIB untuk setiap pemanggil yang akan MEMUTASI hasilnya lalu
+    `_write`. Objek yang di-cache dipakai bersama semua pembaca: memutasinya berarti
+    mengubah apa yang dilihat pemanggil lain, dan menulis dari salinan yang sudah
+    basi bisa menghapus perubahan proses lain (web.py menulis file yang sama).
+
+    Baca yang GAGAL tidak pernah di-cache. Kalau file sempat tak terbaca, hasil
+    default `{"events": {}}` dulu ikut tersimpan dan menempel sampai mtime berubah —
+    registry posisi v2/v4 terlihat kosong padahal isinya ada."""
+    if not fresh:
+        try:
+            st = HISTORY_FILE.stat()
+            key = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            key = None
+        if key is not None:
+            with _HIST_LOCK:
+                if _HIST_CACHE["key"] == key and _HIST_CACHE["val"] is not None:
+                    return _HIST_CACHE["val"]
+    if not HISTORY_FILE.exists():
+        return {"events": {}}
     try:
-        st = HISTORY_FILE.stat()
-        key = (st.st_mtime_ns, st.st_size)
-    except OSError:
-        return _read(HISTORY_FILE, {"events": {}})
-    hit = _HIST_CACHE.get("k")
-    if hit == key and "v" in _HIST_CACHE:
-        return _HIST_CACHE["v"]
-    val = _read(HISTORY_FILE, {"events": {}})
-    _HIST_CACHE["k"], _HIST_CACHE["v"] = key, val
+        val = json.loads(HISTORY_FILE.read_text())
+    except Exception:
+        return {"events": {}}          # rusak/kepotong → JANGAN di-cache
+    if not fresh:
+        try:
+            st = HISTORY_FILE.stat()
+            with _HIST_LOCK:
+                _HIST_CACHE["key"] = (st.st_mtime_ns, st.st_size)
+                _HIST_CACHE["val"] = val
+        except OSError:
+            pass
     return val
+
+
+_HIST_WLOCK = threading.RLock()
+_HIST_LOCKFILE = BASE / ".history.lock"
+
+
+@contextmanager
+def _hist_write():
+    """Kunci baca-ubah-tulis history.json — antar-thread DAN antar-proses.
+
+    Semua mutator polanya sama: baca file, ubah di memori, tulis ulang. Tanpa kunci,
+    dua penulis membaca isi yang sama lalu saling menimpa: terukur pada 8 thread x 40
+    event, hanya 47 dari 320 event yang tersimpan. `bot.py` kini memproses update
+    secara paralel dan `web.py` proses TERPISAH yang menulis file yang sama, jadi
+    kunci thread saja tidak cukup — perlu flock."""
+    with _HIST_WLOCK:
+        try:
+            f = open(_HIST_LOCKFILE, "w")
+        except OSError:
+            yield                       # tanpa flock masih lebih baik daripada gagal
+            return
+        try:
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+            yield
+        finally:
+            try:
+                fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            finally:
+                f.close()
 
 
 def record_event(chain_id: int, kind: str, token_id, usd: float,
                  detail: str = "", wallet: str = ""):
     """kind: mint | close | fees"""
-    h = _hist()
-    h["events"].setdefault(str(chain_id), []).append({
-        "ts": int(time.time()), "kind": kind, "token_id": token_id,
-        "usd": usd, "detail": detail, "wallet": wallet.lower(),
-    })
-    _write(HISTORY_FILE, h)
+    with _hist_write():
+        h = _hist(fresh=True)
+        h["events"].setdefault(str(chain_id), []).append({
+            "ts": int(time.time()), "kind": kind, "token_id": token_id,
+            "usd": usd, "detail": detail, "wallet": wallet.lower(),
+        })
+        _write(HISTORY_FILE, h)
 
 
 def adopt_orphans(chain_id: int, wallet: str, token_ids: list[int]):
     """Event lama tanpa tag wallet: klaim ke wallet ini kalau posisinya memang miliknya."""
-    h = _hist()
-    ids = set(token_ids)
-    changed = False
-    for e in h["events"].get(str(chain_id), []):
-        if not e.get("wallet") and e.get("token_id") in ids:
-            e["wallet"] = wallet.lower()
-            changed = True
-    if changed:
-        _write(HISTORY_FILE, h)
+    with _hist_write():
+        h = _hist(fresh=True)
+        ids = set(token_ids)
+        changed = False
+        for e in h["events"].get(str(chain_id), []):
+            if not e.get("wallet") and e.get("token_id") in ids:
+                e["wallet"] = wallet.lower()
+                changed = True
+        if changed:
+            _write(HISTORY_FILE, h)
 
 
 # ---------- Registry posisi V2/V4 ----------
@@ -165,13 +239,14 @@ def adopt_orphans(chain_id: int, wallet: str, token_ids: list[int]):
 # tidak, dan posisi v2 cuma saldo LP token — keduanya dicatat di sini saat mint.
 def add_ref(chain_id: int, wallet: str, kind: str, ref: str):
     """kind: 'v2' (ref = alamat pair) | 'v4' (ref = tokenId str)."""
-    h = _hist()
-    lst = (h.setdefault("refs", {}).setdefault(str(chain_id), {})
-            .setdefault(wallet.lower(), {}).setdefault(kind, []))
-    ref = str(ref).lower()
-    if ref not in lst:
-        lst.append(ref)
-        _write(HISTORY_FILE, h)
+    with _hist_write():
+        h = _hist(fresh=True)
+        lst = (h.setdefault("refs", {}).setdefault(str(chain_id), {})
+                .setdefault(wallet.lower(), {}).setdefault(kind, []))
+        ref = str(ref).lower()
+        if ref not in lst:
+            lst.append(ref)
+            _write(HISTORY_FILE, h)
 
 
 def refs(chain_id: int, wallet: str, kind: str) -> list[str]:
@@ -180,12 +255,13 @@ def refs(chain_id: int, wallet: str, kind: str) -> list[str]:
 
 
 def drop_ref(chain_id: int, wallet: str, kind: str, ref: str):
-    h = _hist()
-    lst = h.get("refs", {}).get(str(chain_id), {}).get(wallet.lower(), {}).get(kind, [])
-    ref = str(ref).lower()
-    if ref in lst:
-        lst.remove(ref)
-        _write(HISTORY_FILE, h)
+    with _hist_write():
+        h = _hist(fresh=True)
+        lst = h.get("refs", {}).get(str(chain_id), {}).get(wallet.lower(), {}).get(kind, [])
+        ref = str(ref).lower()
+        if ref in lst:
+            lst.remove(ref)
+            _write(HISTORY_FILE, h)
 
 
 # ---------- Patokan fee posisi V2 ----------
@@ -203,26 +279,28 @@ def set_v2_basis(chain_id: int, wallet: str, pair: str, k_per_lp: float,
     """Simpan patokan. Kalau sudah ada posisi (add liquidity berikutnya), patokan
     lama dan baru dirata-rata berbobot jumlah LP — kalau tidak, LP yang baru masuk
     ikut diklaim sudah mengumpulkan fee sejak mint pertama."""
-    if not k_per_lp:
-        return
-    h = _hist()
-    d = (h.setdefault("v2_basis", {}).setdefault(str(chain_id), {})
-          .setdefault(wallet.lower(), {}))
-    key = str(pair).lower()
-    old = d.get(key)
-    if old and lp_after > lp_before > 0:
-        added = lp_after - lp_before
-        d[key] = (old * lp_before + k_per_lp * added) / lp_after
-    else:
-        d[key] = k_per_lp
-    _write(HISTORY_FILE, h)
+    with _hist_write():
+        if not k_per_lp:
+            return
+        h = _hist(fresh=True)
+        d = (h.setdefault("v2_basis", {}).setdefault(str(chain_id), {})
+              .setdefault(wallet.lower(), {}))
+        key = str(pair).lower()
+        old = d.get(key)
+        if old and lp_after > lp_before > 0:
+            added = lp_after - lp_before
+            d[key] = (old * lp_before + k_per_lp * added) / lp_after
+        else:
+            d[key] = k_per_lp
+        _write(HISTORY_FILE, h)
 
 
 def drop_v2_basis(chain_id: int, wallet: str, pair: str):
-    h = _hist()
-    d = (h.get("v2_basis", {}).get(str(chain_id), {}).get(wallet.lower(), {}))
-    if d.pop(str(pair).lower(), None) is not None:
-        _write(HISTORY_FILE, h)
+    with _hist_write():
+        h = _hist(fresh=True)
+        d = (h.get("v2_basis", {}).get(str(chain_id), {}).get(wallet.lower(), {}))
+        if d.pop(str(pair).lower(), None) is not None:
+            _write(HISTORY_FILE, h)
 
 
 def mint_ts(chain_id: int, token_id) -> int | None:
@@ -284,19 +362,20 @@ def portfolio_summary(chain_id: int, wallet: str = "") -> dict:
 #   status ("active"|"done"|"error"|"cancelled"),
 #   created (ts), triggered (ts|None), reason (str), tx (str|None)
 def add_order(chain_id: int, order: dict) -> str:
-    h = _hist()
-    o = dict(order)
-    o["id"] = uuid.uuid4().hex[:6]
-    o.setdefault("created", int(time.time()))
-    o.setdefault("status", "active")
-    o.setdefault("triggered", None)
-    o.setdefault("reason", "")
-    o.setdefault("tx", None)
-    o["wallet"] = str(o.get("wallet", "")).lower()
-    o["pid"] = str(o.get("pid", ""))
-    (h.setdefault("orders", {}).setdefault(str(chain_id), [])).append(o)
-    _write(HISTORY_FILE, h)
-    return o["id"]
+    with _hist_write():
+        h = _hist(fresh=True)
+        o = dict(order)
+        o["id"] = uuid.uuid4().hex[:6]
+        o.setdefault("created", int(time.time()))
+        o.setdefault("status", "active")
+        o.setdefault("triggered", None)
+        o.setdefault("reason", "")
+        o.setdefault("tx", None)
+        o["wallet"] = str(o.get("wallet", "")).lower()
+        o["pid"] = str(o.get("pid", ""))
+        (h.setdefault("orders", {}).setdefault(str(chain_id), [])).append(o)
+        _write(HISTORY_FILE, h)
+        return o["id"]
 
 
 def orders(chain_id: int, wallet: str = "", status: str = "") -> list[dict]:
@@ -319,24 +398,26 @@ def get_order(chain_id: int, oid: str) -> dict | None:
 
 
 def update_order(chain_id: int, oid: str, **fields) -> bool:
-    h = _hist()
-    for o in h.get("orders", {}).get(str(chain_id), []):
-        if o.get("id") == oid:
-            o.update(fields)
-            _write(HISTORY_FILE, h)
-            return True
-    return False
+    with _hist_write():
+        h = _hist(fresh=True)
+        for o in h.get("orders", {}).get(str(chain_id), []):
+            if o.get("id") == oid:
+                o.update(fields)
+                _write(HISTORY_FILE, h)
+                return True
+        return False
 
 
 def drop_order(chain_id: int, oid: str) -> bool:
-    h = _hist()
-    lst = h.get("orders", {}).get(str(chain_id), [])
-    n = len(lst)
-    lst[:] = [o for o in lst if o.get("id") != oid]
-    if len(lst) != n:
-        _write(HISTORY_FILE, h)
-        return True
-    return False
+    with _hist_write():
+        h = _hist(fresh=True)
+        lst = h.get("orders", {}).get(str(chain_id), [])
+        n = len(lst)
+        lst[:] = [o for o in lst if o.get("id") != oid]
+        if len(lst) != n:
+            _write(HISTORY_FILE, h)
+            return True
+        return False
 
 
 def fmt_age(ts: int | None) -> str:
