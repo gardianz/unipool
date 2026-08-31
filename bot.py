@@ -3208,12 +3208,28 @@ async def post_init(app):
             ThreadPoolExecutor(max_workers=32, thread_name_prefix="unipool"))
     except Exception as e:
         log.warning("set executor gagal: %s", e)
-    if app.job_queue is not None:
-        app.job_queue.run_once(lambda c: c.application.create_task(monitor_loop(c.application)), when=1)
-        app.job_queue.run_once(lambda c: c.application.create_task(_loop_watchdog()), when=1)
-    else:
-        app.create_task(monitor_loop(app))
-        app.create_task(_loop_watchdog())
+    _BG.append(asyncio.create_task(_start_background(app)))
+
+
+_BG: list = []   # pegang referensi task bootstrap — asyncio tidak menahannya sendiri
+
+
+async def _start_background(app):
+    """Daftarkan task latar SETELAH aplikasi jalan.
+
+    `app.create_task()` di dalam `post_init` memberi PTBUserWarning "Tasks created
+    while the application is not running won't be automatically awaited" — task-nya
+    tetap jalan, tapi tidak ikut di-await sehingga error di dalamnya hilang
+    diam-diam. Job queue akan menyelesaikannya juga, tapi butuh extra
+    `python-telegram-bot[job-queue]` (APScheduler) yang belum tentu terpasang; di
+    VPS memang tidak ada, dan cabang cadangannya memunculkan warning yang sama.
+    Menunggu `app.running` tidak butuh dependensi apa pun."""
+    for _ in range(600):                 # maks ~60 detik, lalu jalan apa adanya
+        if getattr(app, "running", False):
+            break
+        await asyncio.sleep(0.1)
+    app.create_task(monitor_loop(app))
+    app.create_task(_loop_watchdog())
 
 
 async def cmd_cleanup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):

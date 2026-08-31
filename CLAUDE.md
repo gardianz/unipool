@@ -833,9 +833,15 @@ bisa dobel, dan `assert_position_open()` menolak aksi ke posisi yang sudah tertu
 Sink `set_progress` + `_GAS_WEI` global juga tetap benar: semua `with_progress`
 dipasang DI DALAM `TX_LOCK`. Kalau menambah alur tx baru, dua syarat itu wajib ikut.
 
-`monitor_loop` dijalankan lewat `job_queue.run_once(..., when=1)`, bukan
-`app.create_task()` di `post_init` — task yang dibuat saat aplikasi belum jalan tidak
-ikut di-await PTB (PTBUserWarning) sehingga error di dalamnya hilang diam-diam.
+`monitor_loop` dan `_loop_watchdog` didaftarkan `_start_background()`, yang menunggu
+`app.running` dulu. `app.create_task()` langsung di `post_init` memberi
+PTBUserWarning "Tasks created while the application is not running won't be
+automatically awaited" — task-nya tetap jalan, tapi tidak ikut di-await sehingga
+error di dalamnya hilang diam-diam (terbukti: warning-nya persis dijaga
+`app.running`, True → 0 warning). Job queue menyelesaikannya juga, tapi butuh extra
+`python-telegram-bot[job-queue]` (APScheduler) yang di VPS tidak terpasang sehingga
+cabang cadangannya memunculkan warning yang sama. Menunggu `app.running` tidak butuh
+dependensi apa pun.
 
 **`q.answer()` yang gagal TIDAK boleh membatalkan aksinya.** Query kedaluwarsa cuma
 berarti spinner tombol tidak bisa dihentikan; dulu BadRequest-nya melempar keluar
