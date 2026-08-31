@@ -2441,8 +2441,10 @@ def _drop_offprice_pools(pools: list, token_dec: int, token_addr: str) -> tuple[
 
 
 def discover_any(chain_id: int, token_addr: str) -> dict:
-    """Discovery pool untuk SEMUA UI (bot & web): API Uniswap dulu (lengkap, cepat,
-    termasuk v4 fee non-standar), fallback scan RPC kalau API mati / nihil.
+    """Discovery pool untuk SEMUA UI (bot & web). Urutan sumber:
+    Krystal → indexer Uniswap → GeckoTerminal → discovery sendiri (scan RPC).
+    `res["source"]` menyebut jalur mana yang terpakai — WAJIB ditampilkan UI, karena
+    panjang daftarnya bisa jauh berbeda antar sumber.
     Terakhir ditambah pool ber-quote di luar daftar tetap (mis. RTX/NVDAB) — banyak
     memecoin cuma punya pool jenis ini, tak terjangkau scan quote biasa."""
     # Krystal duluan: <1 detik, dan angkanya sama persis dengan yang dilihat user di
@@ -2454,11 +2456,25 @@ def discover_any(chain_id: int, token_addr: str) -> dict:
         kr = []
     src_name = "krystal"
     if not kr:
-        # Krystal gagal/tidak kenal → GeckoTerminal. Endpoint mereka TIDAK di belakang
-        # Cloudflare, jadi ini satu-satunya daftar pool yang tetap jalan di host yang
-        # IP-nya kena managed challenge (terukur di VPS: Krystal & indexer Uniswap
-        # dua-duanya "Just a moment…", GeckoTerminal 200). Ia juga memuat pool v4
-        # ber-fee non-standar yang mustahil ditemukan scan tier tetap.
+        # Krystal gagal → indexer Uniswap DULU, baru GeckoTerminal. Keduanya dulu di
+        # belakang Cloudflare yang sama sehingga sama-sama mati di host terblokir,
+        # tapi itu tidak selalu benar: terukur di VPS user, Krystal 403 sedangkan
+        # indexer Uniswap tembus. Untuk RADIO di Robinhood selisihnya besar —
+        # indexer **18 pool dalam 1,5 detik** (termasuk yang ber-TVL $41,7k),
+        # GeckoTerminal cuma **7 pool dalam 11,8 detik** dengan yang terbesar $572.
+        # Indexer juga mengirim fee DAN tickSpacing eksak, sedangkan nama pool
+        # GeckoTerminal fee-nya dibulatkan sehingga PoolKey harus ditebak.
+        try:
+            ud = uni_discover(chain_id, token_addr)
+        except Exception:
+            ud = None
+        if ud and ud.get("pools"):
+            kr = ud["pools"]
+            src_name = "uniswap"
+    if not kr:
+        # Terakhir GeckoTerminal: endpoint mereka TIDAK di belakang Cloudflare, jadi
+        # ini satu-satunya daftar pool yang tetap jalan di host yang IP-nya kena
+        # managed challenge. Memuat pool v4 ber-fee non-standar juga.
         try:
             kr = discover_gecko(chain_id, token_addr)
             src_name = "gecko"

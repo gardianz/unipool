@@ -807,6 +807,36 @@ per-quote sehingga pool ber-quote aneh bisa hilang; GeckoTerminal memuat semua p
 yang mengandung token itu apa pun quote-nya. Di jalur gecko pencarian itu murni
 beban — terukur 32,7 detik untuk 0 pool tambahan (36,1s → 6,9s setelah dilewati).
 
+### Urutan sumber daftar pool: Krystal → indexer Uniswap → GeckoTerminal → scan sendiri
+
+Indexer Uniswap dulu dilewati begitu Krystal gagal, dengan alasan keduanya duduk di
+belakang Cloudflare yang sama sehingga sama-sama mati di host terblokir. Itu TIDAK
+selalu benar: terukur di VPS user, Krystal menjawab `HTTP 200, hasil kosong`
+sedangkan indexer Uniswap tembus normal.
+
+Terukur untuk RADIO di Robinhood:
+
+| sumber | pool | waktu |
+|---|---|---|
+| Krystal | 0 | 2,0s |
+| indexer Uniswap | **17** | 13,2s |
+| GeckoTerminal | 7 | 11,8s |
+
+Dua alasan indexer didahulukan dari GeckoTerminal:
+
+- **Cakupan** — 17 vs 7 pool untuk token yang sama.
+- **`fee` DAN `tickSpacing` eksak.** Nama pool GeckoTerminal fee-nya dibulatkan
+  ("BNBCAT / USDT 4.202%" untuk fee 42122), jadi PoolKey harus ditebak lalu
+  dibuktikan lewat hash. Indexer mengirim nilai aslinya (terukur spacing 9303,
+  19988, 18665 — mustahil ditebak dari tier klasik).
+
+**Jangan percaya `totalLiquidityUsd` indexer.** Untuk RADIO ia melaporkan $41.686
+untuk pool yang setelah dihitung ulang on-chain oleh `_fill_onchain_tvl()` cuma
+$661. Angka yang ditampilkan harus selalu yang hasil hitung ulang.
+
+`discover_foreign_pools()` tetap hanya untuk jalur Krystal: daftar indexer sudah
+memuat semua pool Uniswap apa pun quote-nya, sama seperti GeckoTerminal.
+
 ### GeckoTerminal: satu-satunya sumber yang lolos dari host terblokir
 
 Urutan sumber daftar pool: **Krystal → GeckoTerminal → discovery sendiri**.
