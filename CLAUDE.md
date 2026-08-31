@@ -496,6 +496,22 @@ menghapus perubahan proses lain.
 Aturannya: jalur satu-posisi pakai `position_one()`/`position_by_pid()`, jalur daftar
 pakai `list_all_positions()`. Jangan mencari satu posisi lewat daftar.
 
+### Gagal dibaca ≠ tidak ada
+
+`list_all_positions()` dulu membuang exception per-posisi sama seperti hasil `None`.
+Padahal artinya beda: `None` = posisi memang kosong, exception = **belum tahu**.
+Akibatnya RPC yang kena 429 membuat sebagian posisi lenyap dari `/list` tanpa jejak,
+nilai portfolio ikut terlihat menyusut, dan user mengira dananya hilang (terukur:
+16 ref di registry, yang muncul 8).
+
+Sekarang tiap ref dicoba **3×** (jeda 0,4/0,8 detik, `get_w3` diambil ulang tiap
+percobaan sehingga endpoint yang kena rate limit sudah dirotasi), dan yang tetap
+gagal masuk ke parameter `errors`. UI **wajib** menyebutnya — `cmd_list` menulis
+"N posisi GAGAL dibaca (RPC sibuk) — belum tentu tertutup".
+
+tokenId yang tidak ada tetap mengembalikan `None` tanpa exception, jadi tidak ikut
+terlapor sebagai error (diuji dengan tokenId palsu: 0 error).
+
 ### Rate limit RPC: rotasi endpoint, bukan menunggu
 
 `get_w3` men-cache satu endpoint 5 menit. Failover-nya dulu cuma ada di pemilihan

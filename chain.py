@@ -6340,8 +6340,13 @@ def position_by_pid(chain_id: int, pk: str, pid) -> dict | None:
 
 
 def list_all_positions(chain_id: int, pk: str, v2_refs: list[str] = (),
-                       v4_refs: list[str] = (), full: bool = False) -> list[dict]:
-    """Posisi v3 (enumerasi NPM) + v4/v2 (dari registry bot). v3 diberi ver/pid."""
+                       v4_refs: list[str] = (), full: bool = False,
+                       errors: list | None = None) -> list[dict]:
+    """Posisi v3 (enumerasi NPM) + v4/v2 (dari registry bot). v3 diberi ver/pid.
+
+    `errors` (opsional): daftar untuk menampung ref yang GAGAL dibaca. Posisi yang
+    gagal dibaca berbeda dari posisi yang memang tidak ada — kalau tidak dibedakan,
+    RPC sibuk terlihat seperti dana hilang."""
     w3 = get_w3(chain_id)
     account = w3.eth.account.from_key(pk)
     out = []
@@ -6358,24 +6363,39 @@ def list_all_positions(chain_id: int, pk: str, v2_refs: list[str] = (),
     # detik di RPC ber-latensi 270 ms; berurutan, 10 posisi jadi ~33 detik dan tiap
     # tombol di UI terasa menggantung. Semua panggilannya read-only, jadi aman
     # diparalelkan; jumlah worker ditahan supaya RPC free-tier tidak kena 429.
+    # Kegagalan baca TIDAK boleh menghilangkan posisi diam-diam. `None` dari
+    # detail berarti "posisi memang kosong"; exception berarti "belum tahu" —
+    # dulu keduanya sama-sama dibuang, jadi RPC yang kena 429 membuat sebagian
+    # posisi lenyap dari /list dan user mengira dananya hilang (terukur: 17 di
+    # registry, 8 yang muncul). Sekarang dicoba ulang, dan yang tetap gagal
+    # dilaporkan lewat `errors` supaya UI bisa menyebutnya.
+    def _read(fn, ref):
+        for attempt in range(3):
+            try:
+                return fn(ref), None
+            except Exception as e:
+                if attempt == 2:
+                    return None, f"{ref}: {type(e).__name__}"
+                # jatah habis → endpoint sudah ditandai _Provider, ambil w3 baru
+                time.sleep(0.4 * (attempt + 1))
+        return None, None
+
     def _v4_one(r):
-        try:
-            return _v4_position_detail(w3, chain_id, int(r), account.address)
-        except Exception:
-            return None
+        return _read(lambda x: _v4_position_detail(get_w3(chain_id), chain_id,
+                                                   int(x), account.address), r)
 
     def _v2_one(r):
-        try:
-            return _v2_position_detail(w3, chain_id, r, account.address)
-        except Exception:
-            return None
+        return _read(lambda x: _v2_position_detail(get_w3(chain_id), chain_id,
+                                                   x, account.address), r)
 
     refs4, refs2 = list(v4_refs or []), list(v2_refs or [])
     if refs4 or refs2:
         with ThreadPoolExecutor(max_workers=min(8, max(1, len(refs4) + len(refs2)))) as ex:
-            for d in list(ex.map(_v4_one, refs4)) + list(ex.map(_v2_one, refs2)):
+            for d, err in list(ex.map(_v4_one, refs4)) + list(ex.map(_v2_one, refs2)):
                 if d:
                     out.append(d)
+                elif err is not None and errors is not None:
+                    errors.append(err)
     return out
 
 

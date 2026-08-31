@@ -177,12 +177,18 @@ def pk_for(addr: str) -> str | None:
     return None
 
 
-def list_positions_all(cid: int, key: str | None = None) -> list[dict]:
-    """Posisi v3 + v4 + v2 wallet (v4/v2 dari registry yang dicatat saat mint)."""
+def list_positions_all(cid: int, key: str | None = None,
+                       errors: list | None = None) -> list[dict]:
+    """Posisi v3 + v4 + v2 wallet (v4/v2 dari registry yang dicatat saat mint).
+
+    `errors`: ref yang GAGAL dibaca ditampung di sini. WAJIB disebut ke user kalau
+    terisi — posisi yang gagal dibaca beda dari posisi yang tidak ada, dan kalau
+    dibuang diam-diam RPC sibuk terlihat seperti dana hilang."""
     key = key or pk()
     w = _addr_of(key)
     return ch.list_all_positions(cid, key,
-                                 store.refs(cid, w, "v2"), store.refs(cid, w, "v4"))
+                                 store.refs(cid, w, "v2"), store.refs(cid, w, "v4"),
+                                 errors=errors)
 
 
 def position_one(cid: int, pid, key: str | None = None) -> dict | None:
@@ -1720,8 +1726,9 @@ async def cmd_list(update: Update, _, status_msg=None):
         # refresh: pakai pesan /list yang sudah ada, jangan kirim baru
         status = status_msg
         await edit(status, f"⏳ Refreshing positions on {esc(ch.CHAINS[cid]['name'])}...")
+    read_errors: list = []
     try:
-        positions = await asyncio.to_thread(list_positions_all, cid)
+        positions = await asyncio.to_thread(list_positions_all, cid, None, read_errors)
     except Exception as e:
         await edit(status, f"❌ Gagal load posisi: {esc(e)}")
         return
@@ -1759,8 +1766,16 @@ async def cmd_list(update: Update, _, status_msg=None):
         "",
     ]
     buttons = []
+    # Posisi yang GAGAL dibaca wajib disebut. Kalau tidak, RPC sibuk terlihat sama
+    # persis dengan dana yang hilang — dan nilai portfolio di atas ikut kelihatan
+    # menyusut padahal posisinya utuh on-chain.
+    if read_errors:
+        lines.append(f"⚠️ {len(read_errors)} posisi GAGAL dibaca (RPC sibuk) — "
+                     f"belum tentu tertutup. Klik Refresh.")
+        lines.append("")
     if not positions:
-        lines.append("Tidak ada posisi aktif.")
+        lines.append("Tidak ada posisi aktif." if not read_errors
+                     else "Tidak ada posisi yang berhasil dibaca.")
     else:
         lines.append("Klik posisi untuk detail + aksi:")
     for p in positions:
