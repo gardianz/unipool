@@ -1926,9 +1926,11 @@ def add_confirm_text(cid: int, pid: str, val: float, is_pct: bool) -> str:
     if amt and qusd:
         lines.append(f"Perkiraan sesudahnya: <b>{ch.fmt_usd(p['value_usd'] + amt * qusd)}</b>")
     if ver == 4 and p.get("unclaimed_usd"):
-        # v4 mengkreditkan feesAccrued ke tagihan SETTLE_PAIR — lihat CLAUDE.md
+        # v4 mengkreditkan feesAccrued ke tagihan increase — lihat CLAUDE.md.
+        # Dengan CLOSE_CURRENCY per sisi, fee yang TIDAK terpakai (lazim kalau
+        # komposisinya ~100% satu sisi) mendarat di wallet, bukan tetap unclaimed.
         lines.append(f"♻️ Fee unclaimed {ch.fmt_usd(p['unclaimed_usd'])} ikut jadi modal "
-                     f"(tidak keluar ke wallet)")
+                     f"(sisa yang tidak terpakai masuk wallet)")
     lines.append("")
     lines.append(f"<i>Slippage {s['slippage_pct']:g}% · deadline 20 menit</i>")
     return "\n".join(lines)
@@ -2257,7 +2259,8 @@ async def do_add_exec(update: Update, pid: str, val: float, is_pct: bool):
                          f" <i>(meme dari wallet dipakai duluan)</i>")
         if pre_fee > 0:
             lines.append(f"♻️ Fee unclaimed {ch.fmt_usd(pre_fee)} ikut jadi modal "
-                         f"(tidak keluar ke wallet) — dihitung sebagai fee, bukan setoran baru.")
+                         f"(sisa yang tidak terpakai masuk wallet) — dihitung sebagai fee, "
+                         f"bukan setoran baru.")
         for label, h in r["steps"]:
             lines.append(f"{label}: {ch.tx_link(cid, h)}")
         lines.append(ch.pos_link_any(cid, pid))

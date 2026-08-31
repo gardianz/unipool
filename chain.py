@@ -5970,6 +5970,16 @@ def mint_v4(chain_id: int, pk: str, pool_info: dict, budget: float,
     last_err = None
     sent: list[str] = []        # semua tx yang BENAR-BENAR terkirim, untuk pemulihan
     for attempt in range(3):
+        # SEBELUM mengirim ulang: pastikan percobaan sebelumnya benar-benar gagal.
+        # Kalau tx pertama ternyata sudah masuk blok, retry akan MINT POSISI KEDUA
+        # dengan modal baru. `_recover_sent` dulu cuma dipanggil sesudah ketiga
+        # percobaan habis — terlambat mencegah setoran kedua (terbukti di jalur add:
+        # dua increase identik di blok 51026498 dan 51026523).
+        if sent:
+            got = _recover_sent(w3, sent, steps, "mint")
+            if got is not None:
+                receipt = got
+                break
         sqrtp, cur_tick = v4_slot0(w3, chain_id, pid)
         tick_lower, tick_upper, now_mode = _range_of(
             strategy, cur_tick, pool_info["fee"], q_is_t1, spacing)
@@ -6287,6 +6297,18 @@ def increase_v4(chain_id: int, pk: str, tid: int, budget_quote: float,
     last_err = None
     sent: list[str] = []
     for attempt in range(3):
+        # SEBELUM mengirim ulang: pastikan percobaan sebelumnya benar-benar gagal.
+        # wait_ok/preflight bisa keliru menyimpulkan gagal padahal tx-nya sudah masuk
+        # blok — dan retry berikutnya lalu MENAMBAH DANA LAGI. Terbukti di RAM
+        # #1308102: dua increase identik (+4.649.204.726.935.655.993) di blok
+        # 51026498 dan 51026523, jadi user menyetor dua kali padahal mengklik sekali.
+        # `_recover_sent` sudah ada tapi dulu cuma dipanggil SESUDAH ketiga percobaan
+        # habis — terlambat untuk mencegah setoran kedua.
+        if sent:
+            got = _recover_sent(w3, sent, steps, "increase")
+            if got is not None:
+                receipt = got
+                break
         sqrtp, _ = v4_slot0(w3, chain_id, pid)
         a0d, a1d = (meme_have, quote_dep) if q_is_t1 else (quote_dep, meme_have)
         lq = int(liquidity_for_amounts(sqrtp, tick_lo, tick_hi, a0d, a1d))
@@ -6301,10 +6323,22 @@ def increase_v4(chain_id: int, pk: str, tid: int, budget_quote: float,
         for cur, amax in ((key[0], a0max), (key[1], a1max)):
             if cur.lower() != V4_NATIVE and amax > 2:  # 2 wei = sisi kosong single-sided
                 steps += ensure_permit2(w3, chain_id, pk, cur, posm_addr, amax)
-        actions = [V4_INCREASE, V4_SETTLE_PAIR]
+        # CLOSE_CURRENCY per sisi, BUKAN SETTLE_PAIR — alasan yang sama persis dengan
+        # compound. INCREASE_LIQUIDITY mengkreditkan `feesAccrued` terhadap tagihan;
+        # kalau komposisi yang dibutuhkan tidak memakai habis fee di salah satu sisi
+        # (lazim untuk posisi OUT of range yang butuh ~100% satu sisi), delta sisi
+        # itu jadi POSITIF — kita yang menerima — dan SETTLE_PAIR menolaknya dengan
+        # `DeltaNotNegative(address)` (selector 0x3351b260). Terbukti di RAM #1308102:
+        # posisi out of range butuh ~100% WETH + 0% RAM sedangkan fee RAM $3,99
+        # menganggur, dan add gagal 3x di simulasi tanpa satu tx pun terkirim.
+        # CLOSE_CURRENCY (0x12) menyelesaikan satu currency tanpa perlu tahu arah
+        # deltanya; sisa yang tidak terpakai mendarat di WALLET.
+        actions = [V4_INCREASE, V4_CLOSE_CURRENCY, V4_CLOSE_CURRENCY]
         p_inc = abi_encode(["uint256", "uint256", "uint128", "uint128", "bytes"],
                            [tid, lq, a0max, a1max, b""])
-        params = [p_inc, abi_encode(["address", "address"], [key[0], key[1]])]
+        params = [p_inc,
+                  abi_encode(["address"], [key[0]]),
+                  abi_encode(["address"], [key[1]])]
         value = 0
         if key[0].lower() == V4_NATIVE:
             value = a0max

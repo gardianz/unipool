@@ -234,6 +234,23 @@ sebenarnya $30,28, dan angka itu ikut tertulis ke `history.json` sebagai deposit
 Terukur di CHILL #1011495: fee 20,3177 USDG + 9.240,35 CHILL, terpakai 20,3136 USDG
 + 3.918,96 CHILL, gas 197.924 (~0,000009 ETH).
 
+### Add v4 juga `CLOSE_CURRENCY`, bukan `SETTLE_PAIR`
+
+Alasannya sama persis dengan compound, dan jalur add sempat terlewat.
+`INCREASE_LIQUIDITY` mengkreditkan `feesAccrued` terhadap tagihan; kalau komposisi
+yang dibutuhkan tidak memakai habis fee di salah satu sisi — lazim untuk posisi OUT
+of range yang butuh ~100% satu sisi — delta sisi itu jadi POSITIF dan `SETTLE_PAIR`
+menolak dengan `DeltaNotNegative(address)` (selector `0x3351b260`).
+
+Terbukti di RAM #1308102 (posisi butuh ~100% WETH + 0% RAM, fee RAM $3,99
+menganggur): disimulasikan pada posisi hidup, `SETTLE_PAIR` revert
+`DeltaNotNegative(0x5173d45a…)` sedangkan `CLOSE_CURRENCY` per sisi SUKSES. Gejala
+di UI: *"Add v4 gagal 3×. Simulasi tx gagal (tidak dikirim)"* — jadi tidak ada dana
+bergerak, tapi add tidak pernah bisa jalan.
+
+Konsekuensi yang wajib disebut UI: sisa fee yang tidak terpakai mendarat di
+**WALLET**, bukan tetap unclaimed.
+
 ### Add v4 memakai fee unclaimed sebagai modal
 
 `INCREASE_LIQUIDITY` v4 mengkreditkan `feesAccrued` terhadap tagihan `SETTLE_PAIR`:
@@ -455,6 +472,26 @@ Dua penjagaan sekarang:
 - approve dengan **margin 2×** jumlah tx itu (tetap terbatas, kedaluwarsa tetap 1 jam);
 - kalau preflight tetap balas `0xf96fb071`, allowance disetel ulang sebelum percobaan
   berikutnya, bukan mengulang tiga kali dengan sebab yang sama.
+
+### Retry yang mengirim setoran KEDUA
+
+`mint_v4`/`increase_v4` mencoba 3×. Kalau percobaan pertama sebenarnya SUKSES tapi
+`wait_ok`/`_preflight` menyimpulkan gagal, percobaan berikutnya menambah dana LAGI.
+
+Terbukti di RAM #1308102: dua `increase` identik
+(**+4.649.204.726.935.655.993** likuiditas) di blok **51026498** dan **51026523**,
+selang 25 blok. User mengklik sekali, menyetor dua kali; kartu hasil cuma menyebut
+tx yang kedua. Untuk `mint_v4` akibatnya lebih parah — posisi KEDUA lahir dengan
+modal baru.
+
+`_recover_sent()` sudah ada tapi dulu cuma dipanggil SESUDAH ketiga percobaan habis
+— terlambat. Sekarang dipanggil di AWAL tiap percobaan ulang: kalau ada tx terkirim
+yang receipt-nya status 1, alurnya berhenti dan memakai tx itu.
+
+Aturannya: jalur tx apa pun yang punya loop retry WAJIB memeriksa receipt tx yang
+sudah terkirim sebelum mengirim yang baru. Mengirim ulang itu aman hanya untuk tx
+yang IDENTIK (nonce + tanda tangan sama, seperti `_rebroadcast`), bukan untuk tx
+baru yang dibangun ulang.
 
 ### Mint yang sukses tapi dilaporkan gagal = dana hilang dari UI
 
