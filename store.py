@@ -4,6 +4,8 @@ untuk hitung PnL portfolio ala /list.
 """
 import fcntl
 import json
+import logging
+import math
 import threading
 import os
 import time
@@ -14,6 +16,8 @@ from pathlib import Path
 BASE = Path(__file__).parent
 SETTINGS_FILE = BASE / "settings.json"
 HISTORY_FILE = BASE / "history.json"
+
+log = logging.getLogger(__name__)
 
 DEFAULT_SETTINGS = {
     "chain": 4663,
@@ -208,9 +212,44 @@ def _hist_write():
                 f.close()
 
 
+# Batas kewarasan nilai event (USD). Posisi LP terbesar yang masuk akal di bot ini
+# jauh di bawah ini; angka di atasnya selalu bug pembacaan, bukan dana sungguhan.
+_USD_SANITY_MAX = 1e9
+
+
+def drop_bad_events(chain_id: int, limit: float = _USD_SANITY_MAX) -> list[dict]:
+    """Buang event ber-USD mustahil yang terlanjur tercatat. Kembalikan yang dibuang."""
+    with _hist_write():
+        h = _hist(fresh=True)
+        key = str(chain_id)
+        ev = h.get("events", {}).get(key, [])
+        bad = [e for e in ev
+               if not isinstance(e.get("usd"), (int, float))
+               or not math.isfinite(float(e["usd"])) or abs(float(e["usd"])) > limit]
+        if bad:
+            h["events"][key] = [e for e in ev if e not in bad]
+            _write(HISTORY_FILE, h)
+        return bad
+
+
 def record_event(chain_id: int, kind: str, token_id, usd: float,
                  detail: str = "", wallet: str = ""):
     """kind: mint | close | fees"""
+    # Satu nilai mustahil merusak SELURUH PnL portfolio selamanya: jumlahnya bukan
+    # rata-rata, jadi tidak ada yang meredamnya. Terjadi sungguhan — satu event
+    # `fees` senilai $5,9e53 (v4:1239107) membuat PnL terbaca
+    # "$593805893216973777495023055208279841552788881408.0M" dan persentasenya ikut
+    # ngawur. Nilai sebesar itu selalu bug pembacaan (raw token dianggap sudah
+    # berdesimal, delta uint256 yang underflow, harga dari pool debu), bukan dana
+    # sungguhan. Lebih baik satu event hilang daripada seluruh riwayat tidak terpakai.
+    try:
+        usd = float(usd)
+    except (TypeError, ValueError):
+        log.error("record_event %s %s: usd tidak valid (%r) — dilewati", kind, token_id, usd)
+        return
+    if not math.isfinite(usd) or abs(usd) > _USD_SANITY_MAX:
+        log.error("record_event %s %s: usd mustahil ($%.3g) — dilewati", kind, token_id, usd)
+        return
     with _hist_write():
         h = _hist(fresh=True)
         h["events"].setdefault(str(chain_id), []).append({

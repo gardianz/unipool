@@ -479,6 +479,25 @@ Konsekuensi untuk kode baru: mutator apa pun WAJIB `with _hist_write():` dan
 memutasinya mengubah apa yang dilihat pemanggil lain, dan menulis dari salinan basi
 menghapus perubahan proses lain.
 
+### Nilai event mustahil = PnL rusak selamanya
+
+PnL portfolio itu **jumlah**, bukan rata-rata — tidak ada yang meredam satu nilai
+ngawur. Terjadi sungguhan: satu event `fees` senilai **$5,9e53** (v4:1239107)
+membuat PnL terbaca `$593805893216973777495023055208279841552788881408.0M` dan
+persentasenya ikut ngawur, padahal seluruh sisa riwayatnya sehat.
+
+`record_event()` menolak `usd` yang tidak finite atau di atas `_USD_SANITY_MAX`
+(1e9) dan **mencatatnya di log** lengkap dengan kind + token_id. Angka sebesar itu
+selalu bug pembacaan (raw token dianggap sudah berdesimal, delta uint256 yang
+underflow, harga dari pool debu), bukan dana sungguhan — lebih baik satu event
+hilang daripada seluruh riwayat tidak terpakai.
+
+Sumbernya hampir selalu `pos["unclaimed_usd"]`: 12 dari 13 pemanggil `record_event`
+ber-kind `fees` meneruskan nilai itu apa adanya. Jadi kalau log penjaga muncul,
+yang dicari adalah pembacaan fee posisi itu di `chain.py`, bukan jalur pencatatannya.
+
+`drop_bad_events(chain_id)` membuang yang terlanjur tercatat.
+
 ### Registry posisi (kenapa `history.json` penting)
 
 Posisi v3 bisa dienumerasi on-chain (ERC721Enumerable), tapi **PositionManager v4 tidak
