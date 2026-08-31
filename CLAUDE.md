@@ -1018,6 +1018,42 @@ Executor default `asyncio.to_thread` disetel eksplisit **32 worker**. Default-ny
 terlihat seperti RPC lambat. Semuanya kerja I/O, jadi jumlahnya tidak perlu ikut
 jumlah core.
 
+### `monitor_loop` adalah pemakai CU RPC terbesar
+
+Terukur: **satu pindai wallet = 199 request RPC** untuk 16 posisi (12,4 per posisi).
+Loop ini jalan terus-menerus, jadi intervalnya yang menentukan tagihan — bukan
+pemakaian UI.
+
+| konfigurasi | request/hari | CU/hari (26 CU per `eth_call`) |
+|---|---|---|
+| 2 wallet tiap 30 detik | 1.146.240 | **~30M** |
+| 2 wallet tiap 120 detik | 286.560 | ~7,5M |
+| 1 wallet (order saja) tiap 120 detik | 143.280 | ~3,7M |
+
+Kuota Alchemy free 30M CU/bulan — konfigurasi lama menghabiskannya dalam **satu
+hari**, dan throughput-nya menembus batas (terukur **487,7 / 300 CU/s**) sehingga
+muncul 429 yang membuat posisi hilang dari `/list`.
+
+Dua sebabnya, keduanya sudah diperbaiki:
+
+- **`30 if order_chains else …`** — satu order aktif memaksa pindai tiap 30 detik
+  selamanya, mengabaikan setelan user. Sekarang `max(30, order_secs, alert_secs)`
+  dengan `order_secs` default 120.
+- **Semua wallet dipindai di semua chain.** Alert memang butuh semua wallet, tapi
+  hanya di chain aktif; pengecekan order cuma butuh wallet pemilik order.
+  `_gather_positions(cid, only_wallets)` membatasinya, dan chain tanpa order
+  di-skip total.
+
+Pembersihan `RANGE_STATE` HANYA boleh jalan saat pindai penuh (`need is None`) —
+kalau `live` dibangun dari sebagian wallet, entri wallet lain ikut terbuang dan
+transisi range berikutnya hilang karena dianggap baseline baru.
+
+Kalau perlu memangkas lebih jauh: monitor sebenarnya cuma memakai `in_range`,
+`mc_now`, dan `mc_lower`. Itu bisa dihitung dari **satu** panggilan slot0 per pool
+(sisanya statis atau sudah di-cache: `token_supply`, `quote_usd_price`), bukan 12,4
+panggilan per posisi. Belum dikerjakan — perlu jalur "ringan" di
+`_position_detail`/`_v4_position_detail` dan sentuh jalur eksekutor TP/SL.
+
 ### Serialisasi transaksi & eksekutor tunggal
 
 Masing-masing proses punya lock nonce sendiri (`TX_LOCK`: `asyncio.Lock` di bot.py,

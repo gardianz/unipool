@@ -28,6 +28,9 @@ DEFAULT_SETTINGS = {
     "autoswap": True,       # swap hasil close → wrapped native
     "gap": 1,               # jarak pengaman range single-sided dari harga (satuan tick-spacing; 0 = nempel)
     "alert_secs": 60,       # interval cek alert in/out range (detik; 0 = off)
+    "order_secs": 120,      # interval cek order TP/SL (detik) — tiap pindai wallet
+                            # terukur 199 request RPC, jadi ini langsung menentukan
+                            # tagihan CU: 30 detik = ~30M CU/hari untuk 2 wallet
     "wallet_idx": 0,        # wallet aktif (index di daftar PRIVATE_KEY, PRIVATE_KEY_2, ...)
 }
 

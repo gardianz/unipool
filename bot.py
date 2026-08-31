@@ -3137,13 +3137,20 @@ async def _trigger_order(app, cid: int, o: dict, p: dict, hit: tuple, mc: float)
     await _notify(app, "\n".join(lines))
 
 
-async def _gather_positions(cid: int):
-    """Ambil posisi semua wallet di satu chain. Return (positions, by_wallet).
-    by_wallet[addr] = {pid: pos} atau None kalau fetch wallet itu gagal."""
+async def _gather_positions(cid: int, only_wallets: set | None = None):
+    """Ambil posisi wallet di satu chain. Return (positions, by_wallet).
+    by_wallet[addr] = {pid: pos} atau None kalau fetch wallet itu gagal.
+
+    `only_wallets`: batasi ke alamat tertentu (lowercase). Satu pindai wallet
+    terukur **199 request RPC** untuk 16 posisi (12,4 per posisi), jadi memindai
+    wallet yang tidak punya kepentingan di chain itu langsung menggandakan tagihan.
+    """
     positions = []
     by_wallet = {}
     for key in all_pks():
         waddr = _addr_of(key).lower()
+        if only_wallets is not None and waddr not in only_wallets:
+            continue
         try:
             pk_pos = await asyncio.to_thread(list_positions_all, cid, key)
         except Exception as e:
@@ -3177,7 +3184,9 @@ async def _loop_watchdog():
 async def monitor_loop(app):
     """Cek berkala: alert in/out range (chain aktif) + eksekusi order TP/SL.
     Order dicek di SEMUA chain yang punya pesanan aktif — jadi TP/SL tetap jalan
-    walau bot lagi di chain lain. Loop ~30s selama ada pesanan aktif."""
+    walau bot lagi di chain lain. Iramanya `max(alert_secs, order_secs)`, bukan 30
+    detik mati: tiap pindai wallet terukur 199 request RPC, jadi interval loop ini
+    yang paling menentukan tagihan CU."""
     await asyncio.sleep(15)  # kasih waktu bot siap
     while True:
         s = store.load_settings()
@@ -3193,19 +3202,38 @@ async def monitor_loop(app):
             continue
         for cid in chains:
             try:
-                positions, by_wallet = await _gather_positions(cid)
+                # Wallet yang dipindai dibatasi: alert cuma untuk chain aktif (semua
+                # wallet), sedangkan pengecekan order cuma butuh wallet pemilik order.
+                need = None
+                if not (alert_on and cid == active_cid):
+                    need = {str(o.get("wallet", "")).lower()
+                            for o in _orders_for_chain(cid, "active")}
+                    need.discard("")
+                    if not need:
+                        continue
+                positions, by_wallet = await _gather_positions(cid, need)
                 if alert_on and cid == active_cid:
                     await _emit_range_alerts(app, cid, positions)
                 active_orders = _orders_for_chain(cid, "active")
                 if active_orders:
                     await _check_orders(app, cid, active_orders, by_wallet)
-                # posisi yang sudah ditutup → buang dari state alert
-                live = {(cid, p["pid"]) for p in positions}
-                for k in [k for k in RANGE_STATE if k[0] == cid and k not in live]:
-                    RANGE_STATE.pop(k, None)
+                # posisi yang sudah ditutup → buang dari state alert. HANYA saat
+                # pindai penuh: kalau cuma sebagian wallet dibaca, `live` tidak
+                # lengkap dan entri wallet lain ikut terbuang (transisi range
+                # berikutnya jadi hilang karena dianggap baseline baru).
+                if need is None:
+                    live = {(cid, p["pid"]) for p in positions}
+                    for k in [k for k in RANGE_STATE if k[0] == cid and k not in live]:
+                        RANGE_STATE.pop(k, None)
             except Exception as e:
                 log.warning("monitor %s: %s", cid, e)
-        await asyncio.sleep(30 if order_chains else max(30, interval))
+        # Dulu `30 if order_chains else ...` — adanya SATU order aktif memaksa pindai
+        # tiap 30 detik selamanya, mengabaikan setelan user. Terukur: 2 wallet tiap
+        # 30 detik = 1,15 juta request/hari (~30M CU), yaitu seluruh kuota bulanan
+        # Alchemy dalam satu hari, dan throughput-nya menembus batas sehingga muncul
+        # 429 yang membuat posisi hilang dari /list.
+        gap = int(s.get("order_secs", 120) or 120) if order_chains else 0
+        await asyncio.sleep(max(30, gap, interval) if (order_chains or alert_on) else 60)
 
 
 async def post_init(app):
