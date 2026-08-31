@@ -113,8 +113,27 @@ def save_settings(s: dict):
 
 
 # ---------- Riwayat PnL ----------
+_HIST_CACHE: dict = {}      # (mtime, size) -> isi file, biar tidak diparse berulang
+
+
 def _hist() -> dict:
-    return _read(HISTORY_FILE, {"events": {}})
+    """Isi history.json, di-cache selama file-nya belum berubah.
+
+    Kartu /list memanggil mint_usd/fees_claimed_usd/withdrawn_usd/mint_ts per posisi,
+    jadi tanpa cache satu refresh mem-parse file yang sama puluhan kali. Kunci
+    cache-nya (mtime, ukuran) supaya perubahan dari proses lain (web.py) tetap
+    terbaca — file ditulis atomik lewat rename, jadi mtime pasti berubah."""
+    try:
+        st = HISTORY_FILE.stat()
+        key = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return _read(HISTORY_FILE, {"events": {}})
+    hit = _HIST_CACHE.get("k")
+    if hit == key and "v" in _HIST_CACHE:
+        return _HIST_CACHE["v"]
+    val = _read(HISTORY_FILE, {"events": {}})
+    _HIST_CACHE["k"], _HIST_CACHE["v"] = key, val
+    return val
 
 
 def record_event(chain_id: int, kind: str, token_id, usd: float,

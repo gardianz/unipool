@@ -823,6 +823,34 @@ immutable (`pool_addr_of`, `token_supply`, hasil verifikasi kontrak) dan `.activ
 untuk set tokenId aktif. RPC free-tier gampang kena 429 — hindari menambah panggilan
 per-posisi di jalur refresh.
 
+Empat sumber lambat yang sudah diukur dan diperbaiki — jangan dibalik:
+
+- **Detail posisi v4/v2 dibaca paralel** di `list_all_positions()`. Satu posisi v4 =
+  11 panggilan RPC ≈ 3,3 detik di RPC ber-latensi 270 ms; berurutan, 14 posisi butuh
+  ~49 detik. Dengan `ThreadPoolExecutor` (maks 8): **8,66 detik**, hasil identik.
+  Jalur v3 memang sudah paralel sejak awal — v4/v2 yang tertinggal.
+- **Backoff retry RPC dipendekkan** (`total=4, backoff_factor=0.3`, total ~4 detik).
+  Sebelumnya `total=6, backoff_factor=0.6`: satu panggilan yang kena 429 tidur
+  0,6+1,2+2,4+4,8+9,6+19,2 ≈ **37 detik** sebelum pemanggilnya tahu ada masalah, dan
+  satu kartu posisi butuh ~11 panggilan. Endpoint bermasalah ditangani failover
+  `get_w3`, bukan dengan menunggu lebih lama di endpoint yang sama.
+- **Timeout konek 5 detik** (`request_kwargs={"timeout": (5, 30)}`). `get_w3` mencoba
+  endpoint berurutan, jadi 30 detik per endpoint mati berlipat sebelum sampai yang hidup.
+- **`store._hist()` di-cache** dengan kunci `(mtime_ns, ukuran)`. Kartu `/list`
+  memanggil `mint_usd`/`fees_claimed_usd`/`withdrawn_usd`/`mint_ts` per posisi, jadi
+  satu refresh mem-parse `history.json` puluhan kali. Kunci mtime membuat tulisan dari
+  proses lain (web.py) tetap terbaca — file ditulis atomik lewat rename.
+
+`provider.cache_allowed_requests = True` **dipertahankan** untuk pembacaan posisi
+(terukur 11 vs 18 panggilan RPC, 3,3 vs 5,1 detik), tapi **dimatikan di jalur polling
+tx** lewat `_no_req_cache(w3)`. Untuk tiap hasil ber-`blockNumber`, web3 menembak satu
+`eth_getBlockByNumber` EKSTRA hanya untuk memutuskan boleh di-cache atau tidak; blok
+receipt yang baru masuk sering belum terbaca sehingga panggilan itu balik null dan
+web3 mencatat `TypeError: 'NoneType' object is not subscriptable`
+(`request_caching_validation.py:121`). Errornya ditangkap web3 jadi tidak merusak
+apa pun — yang mahal round-trip terbuangnya, tiap poll, selama `wait_ok` menunggu
+sampai 180 detik per tx. Receipt tx pending juga memang tidak layak di-cache.
+
 ### PoA: `get_block` di BSC
 
 BSC memakai extraData 280 byte, jauh di atas 32 byte yang divalidasi web3, jadi

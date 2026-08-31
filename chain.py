@@ -8,6 +8,7 @@ import os
 import re
 import threading
 import time
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 from pathlib import Path
@@ -682,10 +683,17 @@ def fmt_amount(v: float) -> str:
 
 def _rpc_retry() -> Retry:
     """Retry otomatis untuk rate limit / gangguan sesaat RPC (Alchemy 429 dst).
-    Backoff 0.6→9.6 detik, hormati header Retry-After. Aman untuk JSON-RPC:
-    request read idempoten; eth_sendRawTransaction kirim bytes yang sama
-    (hash tx sama) jadi re-broadcast tidak dobel."""
-    return Retry(total=6, backoff_factor=0.6, status_forcelist=(429, 502, 503, 504),
+    Hormati header Retry-After. Aman untuk JSON-RPC: request read idempoten;
+    eth_sendRawTransaction kirim bytes yang sama (hash tx sama) jadi re-broadcast
+    tidak dobel.
+
+    Backoff sengaja PENDEK (0.3→2.4 detik, total ~4 detik). Dulu `total=6,
+    backoff_factor=0.6` berarti satu panggilan RPC yang kena 429 tidur
+    0,6+1,2+2,4+4,8+9,6+19,2 ≈ 37 detik SEBELUM pemanggilnya tahu ada masalah —
+    dan satu kartu posisi butuh ~11 panggilan, jadi satu klik tombol bisa
+    menggantung menit-menit. Endpoint yang benar-benar bermasalah ditangani
+    failover di `get_w3`, bukan dengan menunggu lebih lama di endpoint yang sama."""
+    return Retry(total=4, backoff_factor=0.3, status_forcelist=(429, 502, 503, 504),
                  allowed_methods=None, respect_retry_after_header=True)
 
 
@@ -742,7 +750,7 @@ def _forced_ip_w3(rpc_url: str) -> Web3 | None:
     session.mount(f"https://{ip}", _SNIAdapter(u.hostname))
     session.headers["Host"] = u.hostname
     ip_url = rpc_url.replace(u.hostname, ip, 1)
-    provider = Web3.HTTPProvider(ip_url, request_kwargs={"timeout": 30}, session=session)
+    provider = Web3.HTTPProvider(ip_url, request_kwargs={"timeout": (5, 30)}, session=session)
     provider.cache_allowed_requests = True  # eth_chainId dkk tidak di-query berulang
     return _poa(Web3(provider))
 
@@ -784,7 +792,10 @@ def get_w3(chain_id: int, fresh: bool = False) -> Web3:
     rpcs += cfg["rpcs"]
     errs = []
     for rpc in rpcs:
-        provider = Web3.HTTPProvider(rpc, request_kwargs={"timeout": 30}, session=_rpc_session())
+        # (connect, read): endpoint mati/diblokir DNS ketahuan dalam 5 detik, bukan 30 —
+        # `get_w3` mencoba beberapa endpoint berurutan, jadi timeout konek yang lama
+        # berlipat ganda sebelum sampai ke endpoint yang hidup.
+        provider = Web3.HTTPProvider(rpc, request_kwargs={"timeout": (5, 30)}, session=_rpc_session())
         provider.cache_allowed_requests = True  # eth_chainId dkk tidak di-query berulang
         candidates = [_poa(Web3(provider))]
         for i, w3 in enumerate(candidates):
@@ -1078,6 +1089,29 @@ def _rebroadcast(w3: Web3, raw) -> None:
             pass
 
 
+@contextmanager
+def _no_req_cache(w3: Web3):
+    """Matikan sementara cache request web3 untuk jalur polling tx.
+
+    `cache_allowed_requests` menolong pembacaan posisi (terukur 11 vs 18 panggilan
+    RPC), tapi di jalur tx ia MERUGIKAN: untuk tiap hasil yang punya `blockNumber`
+    web3 menembak satu `eth_getBlockByNumber` EKSTRA cuma buat memutuskan boleh
+    di-cache atau tidak. Receipt tx yang baru masuk sering belum punya blok yang
+    bisa dibaca, jadi panggilan ekstra itu balik null dan web3 mencatat
+    `TypeError: 'NoneType' object is not subscriptable` (tertangkap, tapi tetap
+    membuang satu round-trip tiap poll). Receipt tx pending juga tidak ada gunanya
+    di-cache — isinya memang berubah."""
+    prov = getattr(w3, "provider", None)
+    old = getattr(prov, "cache_allowed_requests", None)
+    try:
+        if prov is not None:
+            prov.cache_allowed_requests = False
+        yield
+    finally:
+        if prov is not None and old is not None:
+            prov.cache_allowed_requests = old
+
+
 def wait_ok(w3: Web3, txhash: str, what: str, total_wait: int = 180):
     """Tunggu receipt sambil menyiarkan ulang tx BERKALA (tiap ~20 detik).
 
@@ -1097,7 +1131,8 @@ def wait_ok(w3: Web3, txhash: str, what: str, total_wait: int = 180):
         if left <= 0:
             break
         try:
-            r = w3.eth.wait_for_transaction_receipt(txhash, timeout=max(5, min(20, left)))
+            with _no_req_cache(w3):
+                r = w3.eth.wait_for_transaction_receipt(txhash, timeout=max(5, min(20, left)))
             break
         except Exception:
             _rebroadcast(w3, raw)
@@ -6218,17 +6253,28 @@ def list_all_positions(chain_id: int, pk: str, v2_refs: list[str] = (),
                 out.append(p)
         except Exception:
             continue
-    for r in v4_refs:
+    # Detail v4/v2 dibaca PARALEL. Satu posisi v4 = ~11 panggilan RPC dan terukur 3,3
+    # detik di RPC ber-latensi 270 ms; berurutan, 10 posisi jadi ~33 detik dan tiap
+    # tombol di UI terasa menggantung. Semua panggilannya read-only, jadi aman
+    # diparalelkan; jumlah worker ditahan supaya RPC free-tier tidak kena 429.
+    def _v4_one(r):
         try:
-            d = _v4_position_detail(w3, chain_id, int(r), account.address)
-            if d:
-                out.append(d)
+            return _v4_position_detail(w3, chain_id, int(r), account.address)
         except Exception:
-            continue
-    for r in v2_refs:
-        d = _v2_position_detail(w3, chain_id, r, account.address)
-        if d:
-            out.append(d)
+            return None
+
+    def _v2_one(r):
+        try:
+            return _v2_position_detail(w3, chain_id, r, account.address)
+        except Exception:
+            return None
+
+    refs4, refs2 = list(v4_refs or []), list(v2_refs or [])
+    if refs4 or refs2:
+        with ThreadPoolExecutor(max_workers=min(8, max(1, len(refs4) + len(refs2)))) as ex:
+            for d in list(ex.map(_v4_one, refs4)) + list(ex.map(_v2_one, refs2)):
+                if d:
+                    out.append(d)
     return out
 
 
