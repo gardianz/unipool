@@ -282,6 +282,31 @@ untuk alur 2 tx).
 
 ### Pindah pool = rebalance dengan `target_pool`
 
+Mode `"same"` mempertahankan **rentang harga** posisi lama, bukan cuma lebarnya.
+Tiga mode lain (`wide`/`lower`/`upper`) memakai lebar lama tapi **dipusatkan di harga
+sekarang** — itu yang selama ini bikin range bergeser saat pindah pool.
+
+Tick TIDAK bisa disalin mentah antar pool: skala harganya beda kalau quote-nya beda
+dan kisinya beda kalau fee-nya beda. `ticks_for_same_band()` karena itu mengonversi
+lewat harga USD (batas MC — MC = harga × supply, dan supply-nya sama), lalu
+membulatkan **KE LUAR** ke kisi pool tujuan: lebih baik sedikit lebih lebar daripada
+memotong sisi yang user harapkan tetap tertutup. Terukur RAM #1481226, WETH 2% →
+USDG 3% (kisi 300): tick `92800..102400` → `-301200..-291300`, MC
+$4.319.631–$11.281.023 → $4.257.653–$11.457.776. Tick tujuan NEGATIF — bukti kenapa
+menyalin tick apa adanya akan salah total (USDG 6 desimal vs RAM 18, orientasi quote
+juga terbalik).
+
+**`"same"` tidak boleh diteruskan ke mesin mint.** `_range_of()` mengembalikan mode
+EFEKTIF dari letak range terhadap harga, dan `mint_v4` menolak kalau tidak cocok
+dengan `strategy["mode"]` — jadi `"same"` akan selalu gagal di situ. Alurnya
+menurunkan `cmode = effective_mode(lo, hi, tick_tujuan, q_is_t1_tujuan)` lebih dulu,
+memakainya untuk komposisi dana DAN sebagai `strategy["mode"]`, lalu menaruh tick
+hasil konversi di `strategy["ticks"]`.
+
+Komposisi dihitung dari geometri pool TUJUAN (di situlah dananya mendarat), bukan
+pool asal — `plan_two_sided` hanya MEMBAGI total secara proporsional, jadi totalnya
+boleh tetap dalam satuan quote lama.
+
 `rebalance_position(..., target_pool=dict)` menutup posisi di pool lama lalu mint di
 pool itu (mis. fee tier 5% → 2%). Dua penjagaan WAJIB, jangan dilemahkan:
 

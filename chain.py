@@ -7020,6 +7020,52 @@ def close_any(chain_id: int, pk: str, pid, slippage_pct: float, autoswap: bool) 
 
 
 # ══════════════════════════ Rebalance ══════════════════════════
+def _meme_price_at_tick(tick: int, q_is_t1: bool, mdec: int, qdec: int) -> float:
+    """Harga 1 meme dalam satuan quote (manusia) pada sebuah tick."""
+    r = tick_to_price(tick)
+    return (r if q_is_t1 else (1 / r if r else 0.0)) * 10 ** (mdec - qdec)
+
+
+def _tick_at_meme_price(price_q: float, q_is_t1: bool, mdec: int, qdec: int) -> float:
+    """Kebalikan `_meme_price_at_tick` — tick (belum dibulatkan ke kisi)."""
+    if price_q <= 0:
+        raise RuntimeError("Harga batas range terbaca 0.")
+    scale = 10 ** (mdec - qdec)
+    raw = price_q / scale if q_is_t1 else scale / price_q
+    if raw <= 0:
+        raise RuntimeError("Harga batas range tidak masuk akal.")
+    return math.log(raw) / math.log(1.0001)
+
+
+def ticks_for_same_band(lo: int, hi: int, src_q_is_t1: bool, src_qdec: int,
+                        src_quote_usd: float, mdec: int,
+                        dst_q_is_t1: bool, dst_qdec: int, dst_quote_usd: float,
+                        dst_spacing: int) -> tuple[int, int]:
+    """Tick di pool TUJUAN yang mewakili rentang HARGA yang sama dengan `lo..hi`
+    di pool asal — dipakai mode "same" pada pindah pool.
+
+    Tick tidak bisa dipindah begitu saja antar pool: skala harganya beda kalau
+    quote-nya beda (mis. WETH 18 desimal vs USDG 6), dan kisinya beda kalau fee-nya
+    beda. Yang dipertahankan adalah rentang harga USD-nya — itu yang setara dengan
+    "market cap range" di UI, karena MC = harga × supply dan supply-nya sama.
+
+    Batas dibulatkan KE LUAR (bawah ke bawah, atas ke atas) supaya menempel kisi
+    tanpa pernah MENYEMPITKAN rentang: lebih baik sedikit lebih lebar daripada
+    memotong sisi yang user harapkan tetap tertutup."""
+    if src_quote_usd <= 0 or dst_quote_usd <= 0:
+        raise RuntimeError("Harga quote tak terbaca — mode 'sama' butuh keduanya.")
+    usd = sorted(_meme_price_at_tick(t, src_q_is_t1, mdec, src_qdec) * src_quote_usd
+                 for t in (lo, hi))
+    ts = sorted(_tick_at_meme_price(u / dst_quote_usd, dst_q_is_t1, mdec, dst_qdec)
+                for u in usd)
+    sp = max(1, int(dst_spacing or 60))
+    t_lo = int(math.floor(ts[0] / sp)) * sp
+    t_hi = int(math.ceil(ts[1] / sp)) * sp
+    if t_hi <= t_lo:
+        t_hi = t_lo + sp
+    return max(t_lo, MIN_TICK), min(t_hi, MAX_TICK)
+
+
 def _span_to_pcts(span: int, mode: str) -> tuple[float, float]:
     """Konversi lebar range lama (tick) → (low_pct, up_pct) untuk strategi baru.
     wide = span dibagi dua sisi; lower/upper = span penuh satu sisi."""
@@ -7115,8 +7161,11 @@ def rebalance_position(chain_id: int, pk: str, pid, mode: str, slippage_pct: flo
     ver, ref = parse_pid(pid)
     if ver == 2:
         raise RuntimeError("Posisi v2 full-range — tidak perlu rebalance.")
-    if mode not in ("wide", "lower", "upper"):
-        raise RuntimeError("Mode rebalance: wide / lower / upper.")
+    if mode not in ("wide", "lower", "upper", "same"):
+        raise RuntimeError("Mode rebalance: wide / lower / upper / same.")
+    if mode == "same" and target_pool is None:
+        raise RuntimeError("Mode 'sama' hanya untuk pindah pool — di pool yang sama "
+                           "range-nya tidak berubah, jadi tidak ada yang dikerjakan.")
     w3 = get_w3(chain_id)
     cfg = CHAINS[chain_id]
     account = w3.eth.account.from_key(pk)
@@ -7228,20 +7277,54 @@ def rebalance_position(chain_id: int, pk: str, pid, mode: str, slippage_pct: flo
         if h:
             steps.append(("swap", h))
 
-    low_pct, up_pct = _span_to_pcts(span, mode)
-    if mode == "lower" and m_delta > 0:
+    low_pct, up_pct = _span_to_pcts(span, "wide" if mode == "same" else mode)
+    # Mode "sama": pertahankan rentang HARGA posisi lama di pool tujuan. Tick tidak
+    # bisa dipindah apa adanya — skalanya beda kalau quote-nya beda, kisinya beda
+    # kalau fee-nya beda — jadi batasnya dikonversi lewat harga USD.
+    same_ticks = None
+    cmode = mode                      # mode yang menentukan KOMPOSISI dana
+    if mode == "same":
+        dst = target_pool
+        mdec_ = token_info(w3, meme)["decimals"]
+        same_ticks = ticks_for_same_band(
+            lo, hi, q_is_t1, qdec, float(pool_info["quote_usd"] or 0), mdec_,
+            bool(dst.get("quote_is_token1")), int(dst.get("quote_decimals") or 18),
+            float(dst.get("quote_usd") or 0),
+            int(dst.get("tick_spacing") or TICK_SPACING.get(dst.get("fee"), 60)))
+        # Mode efektif diturunkan dari LETAK range terhadap harga pool TUJUAN, bukan
+        # dari pilihan user. "same" tidak boleh diteruskan apa adanya ke mesin mint:
+        # `_range_of` mengembalikan mode efektif dan `mint_v4` menolak kalau tidak
+        # cocok dengan `strategy["mode"]` — jadi "same" akan SELALU gagal di situ.
+        dst_tick = (dst.get("tick") if dst.get("ver", 3) == 3
+                    else v4_slot0(w3, chain_id, dst["pool_id"])[1])
+        cmode = effective_mode(same_ticks[0], same_ticks[1], int(dst_tick),
+                               bool(dst.get("quote_is_token1")))
+        _step(f"🎯 Range dipertahankan: tick {same_ticks[0]}..{same_ticks[1]} "
+              f"di pool tujuan (bentuk: {cmode})")
+    if cmode == "lower" and m_delta > 0:
         do_swap(meme, quote, m_delta)  # lower = 100% quote
-    elif mode == "upper" and q_delta > 0:
+    elif cmode == "upper" and q_delta > 0:
         keep_gas = w3.to_wei("0.0005", "ether") if quote.lower() == V4_NATIVE else 0
         do_swap(quote, meme, max(0, q_delta - keep_gas))  # upper = 100% meme
-    elif mode == "wide":
+    elif cmode in ("wide", "stable"):
         # sisi meme berlebih → jual kelebihannya ke quote (arah quote→meme diurus mesin mint)
-        cur_tick_now = pool_info["tick"] if ver == 3 else v4_slot0(w3, chain_id, pool_info["pool_id"])[1]
-        sp_ = pool_info["tick_spacing"] or TICK_SPACING.get(pool_info["fee"], 60)
-        t_lo, t_hi = calc_strategy_range(cur_tick_now, pool_info["fee"], q_is_t1, "wide",
-                                         low_pct, up_pct, gap, spacing=sp_)
+        if same_ticks:
+            # Komposisinya ditentukan geometri pool TUJUAN — di situlah dananya
+            # mendarat. `plan_two_sided` cuma MEMBAGI total secara proporsional,
+            # jadi total boleh tetap dalam satuan quote lama.
+            dst = target_pool
+            g_sqrtp = (dst.get("sqrtp") if dst.get("ver", 3) == 3
+                       else v4_slot0(w3, chain_id, dst["pool_id"])[0]) or sqrtp_now
+            g_q_is_t1 = bool(dst.get("quote_is_token1"))
+            t_lo, t_hi = same_ticks
+        else:
+            cur_tick_now = pool_info["tick"] if ver == 3 else v4_slot0(w3, chain_id, pool_info["pool_id"])[1]
+            sp_ = pool_info["tick_spacing"] or TICK_SPACING.get(pool_info["fee"], 60)
+            t_lo, t_hi = calc_strategy_range(cur_tick_now, pool_info["fee"], q_is_t1, "wide",
+                                             low_pct, up_pct, gap, spacing=sp_)
+            g_sqrtp, g_q_is_t1 = sqrtp_now, q_is_t1
         total_q = q_delta + int(m_delta * mprice_q)
-        keep, _sw = plan_two_sided(sqrtp_now, t_lo, t_hi, max(total_q, 1), q_is_t1)
+        keep, _sw = plan_two_sided(g_sqrtp, t_lo, t_hi, max(total_q, 1), g_q_is_t1)
         need_m_q = max(total_q, 1) - keep          # nilai sisi meme yang dibutuhkan (quote-wei)
         have_m_q = int(m_delta * mprice_q)
         excess_q = have_m_q - need_m_q
@@ -7272,7 +7355,7 @@ def rebalance_position(chain_id: int, pk: str, pid, mode: str, slippage_pct: flo
         raise RuntimeError("Budget mint 0 setelah close+swap — dana aman di wallet, mint manual saja.")
     if target_pool is not None:
         tq = str(target_pool.get("quote_addr", "")).lower()
-        if tq and tq != quote.lower() and mode != "upper":
+        if tq and tq != quote.lower() and cmode != "upper":
             # Quote beda -> tukar dulu. Mode "upper" tidak lewat sini: budget-nya
             # dalam satuan MEME, dan token meme sama di kedua pool.
             got = _convert_quote(w3, chain_id, pk, quote, target_pool["quote_addr"],
@@ -7281,7 +7364,9 @@ def rebalance_position(chain_id: int, pk: str, pid, mode: str, slippage_pct: flo
             if budget <= 0:
                 raise RuntimeError("Konversi quote menghasilkan 0 — dana aman di wallet.")
 
-    strategy = {"mode": mode, "low_pct": low_pct, "up_pct": up_pct, "gap": gap}
+    strategy = {"mode": cmode, "low_pct": low_pct, "up_pct": up_pct, "gap": gap}
+    if same_ticks:
+        strategy["ticks"] = same_ticks       # `_range_of` memakai range bebas apa adanya
     dest = target_pool or pool_info
     if dest is not pool_info:
         assert_pool_orientation(w3, dest, chain_id)   # jangan pernah percaya dict dari UI

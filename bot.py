@@ -958,7 +958,8 @@ async def show_pools_for(status, cid: int, token: str):
 
 
 # ---------- Mint flow ----------
-STRAT_LABEL = {"stable": "Stable", "wide": "Wide", "lower": "Lower", "upper": "Upper"}
+STRAT_LABEL = {"stable": "Stable", "wide": "Wide", "lower": "Lower", "upper": "Upper",
+               "same": "Sama (MC range dipertahankan)"}
 STRAT_PRESETS = {  # baris tombol lebar range per mode: (low_pct, up_pct)
     "stable": [(2, 2), (5, 5), (6.18, 6.18), (10, 10)],
     "wide": [(25, 50), (50, 100), (60, 150), (75, 300)],
@@ -3685,7 +3686,11 @@ async def show_migrate_confirm(msg, key: str, src_pid: str):
     if dest_meme and dest_meme != src_meme:
         await edit(msg, "❌ Pool tujuan bukan untuk token yang sama.", NAV_KB)
         return
+    # "Sama" = pertahankan rentang MARKET CAP posisi lama. Tick tidak bisa disalin
+    # mentah antar pool (skala harga beda kalau quote beda, kisi beda kalau fee beda),
+    # jadi batasnya dikonversi lewat harga USD lalu dibulatkan KE LUAR ke kisi tujuan.
     kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎯 Sama (pertahankan MC range)", callback_data=f"migok|{key}|same")],
         [InlineKeyboardButton("↔️ Wide (dua sisi)", callback_data=f"migok|{key}|wide")],
         [InlineKeyboardButton("⬇️ Lower (quote saja)", callback_data=f"migok|{key}|lower"),
          InlineKeyboardButton("⬆️ Upper (meme saja)", callback_data=f"migok|{key}|upper")],
@@ -3701,8 +3706,13 @@ async def show_migrate_confirm(msg, key: str, src_pid: str):
         + f" → mint di pool baru.\n"
         + (f"<i>⚠️ Quote BEDA — hasil close ditukar dulu, jadi ada fee &amp; slippage "
            f"swap tambahan dan totalnya 4–6 transaksi.</i>\n" if cross else "")
-        + f"<i>Hanya dana hasil posisi ini yang dipakai. Lebar range mengikuti posisi "
-          f"lama; pilih bentuknya:</i>"), kb)
+        + f"<i>Hanya dana hasil posisi ini yang dipakai.</i>\n\n"
+        + (f"🎯 <b>Sama</b> — pertahankan rentang MC {ch.fmt_usd(p.get('mc_lower') or 0)}–"
+           f"{ch.fmt_usd(p.get('mc_upper') or 0)}. Batasnya menempel kisi pool tujuan "
+           f"({(dest.get('tick_spacing') or 60)} tick), jadi bisa melebar sedikit — "
+           f"tidak pernah menyempit.\n" if p.get("mc_lower") and p.get("mc_upper") else "")
+        + f"<i>Tiga pilihan lain memakai LEBAR range lama tapi dipusatkan di harga "
+          f"sekarang. Pilih:</i>"), kb)
 
 
 async def do_migrate(update: Update, key: str, mode: str):
