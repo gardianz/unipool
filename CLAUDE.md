@@ -809,6 +809,21 @@ harus sedekat mungkin ke kenyataan:
 - `/all/v1/lp_explorer/configs` memberi daftar chain + protokol yang dilayani
   Krystal (9 chain saat ditulis).
 
+**Krystal punya DUA endpoint pool, dan `top_pools` saja tidak cukup.** Halaman
+Pools mereka menyaring `>= $1K TVL` dan per-quote; kotak search-nya tidak. Terukur
+untuk DINO di Robinhood: `top_pools` 5 entri, `global_search` **10** — dan yang
+hilang termasuk pool USDG ber-TVL **$34.938**, sedangkan bot cuma menampilkan
+terbesar $4,6k dari jalur gecko. `krystal_raw()` karena itu meng-union
+`GET /all/v1/global_search/search?query=<token>` (ditemukan dari bundel
+defi.krystal.app), dedupe per `poolAddress`, entri `top_pools` menang karena
+statistiknya lebih lengkap. Skema search sudah cocok dengan
+`_v4_key_from_krystal` apa adanya — `token0.address`, `feeTier` dalam PERSEN,
+`hooks` absen — jadi verifikasi hash PoolKey berjalan sama persis.
+
+Pool ber-TVL besar yang tetap tidak muncul biasanya memang **pool hook**: DINO/GOOGL
+$92.608 terbukti ber-`hooks = 0xE5e70264…` (hook launchpad PONS) dengan `lpFee = 0%`
+— LP tidak dapat apa pun di sana, jadi menyembunyikannya benar.
+
 **Endpoint Krystal**: `GET api.krystal.app/all/v2/lp_explorer/top_pools?chainId=&tokenAddress=`
 — **v2**, yang v1 cuma melayani Solana (menjawab "chain id 56 not supported"), dan
 paramnya `tokenAddress` bukan `search`. Tidak terdokumentasi di swagger publik;

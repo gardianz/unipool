@@ -1880,6 +1880,44 @@ def _krystal_get(params: dict, timeout: int = 15):
     return _cf_get(_KRYSTAL_POOLS, params=params, headers=_KRYSTAL_HDR, timeout=timeout)
 
 
+# Endpoint kotak search di web Krystal — BUKAN endpoint halaman Pools.
+# `top_pools` disaring ">= $1K TVL" dan per-quote, jadi ia MELEWATKAN pool terbesar
+# kalau quote-nya di luar daftar mereka. Terukur untuk DINO di Robinhood: top_pools
+# 5 pool (terbesar $4,6k menurut jalur gecko yang jadi cadangannya), sedangkan
+# global_search 10 pool termasuk **DINO/GOOGL $92.608** dan DINO/USDG $35.065.
+# Ditemukan dari bundel defi.krystal.app: `${API}/all/v1/global_search/search?query=`.
+_KRYSTAL_SEARCH = "https://api.krystal.app/all/v1/global_search/search"
+
+
+def krystal_search_raw(chain_id: int, token: str, _cache={}, ttl: int = 120) -> list:
+    """Entri pool dari kotak search Krystal, dinormalkan ke bentuk `top_pools`.
+
+    Skemanya sudah cocok dengan `_v4_key_from_krystal` apa adanya (`token0.address`,
+    `feeTier` dalam PERSEN, `hooks` absen = nol), jadi verifikasi hash PoolKey
+    berjalan sama persis. Yang perlu dipetakan cuma statistik 24 jam."""
+    key = (chain_id, str(token).lower())
+    hit = _cache.get(key)
+    if hit and time.time() - hit[1] < ttl:
+        return hit[0]
+    out = []
+    try:
+        r = _cf_get(_KRYSTAL_SEARCH, params={"query": str(token).lower()},
+                    headers=_KRYSTAL_HDR, timeout=15)
+        for e in ((r.json() or {}).get("pools") or []):
+            if int(e.get("chainId") or 0) != chain_id:
+                continue
+            e = dict(e)
+            e.setdefault("stat24h", {"volumeUsd": e.get("volumeUsd24h"),
+                                     "apr": e.get("apr")})
+            out.append(e)
+    except Exception:
+        return hit[0] if hit else []
+    if not out:                       # sama seperti krystal_raw: kosong jangan di-cache
+        return hit[0] if hit else []
+    _cache[key] = (out, time.time())
+    return out
+
+
 def krystal_raw(chain_id: int, token: str, _cache={}, ttl: int = 120) -> list:
     """Entri mentah dari API Krystal. List kosong kalau gagal / chain tak dilayani —
     pemanggil WAJIB tetap jalan tanpa ini."""
@@ -1903,6 +1941,19 @@ def krystal_raw(chain_id: int, token: str, _cache={}, ttl: int = 120) -> list:
             _KRYSTAL_LAST_ERR = f"{type(e).__name__}: {str(e)[:80]}"
         if attempt == 0:
             time.sleep(0.6)
+    # Union dengan kotak search: `top_pools` disaring per-quote sehingga pool
+    # ber-quote di luar daftar mereka hilang — terukur DINO/GOOGL $92.608 tidak ada
+    # di top_pools tapi ada di search. Dedupe per poolAddress; entri top_pools
+    # menang karena statistiknya lebih lengkap.
+    try:
+        seen_pa = {str(e.get("poolAddress") or "").lower() for e in out}
+        for e in krystal_search_raw(chain_id, token):
+            pa = str(e.get("poolAddress") or "").lower()
+            if pa and pa not in seen_pa:
+                seen_pa.add(pa)
+                out.append(e)
+    except Exception:
+        pass
     if not out:
         # JANGAN cache hasil kosong selama ttl penuh. Krystal bisa menjawab HTTP 200
         # dengan payload error (result hilang) — dulu itu ikut di-cache 120 detik,
