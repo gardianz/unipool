@@ -931,14 +931,24 @@ async def show_pools_for(status, cid: int, token: str):
     # menyimpang) sehingga daftarnya bisa jauh lebih pendek. Tanpa keterangan ini,
     # Krystal yang gagal sesaat terlihat seperti bot kehilangan pool (kejadian nyata:
     # BNBCAT 20 pool jadi 4).
-    src_line = ("\U0001F4DA sumber: daftar Krystal (\u2265$1K TVL, apa adanya)"
-                if res.get("source") == "krystal" else
-                "\U0001F4CA sumber: GeckoTerminal (Krystal tidak terjangkau dari server ini)"
-                if res.get("source") == "gecko" else
-                "\U0001F526 sumber: scan sendiri \u2014 daftarnya lewat saringan pool mati "
-                "& harga menyimpang"
-                + (f" (Krystal gagal: {esc(ch.krystal_last_error())})"
-                   if ch.krystal_last_error() else " (Krystal tidak punya token ini)"))
+    # `source` sekarang bisa gabungan ("krystal+uniswap+gecko"), jadi JANGAN
+    # dicocokkan persis — dulu nilai gabungan jatuh ke cabang terakhir dan kartunya
+    # menulis "scan sendiri … Krystal tidak punya token ini" padahal Krystal yang
+    # menyumbang mayoritas daftar.
+    _SRC_NAMA = {"krystal": "Krystal", "uniswap": "indexer Uniswap",
+                 "gecko": "GeckoTerminal", "scan": "scan sendiri"}
+    parts = [p for p in str(res.get("source") or "").split("+") if p]
+    if parts:
+        nm = " + ".join(_SRC_NAMA.get(p, p) for p in parts)
+        src_line = f"\U0001F4DA sumber: {esc(nm)}"
+        if "krystal" not in parts:
+            src_line += (f" (Krystal gagal: {esc(ch.krystal_last_error())})"
+                         if ch.krystal_last_error() else " (Krystal tidak punya token ini)")
+    else:
+        src_line = ("\U0001F526 sumber: scan sendiri \u2014 daftarnya lewat saringan pool mati "
+                    "& harga menyimpang"
+                    + (f" (Krystal gagal: {esc(ch.krystal_last_error())})"
+                       if ch.krystal_last_error() else " (Krystal tidak punya token ini)"))
     text = (f"Found {len(pools)} pool(s) untuk <b>{esc(tsym)}</b> ({_t.time() - t0:.1f}s):\n"
             f"<pre>{esc(chr(10).join(rows))}</pre>\n"
             f"<i>P=PancakeSwap · U=Uniswap · ! = harga menyimpang · TVL/volume USD · "

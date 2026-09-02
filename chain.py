@@ -2628,6 +2628,13 @@ def discover_any(chain_id: int, token_addr: str) -> dict:
         res = {"token": tinfo, "pools": kr, "source": src_name}
         for p in res["pools"]:
             p["thin"] = (p.get("tvl_usd") or 0) < 50
+            # APR diseragamkan lintas sumber: Krystal mengirimnya, GeckoTerminal
+            # tidak. Tanpa ini kolom APR kosong ("–") justru untuk pool yang volume
+            # dan TVL-nya SUDAH diketahui — terlihat seperti data hilang.
+            if p.get("apr_pct") is None:
+                v, tvl, fee = p.get("vol24_usd"), p.get("tvl_usd"), p.get("fee")
+                if v and tvl and fee:
+                    p["apr_pct"] = v * fee / 1e6 / tvl * 365 * 100
         # Pool dari Krystal TIDAK disaring lagi (daftar mereka sudah tersaring
         # >=$1K TVL). Harga menyimpang cuma DITANDAI, bukan dibuang, supaya isi
         # daftarnya sama dengan web Krystal.

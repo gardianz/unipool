@@ -1060,6 +1060,20 @@ Gejala penting: kegagalan ini SENYAP kalau indexer Uniswap sedang tersedia, kare
 host yang indexer-nya kosong — persis kenapa satu host meloloskan 10 pool dan host
 lain 1 dari entri Krystal yang SAMA.
 
+### `res["source"]` sekarang GABUNGAN — jangan dicocokkan persis
+
+Nilainya bisa `krystal+uniswap+gecko`. UI dulu mencocokkan persis `== "krystal"` /
+`== "gecko"`, jadi nilai gabungan jatuh ke cabang terakhir dan kartu menulis
+*"sumber: scan sendiri … (Krystal tidak punya token ini)"* padahal Krystal yang
+menyumbang mayoritas daftar. Pecah dengan `split("+")` dan sebutkan semuanya.
+
+**APR diseragamkan di `discover_any()`**, bukan per-sumber: Krystal mengirim `apr`,
+GeckoTerminal tidak. Tanpa penyeragaman, kolom APR kosong justru untuk pool yang
+volume dan TVL-nya sudah diketahui — terlihat seperti data hilang padahal cuma tidak
+dihitung. Rumusnya `vol24 × fee/1e6 ÷ tvl × 365 × 100`, dan hasilnya cocok dengan
+angka Krystal (terukur DINO/USDG 4,6% → 8.573% vs 8.573,17%; 4,4% → 9.353% vs
+9.353,48%).
+
 ### Saringan pool yang ditampilkan (jalur discovery sendiri)
 
 Berlapis, urutannya penting (semua di ujung `discover_any()`):
