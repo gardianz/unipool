@@ -3,6 +3,7 @@ chain.py — Web3 core untuk LP bot: discovery pool, mint single-sided,
 listing posisi, close, dan auto-swap.
 DEX per chain: Uniswap v2/v3/v4 di Robinhood (4663), PancakeSwap v2/v3 di BSC (56).
 """
+import logging
 import math
 import os
 import re
@@ -36,6 +37,8 @@ MAX_UINT256 = 2**256 - 1
 # pernah bentrok — fee 2500 cuma ada di Pancake, 3000 cuma di Uniswap — jadi satu map
 # aman untuk dua DEX. Fee tier yang di-scan per chain: CHAINS[cid]["fee_tiers"].
 TICK_SPACING = {100: 1, 500: 10, 2500: 50, 3000: 60, 10000: 200}
+log = logging.getLogger(__name__)
+
 MIN_TICK, MAX_TICK = -887272, 887272
 DEADLINE_SECS = 1200
 
@@ -2350,13 +2353,37 @@ def discover_krystal(chain_id: int, token: str) -> list[dict]:
                           "sqrtp": None, "tick": None, "liquidity": None})
             return p
         except Exception:
-            return None
+            raise
 
-    out = []
+    # Verifikasi tiap entri butuh RPC (v4_slot0, token0/1, factory). Dulu SEMUA
+    # exception ditelan `return None`, jadi pool yang gagal dibaca karena RPC sibuk
+    # tidak bisa dibedakan dari pool yang memang bukan milik kita — dan daftarnya
+    # menyusut diam-diam. Terukur di VPS user: 11 entri Krystal, cuma 1 yang muncul,
+    # sementara host lain meloloskan 10 dari entri yang sama. Sekarang tiap entri
+    # dicoba 2x sebelum menyerah, dan yang tetap gagal DIHITUNG supaya UI bisa
+    # menyebutnya alih-alih menyembunyikannya.
+    def build_retry(entry):
+        for attempt in range(2):
+            try:
+                return build(entry), False
+            except Exception:
+                if attempt:
+                    return None, True
+                time.sleep(0.3)
+        return None, True
+
+    out, failed = [], 0
+    # Batas dinaikkan dari 20: `krystal_raw` kini meng-union top_pools + kotak
+    # search, jadi 20 entri pertama bisa memotong pool yang justru terdalam.
     with ThreadPoolExecutor(max_workers=5) as ex:
-        for r in ex.map(build, raw[:20]):
+        for r, bad in ex.map(build_retry, raw[:60]):
             if r:
                 out.append(r)
+            elif bad:
+                failed += 1
+    if failed:
+        log.warning("discover_krystal %s: %d entri gagal diverifikasi (RPC sibuk)",
+                    token, failed)
     return out
 
 
@@ -2499,10 +2526,11 @@ def _drop_offprice_pools(pools: list, token_dec: int, token_addr: str) -> tuple[
 
 
 def discover_any(chain_id: int, token_addr: str) -> dict:
-    """Discovery pool untuk SEMUA UI (bot & web). Urutan sumber:
-    Krystal → indexer Uniswap → GeckoTerminal → discovery sendiri (scan RPC).
-    `res["source"]` menyebut jalur mana yang terpakai — WAJIB ditampilkan UI, karena
-    panjang daftarnya bisa jauh berbeda antar sumber.
+    """Discovery pool untuk SEMUA UI (bot & web).
+
+    Krystal, indexer Uniswap, dan GeckoTerminal dijalankan BERSAMAAN lalu di-union;
+    scan RPC sendiri hanya kalau ketiganya kosong. `res["source"]` menyebut sumber
+    mana saja yang menyumbang (mis. `krystal+uniswap`) — WAJIB ditampilkan UI.
     Terakhir ditambah pool ber-quote di luar daftar tetap (mis. RTX/NVDAB) — banyak
     memecoin cuma punya pool jenis ini, tak terjangkau scan quote biasa."""
     # Krystal DAN indexer Uniswap dijalankan BERSAMAAN lalu digabung — bukan
@@ -2516,38 +2544,51 @@ def discover_any(chain_id: int, token_addr: str) -> dict:
     # Paralel supaya ongkosnya max(keduanya), bukan jumlahnya. Angka pool yang
     # dimiliki Krystal tetap dari Krystal (sesuai aturan lama); indexer hanya
     # menambah pool yang tidak ada di sana.
-    def _kr():
+    # KETIGA sumber dijalankan bersamaan lalu di-UNION. Bukan berantai: tiap sumber
+    # punya lubangnya sendiri, dan sumber yang menjawab lebih dulu pernah MENUTUP
+    # sumber yang hasilnya jauh lebih lengkap.
+    #   - Krystal `top_pools` disaring >=$1K TVL dan per-quote (RADIO: 2 pool,
+    #     terbesar $2.568) sedangkan indexer Uniswap punya 53 dengan terbesar $50.173.
+    #   - Sebaliknya, begitu Krystal menjawab 1 pool saja, GeckoTerminal yang punya 5
+    #     ikut dilewati — terukur di VPS user untuk DINO, dan daftarnya justru
+    #     menyusut dari 5 jadi 1 setelah Krystal "diperbaiki".
+    # Aturan yang dipegang sekarang: hasil gabungan TIDAK BOLEH lebih sedikit dari
+    # sumber tunggal mana pun. Ongkosnya max(ketiganya), bukan jumlahnya.
+    def _safe(fn):
         try:
-            return discover_krystal(chain_id, token_addr) or []
+            return fn() or []
         except Exception:
             return []
+
+    def _kr():
+        return _safe(lambda: discover_krystal(chain_id, token_addr))
 
     def _un():
-        try:
-            ud = uni_discover(chain_id, token_addr)
-            return (ud or {}).get("pools") or []
-        except Exception:
-            return []
+        return _safe(lambda: (uni_discover(chain_id, token_addr) or {}).get("pools"))
 
-    with ThreadPoolExecutor(max_workers=2) as ex:
-        f_kr, f_un = ex.submit(_kr), ex.submit(_un)
-        kr, un = f_kr.result(), f_un.result()
+    def _gk():
+        return _safe(lambda: discover_gecko(chain_id, token_addr))
+
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        f_kr, f_un, f_gk = ex.submit(_kr), ex.submit(_un), ex.submit(_gk)
+        kr, un, gk = f_kr.result(), f_un.result(), f_gk.result()
     krystal_had = bool(kr)
-    seen_pool = {str(p.get("pool")).lower() for p in kr}
-    extra_uni = [p for p in un if str(p.get("pool")).lower() not in seen_pool]
-    src_name = ("krystal+uniswap" if krystal_had and extra_uni else
-                "krystal" if krystal_had else "uniswap" if un else "")
-    kr = kr + extra_uni
+    # Prioritas saat pool yang sama muncul di beberapa sumber: Krystal (statistik
+    # paling lengkap) → indexer Uniswap (fee & tickSpacing eksak) → GeckoTerminal.
+    merged, seen_pool, used = [], set(), []
+    for label, lst in (("krystal", kr), ("uniswap", un), ("gecko", gk)):
+        added = 0
+        for p in lst:
+            k = str(p.get("pool")).lower()
+            if k and k not in seen_pool:
+                seen_pool.add(k)
+                merged.append(p)
+                added += 1
+        if added:
+            used.append(label)
+    kr = merged
     kr.sort(key=lambda p: p.get("tvl_usd") or 0, reverse=True)
-    if not kr:
-        # Terakhir GeckoTerminal: endpoint mereka TIDAK di belakang Cloudflare, jadi
-        # ini satu-satunya daftar pool yang tetap jalan di host yang IP-nya kena
-        # managed challenge. Memuat pool v4 ber-fee non-standar juga.
-        try:
-            kr = discover_gecko(chain_id, token_addr)
-            src_name = "gecko"
-        except Exception:
-            kr = []
+    src_name = "+".join(used)
     if kr:
         try:
             tinfo = token_info(get_w3(chain_id), Web3.to_checksum_address(token_addr))
@@ -2582,7 +2623,7 @@ def discover_any(chain_id: int, token_addr: str) -> dict:
         # per-quote sehingga pool ber-quote aneh bisa hilang (RUBY/RDDT $40k), tapi
         # indexer sudah memuat SEMUA pool Uniswap apa pun quote-nya — jadi kalau ia
         # ikut, pencarian ini murni beban (terukur 32,7 detik untuk 0 pool tambahan).
-        if krystal_had and not un:
+        if krystal_had and not un and not gk:
             try:
                 seen = {str(p["pool"]).lower() for p in res["pools"]}
                 # Dibatasi waktu. Pencarian ini menyapu kandidat DexScreener lalu

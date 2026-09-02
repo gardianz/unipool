@@ -898,10 +898,31 @@ per-quote sehingga pool ber-quote aneh bisa hilang; GeckoTerminal memuat semua p
 yang mengandung token itu apa pun quote-nya. Di jalur gecko pencarian itu murni
 beban — terukur 32,7 detik untuk 0 pool tambahan (36,1s → 6,9s setelah dilewati).
 
-### Krystal DAN indexer Uniswap digabung, bukan berurutan
+### Tiga sumber daftar pool di-UNION, bukan berantai
 
-Keduanya dijalankan PARALEL lalu hasilnya di-union (dedupe per alamat/poolId), baru
-GeckoTerminal → scan sendiri kalau dua-duanya kosong.
+`discover_krystal`, `uni_discover`, dan `discover_gecko` dijalankan PARALEL lalu
+hasilnya di-union (dedupe per alamat/poolId); scan RPC sendiri hanya kalau ketiganya
+kosong. Prioritas saat pool sama muncul di beberapa sumber: Krystal (statistik
+terlengkap) → indexer Uniswap (fee & tickSpacing eksak) → GeckoTerminal.
+
+**Aturannya: hasil gabungan tidak boleh lebih sedikit dari sumber tunggal mana pun.**
+Model berantai melanggar itu dua arah, dan keduanya sudah terjadi:
+
+- Krystal menang duluan → indexer tertutup. RADIO: Krystal 2 pool (terbesar $2.568),
+  indexer 53 pool (terbesar $50.173).
+- Krystal menjawab 1 pool → GeckoTerminal yang punya 5 ikut dilewati. Terukur di VPS
+  user untuk DINO: daftarnya justru MENYUSUT dari 5 jadi 1 setelah jalur Krystal
+  "diperbaiki".
+
+`discover_foreign_pools()` dilewati kalau indexer ATAU gecko menyumbang — keduanya
+sudah memuat semua quote.
+
+**Verifikasi per-entri tidak boleh menelan kegagalan RPC.** `build()` dulu
+`except Exception: return None`, jadi pool yang gagal dibaca karena RPC sibuk tidak
+bisa dibedakan dari pool yang memang bukan milik kita. Terukur: 11 entri Krystal
+menghasilkan 1 pool di satu host dan 10 di host lain dari entri yang SAMA. Sekarang
+tiap entri dicoba 2×, dan yang tetap gagal dihitung + dicatat di log. Batas entri
+juga dinaikkan 20 → 60, karena `krystal_raw` kini meng-union dua endpoint.
 
 Dulu Krystal menang begitu hasilnya tidak kosong. Itu **menyembunyikan pool
 terdalam**: daftar Krystal disaring ≥$1K TVL dan per-quote. Terukur untuk RADIO di
