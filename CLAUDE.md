@@ -820,6 +820,14 @@ statistiknya lebih lengkap. Skema search sudah cocok dengan
 `_v4_key_from_krystal` apa adanya — `token0.address`, `feeTier` dalam PERSEN,
 `hooks` absen — jadi verifikasi hash PoolKey berjalan sama persis.
 
+**Keduanya saling melewatkan pool — DUA ARAH, jadi union-nya wajib.** Terukur:
+untuk DINO kotak search punya 10 entri (termasuk pool $92k) sedangkan `top_pools`
+cuma 5; untuk OPTIMUS justru sebaliknya — `top_pools` punya WETH/OPTIMUS 0,9%
+ber-TVL **$366.278** yang TIDAK ADA di kotak search sama sekali, padahal pool itu
+terverifikasi sehat on-chain (`lpFee 0,9%`, tanpa hooks, likuiditas aktif 1,36e22,
+harga pool $0,00874 vs pasar $0,00874693). Jangan pernah menyimpulkan "Krystal
+tidak punya pool ini" dari satu endpoint saja.
+
 Pool ber-TVL besar yang tetap tidak muncul biasanya memang **pool hook**: DINO/GOOGL
 $92.608 terbukti ber-`hooks = 0xE5e70264…` (hook launchpad PONS) dengan `lpFee = 0%`
 — LP tidak dapat apa pun di sana, jadi menyembunyikannya benar.
