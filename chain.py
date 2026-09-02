@@ -909,6 +909,7 @@ def _poa(w3: Web3) -> Web3:
 _RPC_BAD: dict[str, float] = {}     # url -> kapan terakhir kena rate limit
 _RPC_BAD_COOLDOWN = 120             # detik endpoint dilewati setelah 429
 _SWR_MAX_STALE = 600                # detik hasil indexer boleh basi (disegarkan di latar)
+_FOREIGN_POOL_BUDGET = 12           # detik maks untuk pencarian pool ber-quote aneh
 
 
 def _is_rate_limited(e: Exception) -> bool:
@@ -2453,30 +2454,40 @@ def discover_any(chain_id: int, token_addr: str) -> dict:
     panjang daftarnya bisa jauh berbeda antar sumber.
     Terakhir ditambah pool ber-quote di luar daftar tetap (mis. RTX/NVDAB) — banyak
     memecoin cuma punya pool jenis ini, tak terjangkau scan quote biasa."""
-    # Krystal duluan: <1 detik, dan angkanya sama persis dengan yang dilihat user di
-    # web mereka. Tiap pool tetap diverifikasi on-chain di discover_krystal.
-    kr = []
-    try:
-        kr = discover_krystal(chain_id, token_addr)
-    except Exception:
-        kr = []
-    src_name = "krystal"
-    if not kr:
-        # Krystal gagal → indexer Uniswap DULU, baru GeckoTerminal. Keduanya dulu di
-        # belakang Cloudflare yang sama sehingga sama-sama mati di host terblokir,
-        # tapi itu tidak selalu benar: terukur di VPS user, Krystal 403 sedangkan
-        # indexer Uniswap tembus. Untuk RADIO di Robinhood selisihnya besar —
-        # indexer **18 pool dalam 1,5 detik** (termasuk yang ber-TVL $41,7k),
-        # GeckoTerminal cuma **7 pool dalam 11,8 detik** dengan yang terbesar $572.
-        # Indexer juga mengirim fee DAN tickSpacing eksak, sedangkan nama pool
-        # GeckoTerminal fee-nya dibulatkan sehingga PoolKey harus ditebak.
+    # Krystal DAN indexer Uniswap dijalankan BERSAMAAN lalu digabung — bukan
+    # "Krystal duluan, indexer cuma cadangan". Daftar Krystal disaring >=$1K TVL dan
+    # per-quote, jadi ia bisa MELEWATKAN pool terdalam: terukur untuk RADIO di
+    # Robinhood, Krystal 2 pool (terbesar $2.568) sedangkan indexer 53 pool dengan
+    # yang terbesar **$50.173** — 20x lebih dalam dan tidak ada di Krystal sama
+    # sekali. Karena dulu Krystal menang begitu hasilnya tidak kosong, pool terdalam
+    # itu tidak pernah terlihat user.
+    #
+    # Paralel supaya ongkosnya max(keduanya), bukan jumlahnya. Angka pool yang
+    # dimiliki Krystal tetap dari Krystal (sesuai aturan lama); indexer hanya
+    # menambah pool yang tidak ada di sana.
+    def _kr():
+        try:
+            return discover_krystal(chain_id, token_addr) or []
+        except Exception:
+            return []
+
+    def _un():
         try:
             ud = uni_discover(chain_id, token_addr)
+            return (ud or {}).get("pools") or []
         except Exception:
-            ud = None
-        if ud and ud.get("pools"):
-            kr = ud["pools"]
-            src_name = "uniswap"
+            return []
+
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f_kr, f_un = ex.submit(_kr), ex.submit(_un)
+        kr, un = f_kr.result(), f_un.result()
+    krystal_had = bool(kr)
+    seen_pool = {str(p.get("pool")).lower() for p in kr}
+    extra_uni = [p for p in un if str(p.get("pool")).lower() not in seen_pool]
+    src_name = ("krystal+uniswap" if krystal_had and extra_uni else
+                "krystal" if krystal_had else "uniswap" if un else "")
+    kr = kr + extra_uni
+    kr.sort(key=lambda p: p.get("tvl_usd") or 0, reverse=True)
     if not kr:
         # Terakhir GeckoTerminal: endpoint mereka TIDAK di belakang Cloudflare, jadi
         # ini satu-satunya daftar pool yang tetap jalan di host yang IP-nya kena
@@ -2516,12 +2527,32 @@ def discover_any(chain_id: int, token_addr: str) -> dict:
         # pool terbesarnya). GeckoTerminal memuat SEMUA pool yang mengandung token
         # itu apa pun quote-nya, jadi di jalur gecko pencarian ini murni beban:
         # terukur 32,7 detik untuk 0 pool tambahan — hampir seluruh waktu discovery.
-        if src_name == "krystal":
+        # Cuma perlu kalau indexer Uniswap TIDAK menyumbang. Daftar Krystal disaring
+        # per-quote sehingga pool ber-quote aneh bisa hilang (RUBY/RDDT $40k), tapi
+        # indexer sudah memuat SEMUA pool Uniswap apa pun quote-nya — jadi kalau ia
+        # ikut, pencarian ini murni beban (terukur 32,7 detik untuk 0 pool tambahan).
+        if krystal_had and not un:
             try:
                 seen = {str(p["pool"]).lower() for p in res["pools"]}
-                extra = [p for p in discover_foreign_pools(get_w3(chain_id), chain_id,
-                                                           token_addr, seen)
-                         if (p.get("tvl_usd") or 0) > 0]
+                # Dibatasi waktu. Pencarian ini menyapu kandidat DexScreener lalu
+                # memverifikasi tiap pool on-chain — terukur 32,7 detik, dan pernah
+                # **104,9 detik** untuk DINO. Itu duduk di jalur klik tombol, jadi
+                # lebih baik kehilangan satu pool ber-quote aneh daripada kartunya
+                # menggantung semenit lebih. Thread-nya read-only; kalau lewat batas
+                # ia dibiarkan selesai sendiri dan hasilnya diabaikan.
+                # JANGAN pakai `with`: keluar dari blok itu memanggil
+                # shutdown(wait=True) yang menunggu thread selesai — batas waktunya
+                # jadi tidak ada gunanya (terukur tetap 104,8 detik).
+                _fx = ThreadPoolExecutor(max_workers=1)
+                _ff = _fx.submit(discover_foreign_pools, get_w3(chain_id),
+                                 chain_id, token_addr, seen)
+                try:
+                    found = _ff.result(timeout=_FOREIGN_POOL_BUDGET)
+                except futures.TimeoutError:
+                    found = []
+                finally:
+                    _fx.shutdown(wait=False)
+                extra = [p for p in found if (p.get("tvl_usd") or 0) > 0]
                 res["pools"] += extra
             except Exception:
                 pass

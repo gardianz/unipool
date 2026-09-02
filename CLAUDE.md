@@ -883,10 +883,32 @@ per-quote sehingga pool ber-quote aneh bisa hilang; GeckoTerminal memuat semua p
 yang mengandung token itu apa pun quote-nya. Di jalur gecko pencarian itu murni
 beban — terukur 32,7 detik untuk 0 pool tambahan (36,1s → 6,9s setelah dilewati).
 
-### Urutan sumber daftar pool: Krystal → indexer Uniswap → GeckoTerminal → scan sendiri
+### Krystal DAN indexer Uniswap digabung, bukan berurutan
 
-Indexer Uniswap dulu dilewati begitu Krystal gagal, dengan alasan keduanya duduk di
-belakang Cloudflare yang sama sehingga sama-sama mati di host terblokir. Itu TIDAK
+Keduanya dijalankan PARALEL lalu hasilnya di-union (dedupe per alamat/poolId), baru
+GeckoTerminal → scan sendiri kalau dua-duanya kosong.
+
+Dulu Krystal menang begitu hasilnya tidak kosong. Itu **menyembunyikan pool
+terdalam**: daftar Krystal disaring ≥$1K TVL dan per-quote. Terukur untuk RADIO di
+Robinhood — Krystal **2 pool** (terbesar $2.568), indexer Uniswap **53 pool** dengan
+yang terbesar **$50.173**, dan pool itu TIDAK ADA di Krystal sama sekali. 51 pool
+hanya ada di indexer.
+
+Angka pool yang dimiliki Krystal tetap dari Krystal; indexer hanya menambah pool
+yang tidak ada di sana. `res["source"]` jadi `krystal+uniswap` / `krystal` /
+`uniswap` / `gecko`.
+
+**`discover_foreign_pools()` dilewati kalau indexer ikut menyumbang** — indexer
+sudah memuat semua pool Uniswap apa pun quote-nya, jadi pencarian itu murni beban
+(terukur RADIO 28,7s → 11,9s). Kalau tetap perlu (indexer kosong), ia **dibatasi
+`_FOREIGN_POOL_BUDGET` = 12 detik**: terukur pernah **104,9 detik** untuk DINO, dan
+itu duduk persis di jalur klik tombol. Batas itu HANYA bekerja kalau executor-nya
+tidak dipakai lewat `with` — keluar dari blok `with` memanggil `shutdown(wait=True)`
+yang menunggu thread selesai, jadi timeout-nya tidak berpengaruh sama sekali
+(terukur tetap 104,8 detik sampai `with`-nya dihapus). Sesudahnya DINO 21,8 detik.
+
+Indexer Uniswap juga dulu dilewati begitu Krystal gagal, dengan alasan keduanya duduk
+di belakang Cloudflare yang sama sehingga sama-sama mati di host terblokir. Itu TIDAK
 selalu benar: terukur di VPS user, Krystal menjawab `HTTP 200, hasil kosong`
 sedangkan indexer Uniswap tembus normal.
 
@@ -905,6 +927,13 @@ Dua alasan indexer didahulukan dari GeckoTerminal:
   ("BNBCAT / USDT 4.202%" untuk fee 42122), jadi PoolKey harus ditebak lalu
   dibuktikan lewat hash. Indexer mengirim nilai aslinya (terukur spacing 9303,
   19988, 18665 — mustahil ditebak dari tier klasik).
+
+**`ListPools` mewajibkan `token0`**, dan itu bukan filter posisi token — dipakai
+sebagai "token ini ada di pool", jadi RADIO (alamat tinggi) tetap mengembalikan 59
+entri. Mengirim `token1` saja dijawab `400 Missing required parameter: token0`.
+Token yang terlalu baru dijawab **HTTP 200 dengan body `{}`** (terukur: DINO), bukan
+error — itu sebabnya `uni_pools` tidak meng-cache hasil kosong, supaya percobaan
+berikutnya langsung dapat begitu indexer menyusul.
 
 **Jangan percaya `totalLiquidityUsd` indexer.** Untuk RADIO ia melaporkan $41.686
 untuk pool yang setelah dihitung ulang on-chain oleh `_fill_onchain_tvl()` cuma
