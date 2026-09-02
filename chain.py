@@ -911,6 +911,7 @@ def _poa(w3: Web3) -> Web3:
 
 _RPC_BAD: dict[str, float] = {}     # url -> kapan terakhir kena rate limit
 _RPC_BAD_COOLDOWN = 120             # detik endpoint dilewati setelah 429
+_UNI_EMPTY_TTL = 20                 # detik hasil indexer KOSONG boleh di-cache
 _SWR_MAX_STALE = 600                # detik hasil indexer boleh basi (disegarkan di latar)
 _FOREIGN_POOL_BUDGET = 12           # detik maks untuk pencarian pool ber-quote aneh
 
@@ -1523,6 +1524,11 @@ def uni_pools(cid: int, token: str, ttl: int = 30) -> list | None:
         r = _cf_post(_UNI_POOLS_API, headers=_UNI_HDR, json=body, timeout=10)
         pools = r.json().get("pools")
         if not isinstance(pools, list):
+            # Token yang belum terindeks dijawab HTTP 200 body kosong. Itu di-cache
+            # SEBENTAR (bukan ttl penuh) supaya `_v4_key_from_indexer` yang dipanggil
+            # sekali per entri Krystal tidak menembak HTTP berulang — terukur 8,7
+            # detik untuk 14 entri DINO, padahal jawabannya sama semua.
+            _UNI_POOLS_CACHE[ck] = (time.time() - ttl + _UNI_EMPTY_TTL, [])
             return hit[1] if hit else None
         _UNI_POOLS_CACHE[ck] = (time.time(), pools)
         return pools
@@ -2044,8 +2050,7 @@ def _v4_key_from_indexer(chain_id: int, token: str, pool_id_hex: str) -> tuple |
     return None
 
 
-def _v4_key_from_krystal(entry: dict, pool_id_hex: str,
-                         full_sweep: bool = True) -> tuple | None:
+def _v4_key_from_krystal(entry: dict, pool_id_hex: str) -> tuple | None:
     """Susun PoolKey v4 dari data Krystal, dibuktikan lewat hash.
 
     Krystal tidak mengirim tickSpacing, jadi nilainya dicoba satu per satu dan
@@ -2056,8 +2061,24 @@ def _v4_key_from_krystal(entry: dict, pool_id_hex: str,
         hooks = Web3.to_checksum_address(entry.get("hooks") or V4_NATIVE)
         if int(hooks, 16) != 0:
             return None                     # pool ber-hooks tidak didukung
-        c0, c1 = sort_tokens(_norm_currency(entry["token0"]["address"]),
-                             _norm_currency(entry["token1"]["address"]))
+        a0 = _norm_currency(entry["token0"]["address"])
+        a1 = _norm_currency(entry["token1"]["address"])
+        # Krystal melaporkan alamat ERC20 WRAPPED untuk pool yang PoolKey-nya
+        # sebenarnya memakai ETH NATIVE. Terbukti di WETH/DINO Robinhood: dengan
+        # alamat WETH tidak ada spacing yang cocok, dengan address(0) langsung cocok
+        # di spacing 60. Tanpa varian ini pool-nya jatuh ke `_v4_key_from_init` yang
+        # memakai getLogs — terukur 8,1 detik untuk 9 pool, dan sering ditolak RPC
+        # publik sehingga pool-nya hilang sama sekali.
+        pairs = [(a0, a1)]
+        try:
+            wrapped = CHAINS[int(entry.get("chainId") or 0)]["wrapped"].lower()
+            nat = Web3.to_checksum_address(V4_NATIVE)
+            if a0.lower() == wrapped:
+                pairs.append((nat, a1))
+            if a1.lower() == wrapped:
+                pairs.append((a0, nat))
+        except Exception:
+            pass
         want = str(pool_id_hex).lower()
         fees = []
         if entry.get("dynamicFee"):
@@ -2065,23 +2086,20 @@ def _v4_key_from_krystal(entry: dict, pool_id_hex: str,
         for f in (entry.get("lpFee"), entry.get("feeTier")):
             if f is not None:
                 fees.append(int(round(float(f) * 10000)))
-        for fee in dict.fromkeys(fees):
-            for sp in _spacing_candidates(fee):
-                key = (c0, c1, fee, sp, hooks)
-                if "0x" + v4_pool_id(key).hex().removeprefix("0x") == want:
-                    return key
-        # Kandidat habis → sapu SELURUH rentang tickSpacing yang sah (1..32767).
-        # Hash-nya keccak lokal: terukur 0,85 detik per (fee, hooks) untuk 32.767
-        # kombinasi, tanpa satu pun panggilan RPC. Itu murah dibanding kehilangan
-        # pool terdalam dari daftar, dan hanya dibayar oleh pool yang tebakannya
-        # meleset. Pool ber-hooks tidak akan pernah cocok di sini — memang begitu
-        # yang diinginkan.
-        if full_sweep:
+        for pa, pb in pairs:
+            c0, c1 = sort_tokens(pa, pb)
             for fee in dict.fromkeys(fees):
-                for sp in range(1, 32768):
+                for sp in _spacing_candidates(fee):
                     key = (c0, c1, fee, sp, hooks)
                     if "0x" + v4_pool_id(key).hex().removeprefix("0x") == want:
                         return key
+        # TIDAK ada sapuan penuh 1..32767 di sini, dan itu disengaja. Sempat
+        # ditambahkan, lalu diukur pada 14 entri DINO: 4 entri cocok lewat kandidat
+        # dalam 0,1-0,4 ms, dan 10 sisanya GAGAL walau sudah disapu penuh — semuanya
+        # pool ber-hooks, yang memang tidak akan pernah cocok dengan hooks=0.
+        # Hasilnya 0 pool tambahan dengan ongkos 10 x 0,85 detik. Kalau suatu saat
+        # ada pool tanpa hooks ber-spacing aneh, indexer Uniswap yang menanganinya
+        # (fee + tickSpacing eksak, tanpa tebakan).
     except Exception:
         return None
     return None

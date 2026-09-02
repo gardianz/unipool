@@ -900,6 +900,11 @@ beban — terukur 32,7 detik untuk 0 pool tambahan (36,1s → 6,9s setelah dilew
 
 ### Tiga sumber daftar pool di-UNION, bukan berantai
 
+**Bukan union-nya yang mahal.** Terukur untuk DINO: `discover_gecko` 2,1 detik,
+`uni_discover` 0,5 detik, sedangkan `discover_krystal` 54,9 detik. Mematikan dua
+sumber tambahan hanya menghemat ~2,6 detik dan mengembalikan bug "cuma 1 pool" —
+yang mahal selalu verifikasi PoolKey Krystal, bukan jumlah sumbernya.
+
 `discover_krystal`, `uni_discover`, dan `discover_gecko` dijalankan PARALEL lalu
 hasilnya di-union (dedupe per alamat/poolId); scan RPC sendiri hanya kalau ketiganya
 kosong. Prioritas saat pool sama muncul di beberapa sumber: Krystal (statistik
@@ -1049,11 +1054,19 @@ Pola yang dominan terukur adalah **fee/100**, bukan fee/50 seperti dugaan awal: 
 satu karena spacing-nya kebetulan 60 (tier tetap) — itulah sebabnya kartu cuma
 menampilkan 1 pool.
 
-Sisanya tidak mengikuti pola apa pun (fee 40000→1000, 128000→60), jadi
-`_v4_key_from_krystal()` menyapu SELURUH rentang sah (1..32767) kalau kandidat habis.
-Hash-nya keccak lokal — terukur **0,85 detik untuk 32.767 kombinasi**, tanpa RPC —
-jadi jauh lebih murah daripada kehilangan pool terdalam. Pool ber-hooks tidak akan
-pernah cocok di situ, dan memang itu yang diinginkan.
+**Sapuan penuh 1..32767 sempat ditambahkan, lalu DIBUANG** — jangan diulang. Diukur
+pada 14 entri DINO: 4 entri cocok lewat kandidat dalam 0,1–0,4 ms dan 10 sisanya
+gagal walau sudah disapu penuh, jadi hasilnya **0 pool tambahan dengan ongkos
+10 × 0,85 detik**. Yang gagal itu bukan pool ber-hooks (log `Initialize` menunjukkan
+`hooks = 0x0`), melainkan kasus di bawah ini.
+
+**Krystal melaporkan alamat ERC20 WRAPPED untuk pool yang PoolKey-nya memakai ETH
+NATIVE.** Terbukti di WETH/DINO Robinhood: dengan alamat WETH tidak ada spacing yang
+cocok, dengan `address(0)` langsung cocok di spacing 60. `_v4_key_from_krystal()`
+karena itu mencoba kedua varian pasangan currency. Tanpa itu pool-nya jatuh ke
+`_v4_key_from_init()` yang memakai `getLogs` — terukur 8,1 detik untuk 9 pool, dan
+di RPC pelit sering ditolak sehingga pool-nya hilang sama sekali. Sesudah varian
+native ditambahkan: **10 dari 11 entri resolve tanpa getLogs** (sebelumnya 3 dari 13).
 
 Gejala penting: kegagalan ini SENYAP kalau indexer Uniswap sedang tersedia, karena
 `_v4_key_from_indexer()` memberi fee+spacing eksak lebih dulu. Bug-nya cuma muncul di
