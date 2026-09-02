@@ -2000,10 +2000,28 @@ def _norm_currency(a: str) -> str:
 
 
 def _spacing_candidates(fee: int) -> list[int]:
-    base = fee / 50
-    cands = {int(round(base)), int(base), int(base) + 1, *_V4_SPACING_FIXED,
-             *(s for f, s in V4_FEE_SPACINGS if f == fee)}
-    return [s for s in sorted(cands) if 1 <= s <= 32767]
+    """Tebakan tickSpacing untuk sebuah fee, diurutkan dari yang paling sering benar.
+
+    Pola yang dominan terukur adalah **fee/100**, bukan fee/50 seperti dugaan awal.
+    Dari 10 pool DINO di Robinhood: fee 50000→500, 86000→860, 87000→870, 46000→460,
+    44000→440, 94000→940, 49200→492 — semuanya fee/100. Dengan hanya fee/50 sebagai
+    tebakan, 9 dari 10 pool GAGAL diverifikasi dan lenyap dari daftar; yang lolos
+    cuma satu karena spacing-nya kebetulan 60 (tier tetap).
+
+    Sisanya tidak mengikuti pola apa pun (fee 40000→1000, 128000→60), makanya
+    pemanggil menyediakan sapuan penuh sebagai cadangan."""
+    out = []
+    for v in (fee / 100, fee / 50, fee / 200, fee / 40, fee / 25):
+        for c in (int(round(v)), int(v), int(v) + 1):
+            out.append(c)
+    out += list(_V4_SPACING_FIXED)
+    out += [s for f, s in V4_FEE_SPACINGS if f == fee]
+    seen, res = set(), []
+    for s in out:                       # urutan dipertahankan: tebakan terbaik dulu
+        if 1 <= s <= 32767 and s not in seen:
+            seen.add(s)
+            res.append(s)
+    return res
 
 
 def _v4_key_from_indexer(chain_id: int, token: str, pool_id_hex: str) -> tuple | None:
@@ -2026,7 +2044,8 @@ def _v4_key_from_indexer(chain_id: int, token: str, pool_id_hex: str) -> tuple |
     return None
 
 
-def _v4_key_from_krystal(entry: dict, pool_id_hex: str) -> tuple | None:
+def _v4_key_from_krystal(entry: dict, pool_id_hex: str,
+                         full_sweep: bool = True) -> tuple | None:
     """Susun PoolKey v4 dari data Krystal, dibuktikan lewat hash.
 
     Krystal tidak mengirim tickSpacing, jadi nilainya dicoba satu per satu dan
@@ -2051,6 +2070,18 @@ def _v4_key_from_krystal(entry: dict, pool_id_hex: str) -> tuple | None:
                 key = (c0, c1, fee, sp, hooks)
                 if "0x" + v4_pool_id(key).hex().removeprefix("0x") == want:
                     return key
+        # Kandidat habis → sapu SELURUH rentang tickSpacing yang sah (1..32767).
+        # Hash-nya keccak lokal: terukur 0,85 detik per (fee, hooks) untuk 32.767
+        # kombinasi, tanpa satu pun panggilan RPC. Itu murah dibanding kehilangan
+        # pool terdalam dari daftar, dan hanya dibayar oleh pool yang tebakannya
+        # meleset. Pool ber-hooks tidak akan pernah cocok di sini — memang begitu
+        # yang diinginkan.
+        if full_sweep:
+            for fee in dict.fromkeys(fees):
+                for sp in range(1, 32768):
+                    key = (c0, c1, fee, sp, hooks)
+                    if "0x" + v4_pool_id(key).hex().removeprefix("0x") == want:
+                        return key
     except Exception:
         return None
     return None

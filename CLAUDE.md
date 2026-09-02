@@ -1040,9 +1040,25 @@ Dua jebakan yang sudah kena di jalur ini:
 Tetap berlaku: data Krystal **tidak pernah** otoritatif untuk transaksi. Tiap pool
 diverifikasi on-chain di `discover_krystal()` — v2/v3 dicek ke factory DEX-nya,
 v4 lewat `_v4_key_from_krystal()` yang menyusun PoolKey lalu membuktikannya dengan
-hash (`v4_pool_id(key) == poolId`). Krystal tidak mengirim `tickSpacing`, jadi nilainya
-dicoba dari pola **spacing ≈ fee/50** (fee 40000→800, 18888→378) + tier klasik;
-yang diterima hanya yang hash-nya cocok.
+hash (`v4_pool_id(key) == poolId`).
+
+**Krystal tidak mengirim `tickSpacing`, dan menebaknya salah = pool lenyap diam-diam.**
+Pola yang dominan terukur adalah **fee/100**, bukan fee/50 seperti dugaan awal: dari
+10 pool DINO di Robinhood, fee 50000→500, 86000→860, 87000→870, 46000→460, 44000→440,
+94000→940, 49200→492. Dengan hanya fee/50, **9 dari 10 gagal** dan yang lolos cuma
+satu karena spacing-nya kebetulan 60 (tier tetap) — itulah sebabnya kartu cuma
+menampilkan 1 pool.
+
+Sisanya tidak mengikuti pola apa pun (fee 40000→1000, 128000→60), jadi
+`_v4_key_from_krystal()` menyapu SELURUH rentang sah (1..32767) kalau kandidat habis.
+Hash-nya keccak lokal — terukur **0,85 detik untuk 32.767 kombinasi**, tanpa RPC —
+jadi jauh lebih murah daripada kehilangan pool terdalam. Pool ber-hooks tidak akan
+pernah cocok di situ, dan memang itu yang diinginkan.
+
+Gejala penting: kegagalan ini SENYAP kalau indexer Uniswap sedang tersedia, karena
+`_v4_key_from_indexer()` memberi fee+spacing eksak lebih dulu. Bug-nya cuma muncul di
+host yang indexer-nya kosong — persis kenapa satu host meloloskan 10 pool dan host
+lain 1 dari entri Krystal yang SAMA.
 
 ### Saringan pool yang ditampilkan (jalur discovery sendiri)
 
