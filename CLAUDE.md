@@ -1177,6 +1177,28 @@ indexer otoritatif untuk membangun transaksi — `assert_pool_orientation()` dan
 `verify_router` / `verify_v2_router` / `verify_v4` mem-verifikasi silang alamat kontrak
 on-chain sebelum dana bergerak (fail-closed).
 
+### Tombol A% bisa mempersenkan saldo MEME, bukan cuma quote
+
+`ctx["amount_src"]` = `"quote"` (default, perilaku lama) atau `"meme"`. Barisnya
+muncul di kartu konfirmasi mint sebagai `💰 <quote>` / `🪙 <meme>`, disembunyikan di
+mode `upper` karena mode itu memang selalu memakai meme.
+
+Untuk `"meme"`, sisi quote **menyesuaikan mengikuti rasio range** — bukan sekadar
+menukar satuan. `compute_amount()` menghitung nilai meme dalam quote lalu
+membaginya dengan porsi meme range: `budget = nilai_meme / (1 − keep_frac)`, dengan
+`keep_frac` dari `plan_two_sided()`. Terukur di GME/WETH: 75% dari 226.545,62 GME
+menghasilkan sisi meme 169.909,22 = **75,0%** persis.
+
+Dua syarat yang gampang terlewat:
+
+- **Range harus dihitung SEBELUM amount.** `build_preview` dan `do_mint` sama-sama
+  menghitung tick lebih dulu lalu mengoper `sqrtp` + `ticks` ke `compute_amount()`.
+  Kalau salah satu lupa, jumlah yang dieksekusi beda dari yang ditampilkan.
+- **Kartu wajib menyebut satuan persennya** (`75% GME` vs `75% USDG`) — tanpa itu
+  "75%" ambigu dan user salah memperkirakan berapa yang dipakai.
+
+Mode `lower` (100% quote) memakai nilai meme apa adanya: seluruh meme dijual.
+
 ### Range selalu dihitung di server
 
 Browser hanya mengirim *persen* lebar range; tick final tetap dari `calc_strategy_range()`

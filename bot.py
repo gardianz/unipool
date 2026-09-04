@@ -894,6 +894,7 @@ async def show_pools_for(status, cid: int, token: str):
                         "mode": "v2" if p.get("ver") == 2 else "lower",
                         "low_pct": s["width_pct"], "up_pct": 100.0,
                         "amount_pct": s["amount_pct"], "amount_fixed": s["amount_fixed"],
+                        "amount_src": "quote",   # saldo yang dipersenkan tombol A%
                         "gap": int(s.get("gap", 1)), "vol": None, "rec": None}
         ver = p.get("ver", 3)
         # tanda DEX cuma muncul di chain ber-DEX ganda (BSC: P=PancakeSwap, U=Uniswap)
@@ -972,8 +973,19 @@ def _meme_addr(p: dict) -> str:
     return p["token0"] if p["quote_is_token1"] else p["token1"]
 
 
-def compute_amount(ctx_data: dict) -> float:
-    """Budget deposit. lower/wide/stable = satuan quote; upper = satuan meme."""
+def compute_amount(ctx_data: dict, sqrtp: int | None = None,
+                   ticks: tuple[int, int] | None = None) -> float:
+    """Budget deposit. lower/wide/stable = satuan quote; upper = satuan meme.
+
+    `amount_src` memilih saldo mana yang dipersenkan:
+
+    - `"quote"` (default) — % dari modal sisi quote (quote + WETH/native + quote
+      lain yang bisa ditukar). Perilaku lama.
+    - `"meme"` — % dari saldo token meme. Sisi quote-nya MENYESUAIKAN mengikuti
+      rasio range: budget quote = nilai meme ÷ (1 − porsi_quote), sehingga meme
+      sebanyak itulah yang benar-benar masuk posisi. `sqrtp`+`ticks` perlu untuk
+      menghitung rasionya; tanpa itu dipakai perkiraan nilai meme apa adanya.
+    """
     cid = ctx_data["chain"]
     cfg = ch.CHAINS[cid]
     p = ctx_data["pool_info"]
@@ -981,7 +993,29 @@ def compute_amount(ctx_data: dict) -> float:
         return float(ctx_data["amount_fixed"])
     w3 = ch.get_w3(cid)
     addr = wallet_address()
-    if ctx_data["mode"] == "upper":
+    mode = ctx_data["mode"]
+    if ctx_data.get("amount_src") == "meme" and mode != "upper":
+        meme = _meme_addr(p)
+        mdec = ch.token_info(w3, meme)["decimals"]
+        use = ch.erc20(w3, meme).functions.balanceOf(addr).call() * ctx_data["amount_pct"] / 100
+        if use <= 0:
+            return 0.0
+        s = sqrtp
+        if s is None:
+            s = (ch.v4_slot0(w3, cid, p["pool_id"])[0] if p.get("ver") == 4 else
+                 w3.eth.contract(address=ch.Web3.to_checksum_address(p["pool"]),
+                                 abi=ch.POOL_ABI).functions.slot0().call()[0])
+        raw = (s / ch.Q96) ** 2
+        mprice_q = raw if p["quote_is_token1"] else (1 / raw if raw else 0)  # quote-wei per meme-wei
+        val_q = use * mprice_q                       # nilai meme dalam quote-wei
+        if ticks and mode in ("wide", "stable"):
+            keep, _ = ch.plan_two_sided(s, ticks[0], ticks[1], 10 ** 18, p["quote_is_token1"])
+            keep_frac = keep / 10 ** 18
+            if keep_frac < 0.999:                    # ada sisi meme → skalakan ke total
+                val_q = val_q / (1 - keep_frac)
+        # mode "lower" = 100% quote: seluruh meme dijual, jadi nilainya apa adanya.
+        return val_q / 10 ** p["quote_decimals"]
+    if mode == "upper":
         meme = _meme_addr(p)
         mdec = ch.token_info(w3, meme)["decimals"]
         bal = ch.erc20(w3, meme).functions.balanceOf(addr).call()
@@ -1141,12 +1175,9 @@ def build_preview(ctx_data: dict) -> str:
     if ctx_data["rec"] is None:
         ctx_data["rec"], ctx_data["vol"] = recommend_strategy(ctx_data)
 
-    amount = compute_amount(ctx_data)
-    dep_sym = tsym if mode == "upper" else p["quote_sym"]
-    if amount <= 0:
-        raise RuntimeError(f"Saldo {dep_sym} kosong."
-                           + (" Upper butuh pegang token meme." if mode == "upper" else ""))
-
+    # Range dihitung DULU: `amount_src="meme"` butuh rasio sisi range untuk
+    # menskalakan nilai meme jadi budget quote. Tick tidak bergantung pada amount,
+    # jadi urutan ini aman.
     if p.get("ver") == 4:
         sqrtp, cur_tick = ch.v4_slot0(w3, cid, p["pool_id"])
     else:
@@ -1156,6 +1187,14 @@ def build_preview(ctx_data: dict) -> str:
     lo_t, hi_t = ch.calc_strategy_range(cur_tick, p["fee"], p["quote_is_token1"],
                                         mode, ctx_data["low_pct"], ctx_data["up_pct"],
                                         ctx_data.get("gap", 1), spacing=p.get("tick_spacing"))
+
+    amount = compute_amount(ctx_data, sqrtp, (lo_t, hi_t))
+    src_meme = ctx_data.get("amount_src") == "meme"
+    dep_sym = tsym if mode == "upper" else p["quote_sym"]
+    if amount <= 0:
+        raise RuntimeError(
+            f"Saldo {tsym if (src_meme or mode == 'upper') else dep_sym} kosong."
+            + (" Upper butuh pegang token meme." if mode == "upper" else ""))
     lo, hi = sorted([_meme_price(p, tdec, lo_t), _meme_price(p, tdec, hi_t)])
     now = _meme_price(p, tdec, cur_tick)
     try:
@@ -1228,7 +1267,11 @@ def build_preview(ctx_data: dict) -> str:
                           f"{esc(cfg['wrapped_symbol'])}/{esc(p['quote_sym'])} tidak ditemukan — mint bakal gagal.")
 
     usd = amount * (ch._meme_usd(w3, cid, p) if mode == "upper" else p["quote_usd"])
-    amount_desc = "fix" if ctx_data["amount_fixed"] else f"{ctx_data['amount_pct']:g}%"
+    # Persennya bisa merujuk saldo quote ATAU saldo meme — wajib disebut, kalau
+    # tidak "25%" jadi ambigu dan user salah memperkirakan berapa yang dipakai.
+    amount_desc = ("fix" if ctx_data["amount_fixed"] else
+                   f"{ctx_data['amount_pct']:g}% "
+                   f"{tsym if (src_meme or mode == 'upper') else p['quote_sym']}")
     if mode == "stable":
         strat_desc = f"±{ctx_data['low_pct']:g}%"
     elif mode == "wide":
@@ -1321,16 +1364,31 @@ def confirm_kb(key: str, ctx_data: dict) -> InlineKeyboardMarkup:
         mark = "✓ " if (not ctx_data["amount_fixed"] and ctx_data["amount_pct"] == a) else ""
         return InlineKeyboardButton(f"{mark}A {a:g}%", callback_data=f"amt|{key}|{a}")
 
-    return InlineKeyboardMarkup([
+    # Baris pemilih SUMBER persen: tombol A% mempersenkan saldo quote (lama) atau
+    # saldo token meme. Tidak ditampilkan di mode "upper" — mode itu memang selalu
+    # memakai meme, jadi pilihannya cuma menyesatkan.
+    src_sel = ctx_data.get("amount_src", "quote")
+
+    def srcbtn(val, label):
+        return InlineKeyboardButton(("✓ " if src_sel == val else "") + label,
+                                    callback_data=f"amtsrc|{key}|{val}")
+
+    rows = [
         [InlineKeyboardButton("✅ Confirm mint", callback_data=f"mint|{key}"),
          InlineKeyboardButton("❌ Cancel", callback_data=f"cancelp|{key}")],
         [sbtn(m) for m in ("stable", "wide", "lower", "upper")],
         [wbtn(lo, up) for lo, up in STRAT_PRESETS[mode]],
         [InlineKeyboardButton("🎯 Rapat — langsung aktif (2 sisi)", callback_data=f"tight|{key}")],
+    ]
+    if mode != "upper":
+        rows.append([srcbtn("quote", f"💰 {ctx_data['pool_info']['quote_sym']}"),
+                     srcbtn("meme", f"🪙 {ctx_data['token']['symbol']}")])
+    rows += [
         [abtn(a) for a in (25, 50, 75, 100)],
         [InlineKeyboardButton("✏️ Custom Range…", callback_data=f"askrng|{key}"),
          InlineKeyboardButton("✏️ Custom Amount…", callback_data=f"askamt|{key}")],
-    ])
+    ]
+    return InlineKeyboardMarkup(rows)
 
 
 async def show_confirm(msg, key: str):
@@ -1644,7 +1702,24 @@ async def do_mint(update: Update, ctx_data: dict):
     strategy = {"mode": mode, "low_pct": ctx_data["low_pct"], "up_pct": ctx_data["up_pct"],
                 "gap": ctx_data.get("gap", 1)}
 
-    amount = await asyncio.to_thread(compute_amount, ctx_data)
+    # Sama persis dengan kartu konfirmasi: untuk `amount_src="meme"` budget-nya
+    # bergantung rasio range, jadi tick harus ikut dihitung — kalau tidak, jumlah
+    # yang dieksekusi beda dari yang ditampilkan.
+    def _amt():
+        p_ = ctx_data["pool_info"]
+        w3_ = ch.get_w3(ctx_data["chain"])
+        if p_.get("ver") == 4:
+            sq, ct = ch.v4_slot0(w3_, ctx_data["chain"], p_["pool_id"])
+        else:
+            s0 = w3_.eth.contract(address=ch.Web3.to_checksum_address(p_["pool"]),
+                                  abi=ch.POOL_ABI).functions.slot0().call()
+            sq, ct = s0[0], s0[1]
+        tk = ch.calc_strategy_range(ct, p_["fee"], p_["quote_is_token1"], mode,
+                                    ctx_data["low_pct"], ctx_data["up_pct"],
+                                    ctx_data.get("gap", 1), spacing=p_.get("tick_spacing"))
+        return compute_amount(ctx_data, sq, tk)
+
+    amount = await asyncio.to_thread(_amt)
     dep_sym = tsym if mode == "upper" else p["quote_sym"]
     if amount <= 0:
         await reply(update, f"❌ Saldo {esc(dep_sym)} kosong.")
@@ -2818,7 +2893,7 @@ async def _route_callback(update: Update):
         ctx["gap"] = 0
         await show_confirm(q.message, key)
         return
-    if data.startswith(("wd|", "amt|", "st|")):
+    if data.startswith(("wd|", "amt|", "st|", "amtsrc|")):
         parts = data.split("|")
         kind, key = parts[0], parts[1]
         ctx = PENDING.get(key)
@@ -2832,6 +2907,10 @@ async def _route_callback(update: Update):
             # default lebar per mode
             defaults = {"stable": (6.18, 6.18), "wide": (50, 100), "lower": (50, 100), "upper": (50, 100)}
             ctx["low_pct"], ctx["up_pct"] = defaults[ctx["mode"]]
+        elif kind == "amtsrc":
+            # Saldo mana yang dipersenkan: sisi quote (lama) atau token meme.
+            ctx["amount_src"] = parts[2]
+            ctx["amount_fixed"] = None       # kembali ke persen, bukan jumlah tetap
         else:
             ctx["amount_pct"] = float(parts[2])
             ctx["amount_fixed"] = None
