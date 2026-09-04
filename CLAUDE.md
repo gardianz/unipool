@@ -467,12 +467,22 @@ terbuka saat alur kedua jalan; yang salah jumlahnya, bukan keberadaannya.
 
 ### Aksi ke posisi yang sudah tertutup
 
-**`NOT_MINTED` pada close = close SEBELUMNYA berhasil**, bukan kegagalan baru.
-Lazim terjadi kalau `wait_ok` menyerah lebih dulu (180 detik) lalu user mengklik
-lagi: tx kedua ditolak kontrak tanpa memindahkan dana apa pun. Dulu pesannya
-*"Tx close v4 FAILED: … NOT_MINTED"* dan user mengira dananya nyangkut. `close_v4`
-sekarang memeriksa `ownerOf` saat melihat NOT_MINTED dan, kalau NFT-nya memang sudah
-hilang, melapor "posisi SUDAH tertutup — dananya ada di wallet".
+**Posisi yang sudah tertutup BUKAN error — `AlreadyClosed`.** Kelas turunan
+`RuntimeError` (jadi semua `except` lama tetap menangkapnya) yang dipakai
+`assert_position_open()` dan `close_v4`. UI menampilkannya sebagai ✅, bukan ❌,
+karena tidak ada dana yang bergerak dan hasil close-nya sudah di wallet.
+
+**Jangan mencocokkan teks error untuk mendeteksinya** — bunyinya bervariasi dan dua
+varian sudah kejadian: `NOT_MINTED` (tx masuk blok lalu revert) dan
+*"Transaction with hash … not found"* (`wait_ok` menyerah sebelum node mengenali
+tx-nya, tx menyusul masuk blok lalu revert). Yang menentukan keadaan on-chain:
+`close_v4` menangkap kegagalan APA PUN lalu memeriksa `ownerOf` sekali.
+
+Terbukti di #1740532: burn SUKSES di blok **54079998**, tx susulan revert 25 blok
+kemudian di **54080023**, dan hasilnya — 71,2994 MEME (event Transfer) + ~0,0416 ETH
+**native** (tanpa event, jadi tak terlihat di scan log) — sudah ada di wallet sejak
+awal. `rebalance_position()` ikut memanggil `assert_position_open()` supaya jalur
+rebalance dan pindah pool memberi sinyal yang sama.
 
 Dua alur yang berjalan berdekatan (tombol Close tertekan dua kali) membuat yang
 kedua mengirim tx ke posisi yang sudah di-burn: tx masuk blok lalu revert

@@ -2454,6 +2454,9 @@ async def do_rebalance(update: Update, pid: str, mode: str):
                 r = await with_progress(status, head, lambda: ch.rebalance_position(
                     cid, pk(), pid, mode, s["slippage_pct"], int(s.get("gap", 1))))
             except Exception as e:
+                if isinstance(e, ch.AlreadyClosed):
+                    await edit(status, f"✅ {esc(e)}", NAV_KB)
+                    return
                 await edit(status, f"❌ Rebalance gagal: {esc(e)}\n"
                                    f"<i>Kalau close sudah jalan, dananya aman di wallet — "
                                    f"cek /wallet lalu mint manual.</i>")
@@ -2573,6 +2576,11 @@ async def do_close(update: Update, pid: str, autoswap: bool):
                 r = await with_progress(status, head, lambda: ch.close_any(
                     cid, pk(), pid, s["slippage_pct"], autoswap))
             except Exception as e:
+                if isinstance(e, ch.AlreadyClosed):
+                    # Bukan kegagalan: tx susulan ditolak, tapi close-nya sendiri
+                    # sudah berhasil dan dananya sudah di wallet.
+                    await edit(status, f"✅ {esc(e)}", NAV_KB)
+                    return
                 await edit(status, f"❌ Close gagal: {esc(e)}")
                 return
 
@@ -3737,6 +3745,9 @@ async def do_migrate(update: Update, key: str, mode: str):
                 cid, pk(), src_pid, mode, s["slippage_pct"], int(s.get("gap", 1)),
                 target_pool=dest))
         except Exception as e:
+            if isinstance(e, ch.AlreadyClosed):
+                await edit(status, f"✅ {esc(e)}", NAV_KB)
+                return
             await edit(status, f"❌ Pindah pool gagal: {esc(e)}\n"
                                f"<i>Kalau close sudah jalan, dananya aman di wallet — "
                                f"cek /wallet lalu mint manual.</i>")

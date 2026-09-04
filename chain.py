@@ -39,6 +39,14 @@ MAX_UINT256 = 2**256 - 1
 TICK_SPACING = {100: 1, 500: 10, 2500: 50, 3000: 60, 10000: 200}
 log = logging.getLogger(__name__)
 
+
+class AlreadyClosed(RuntimeError):
+    """Posisi ternyata SUDAH tertutup — tx sebelumnya berhasil, yang ini menyusul.
+
+    Bukan kegagalan: tidak ada dana yang bergerak di tx yang ditolak, dan hasil
+    close-nya sudah ada di wallet. Dipakai UI untuk melapor keadaan normal, bukan
+    error. Turunan RuntimeError, jadi semua `except` lama tetap menangkapnya.""" 
+
 MIN_TICK, MAX_TICK = -887272, 887272
 DEADLINE_SECS = 1200
 
@@ -6687,21 +6695,23 @@ def close_v4(chain_id: int, pk: str, tid: int, slippage_pct: float, autoswap: bo
     try:
         h = _v4_modify(w3, chain_id, pk, posm, [V4_BURN, V4_TAKE_PAIR], [p_burn, p_take], "close v4")
     except Exception as e:
-        # NOT_MINTED = NFT-nya sudah tidak ada. Itu BUKTI close sebelumnya berhasil,
-        # bukan kegagalan baru — lazim terjadi kalau `wait_ok` menyerah lebih dulu
-        # (180 detik) lalu user mengklik lagi. Dulu pesannya "Tx close v4 FAILED"
-        # dan user mengira dananya nyangkut; padahal dana sudah di wallet.
-        if "NOT_MINTED" not in str(e):
-            raise
+        # Gagal APA PUN → periksa NFT-nya sekali. Kalau sudah hilang, close
+        # sebelumnya berhasil dan tx ini cuma menyusul; tidak ada dana bergerak.
+        #
+        # Sengaja tidak mencocokkan teks error tertentu: pesannya bervariasi dan
+        # dua-duanya sudah kejadian — "NOT_MINTED" (tx masuk blok lalu revert) dan
+        # "Transaction with hash … not found" (`wait_ok` menyerah sebelum tx dikenali
+        # node, tx-nya menyusul masuk blok lalu revert). Terbukti di #1740532: burn
+        # SUKSES di blok 54079998, tx kedua revert 25 blok kemudian, dan hasilnya
+        # (71,2994 MEME + ~0,0416 ETH native) sudah ada di wallet sejak awal.
+        # Yang menentukan adalah keadaan on-chain, bukan bunyi pesannya.
         try:
             posm.functions.ownerOf(tid).call()
-            raise                            # masih ada → error itu bukan soal ini
         except Exception:
-            pass
-        raise RuntimeError(
-            f"Posisi #{tid} SUDAH tertutup — close sebelumnya ternyata berhasil "
-            f"(tx ini ditolak dengan NOT_MINTED, tidak ada dana bergerak). "
-            f"Dananya ada di wallet, cek /wallet.") from e
+            raise AlreadyClosed(
+                f"Posisi #{tid} sudah tertutup — close-nya berhasil, tx susulan ini "
+                f"ditolak tanpa memindahkan dana apa pun. Hasilnya ada di wallet.") from e
+        raise                                # NFT masih ada → ini kegagalan sungguhan
     steps = [("burn", h)]
 
     swaps = []
@@ -6990,7 +7000,9 @@ def assert_position_open(w3: Web3, chain_id: int, pid) -> None:
         posm.functions.ownerOf(int(ref)).call()
     except Exception as e:
         if "NOT_MINTED" in str(e) or "nonexistent" in str(e).lower():
-            raise RuntimeError(
+            # AlreadyClosed, bukan RuntimeError polos: UI melaporkannya sebagai
+            # keadaan normal (dana sudah di wallet), bukan kegagalan.
+            raise AlreadyClosed(
                 f"Posisi {pid} sudah tertutup — tidak ada yang perlu dikerjakan. "
                 f"Kalau ini di luar dugaan, cek /list (dananya sudah di wallet).")
         # error lain (RPC) jangan dijadikan alasan membatalkan
@@ -7214,6 +7226,7 @@ def rebalance_position(chain_id: int, pk: str, pid, mode: str, slippage_pct: flo
         raise RuntimeError("Mode 'sama' hanya untuk pindah pool — di pool yang sama "
                            "range-nya tidak berubah, jadi tidak ada yang dikerjakan.")
     w3 = get_w3(chain_id)
+    assert_position_open(w3, chain_id, pid)   # sinyal yang sama dgn close: AlreadyClosed
     cfg = CHAINS[chain_id]
     account = w3.eth.account.from_key(pk)
 
