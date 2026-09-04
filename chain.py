@@ -909,6 +909,37 @@ def _poa(w3: Web3) -> Web3:
     return w3
 
 
+def alchemy_keys() -> list[str]:
+    """Semua API key Alchemy yang tersedia, urut prioritas.
+
+    Menerima `ALCHEMY_API_KEY` (satu), `ALCHEMY_API_KEYS` (dipisah koma/spasi), dan
+    `ALCHEMY_API_KEY_2..N`. Tiap key jadi ENDPOINT TERSENDIRI di `get_w3`, jadi
+    rotasi yang sudah ada ikut bekerja: begitu satu key kena 429, `_Provider`
+    menandainya di `_RPC_BAD` dan panggilan berikutnya memakai key lain.
+
+    Kuota Alchemy dihitung per-app, jadi beberapa key = beberapa jatah. Ini yang
+    paling langsung menolong `monitor_loop`, pemakai CU terbesar."""
+    out = []
+    for raw in (os.environ.get("ALCHEMY_API_KEY", ""),
+                os.environ.get("ALCHEMY_API_KEYS", "")):
+        out += [k.strip() for k in re.split(r"[,\s]+", raw) if k.strip()]
+    for i in range(2, 11):
+        k = os.environ.get(f"ALCHEMY_API_KEY_{i}", "").strip()
+        if k:
+            out.append(k)
+    seen, res = set(), []
+    for k in out:
+        if k not in seen:
+            seen.add(k)
+            res.append(k)
+    return res
+
+
+def _alchemy_urls(cfg: dict) -> list[str]:
+    net = cfg.get("alchemy")
+    return [f"https://{net}.g.alchemy.com/v2/{k}" for k in alchemy_keys()] if net else []
+
+
 _RPC_BAD: dict[str, float] = {}     # url -> kapan terakhir kena rate limit
 _RPC_BAD_COOLDOWN = 120             # detik endpoint dilewati setelah 429
 _UNI_EMPTY_TTL = 20                 # detik hasil indexer KOSONG boleh di-cache
@@ -962,10 +993,11 @@ def get_w3(chain_id: int, fresh: bool = False) -> Web3:
     rpcs = []
     if os.environ.get(cfg["rpc_env"]):
         rpcs.append(os.environ[cfg["rpc_env"]])
-    # Alchemy prioritas kalau API key ada (host g.alchemy.com tidak kena blokir DNS ISP)
-    akey = os.environ.get("ALCHEMY_API_KEY", "").strip()
-    if akey and cfg.get("alchemy"):
-        rpcs.append(f"https://{cfg['alchemy']}.g.alchemy.com/v2/{akey}")
+    # Alchemy prioritas kalau API key ada (host g.alchemy.com tidak kena blokir DNS
+    # ISP). SETIAP key jadi endpoint sendiri, jadi rotasi `_RPC_BAD` memperlakukan
+    # key yang kehabisan jatah sama seperti endpoint mati: dilewati 120 detik lalu
+    # dicoba lagi, dan panggilan berikutnya jalan lewat key lain.
+    rpcs += _alchemy_urls(cfg)
     rpcs += cfg["rpcs"]
     # Endpoint yang baru saja kehabisan jatah dilewati dulu — tapi hanya kalau masih
     # ada pilihan lain, supaya chain ber-RPC tunggal tidak jadi mati total.
@@ -1208,9 +1240,7 @@ def _peer_w3s(chain_id: int, skip_uri: str = "", _cache={}) -> list:
     urls = []
     if os.environ.get(cfg["rpc_env"]):
         urls.append(os.environ[cfg["rpc_env"]])
-    akey = os.environ.get("ALCHEMY_API_KEY", "").strip()
-    if akey and cfg.get("alchemy"):
-        urls.append(f"https://{cfg['alchemy']}.g.alchemy.com/v2/{akey}")
+    urls += _alchemy_urls(cfg)
     urls += cfg["rpcs"]
     out = []
     for u in urls:
@@ -6654,7 +6684,24 @@ def close_v4(chain_id: int, pk: str, tid: int, slippage_pct: float, autoswap: bo
     p_burn = abi_encode(["uint256", "uint128", "uint128", "bytes"],
                         [tid, int(u0 * slip), int(u1 * slip), b""])
     p_take = abi_encode(["address", "address", "address"], [key[0], key[1], account.address])
-    h = _v4_modify(w3, chain_id, pk, posm, [V4_BURN, V4_TAKE_PAIR], [p_burn, p_take], "close v4")
+    try:
+        h = _v4_modify(w3, chain_id, pk, posm, [V4_BURN, V4_TAKE_PAIR], [p_burn, p_take], "close v4")
+    except Exception as e:
+        # NOT_MINTED = NFT-nya sudah tidak ada. Itu BUKTI close sebelumnya berhasil,
+        # bukan kegagalan baru — lazim terjadi kalau `wait_ok` menyerah lebih dulu
+        # (180 detik) lalu user mengklik lagi. Dulu pesannya "Tx close v4 FAILED"
+        # dan user mengira dananya nyangkut; padahal dana sudah di wallet.
+        if "NOT_MINTED" not in str(e):
+            raise
+        try:
+            posm.functions.ownerOf(tid).call()
+            raise                            # masih ada → error itu bukan soal ini
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"Posisi #{tid} SUDAH tertutup — close sebelumnya ternyata berhasil "
+            f"(tx ini ditolak dengan NOT_MINTED, tidak ada dana bergerak). "
+            f"Dananya ada di wallet, cek /wallet.") from e
     steps = [("burn", h)]
 
     swaps = []

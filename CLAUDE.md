@@ -467,6 +467,13 @@ terbuka saat alur kedua jalan; yang salah jumlahnya, bukan keberadaannya.
 
 ### Aksi ke posisi yang sudah tertutup
 
+**`NOT_MINTED` pada close = close SEBELUMNYA berhasil**, bukan kegagalan baru.
+Lazim terjadi kalau `wait_ok` menyerah lebih dulu (180 detik) lalu user mengklik
+lagi: tx kedua ditolak kontrak tanpa memindahkan dana apa pun. Dulu pesannya
+*"Tx close v4 FAILED: … NOT_MINTED"* dan user mengira dananya nyangkut. `close_v4`
+sekarang memeriksa `ownerOf` saat melihat NOT_MINTED dan, kalau NFT-nya memang sudah
+hilang, melapor "posisi SUDAH tertutup — dananya ada di wallet".
+
 Dua alur yang berjalan berdekatan (tombol Close tertekan dua kali) membuat yang
 kedua mengirim tx ke posisi yang sudah di-burn: tx masuk blok lalu revert
 `NOT_MINTED`, gas terbakar percuma, dan pesannya bikin user mengira close-nya gagal
@@ -680,6 +687,15 @@ tokenId yang tidak ada tetap mengembalikan `None` tanpa exception, jadi tidak ik
 terlapor sebagai error (diuji dengan tokenId palsu: 0 error).
 
 ### Rate limit RPC: rotasi endpoint, bukan menunggu
+
+**Beberapa API key Alchemy didukung** lewat `alchemy_keys()`: `ALCHEMY_API_KEY`,
+`ALCHEMY_API_KEYS` (dipisah koma/spasi), dan `ALCHEMY_API_KEY_2..10`, dedupe dengan
+urutan dipertahankan. Tiap key jadi **endpoint tersendiri** di `get_w3`, jadi tidak
+ada mekanisme baru yang perlu ditulis — rotasi `_RPC_BAD` yang sudah ada langsung
+bekerja: key yang kena 429 ditandai, dilewati 120 detik, dan panggilan berikutnya
+jalan lewat key berikutnya. Kuota Alchemy dihitung per-app, jadi N key = N jatah.
+Terukur: dengan key `aaa` ditandai kena limit, endpoint terpilih berikutnya adalah
+key `bbb` — bukan RPC publik yang 10x lebih lambat.
 
 `get_w3` men-cache satu endpoint 5 menit. Failover-nya dulu cuma ada di pemilihan
 AWAL, padahal jatah habis di tengah jalan justru yang lazim — begitu endpoint itu
