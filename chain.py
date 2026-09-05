@@ -6106,6 +6106,31 @@ def _v4_ensure_funds(w3: Web3, chain_id: int, pk: str, currency: str, need_wei: 
 V4_TID_RE = None  # placeholder biar grep gampang
 
 
+def _fit_native_value(w3: Web3, chain_id: int, owner: str, lq: int,
+                      sqrtp: int, lo: int, hi: int, a0d: int, a1d: int,
+                      slippage_pct: float) -> tuple:
+    """Kecilkan likuiditas kalau ETH native yang mau dikirim tidak menyisakan gas.
+
+    Untuk pool v4 ber-currency0 native, `value` tx = a0max. Budget-nya sendiri
+    dihitung dari native + WETH + quote lain, lalu `ensure_native_balance()`
+    menaikkan saldo native seperlunya — tapi gas tx MINT-nya sendiri belum masuk
+    hitungan, jadi value bisa mendarat persis sebesar saldo. Terukur: punya
+    150.350.143.094.057.117 wei, butuh 150.971.630.123.489.580 → simulasi ditolak
+    `insufficient funds for gas * price + value`, selisihnya persis ongkos gas.
+
+    Likuiditasnya diskalakan (bukan cuma value-nya dipotong) supaya RASIO kedua
+    sisi tetap benar — memotong value saja akan membuat tx revert karena jumlah
+    yang ditarik posm tidak berubah."""
+    need = min(int(a0d * (1 + slippage_pct / 100)) + 2, MAX_UINT128, max(a0d, 2))
+    a0max = min(int(amounts_from_liquidity(lq, sqrtp, lo, hi)[0] * (1 + slippage_pct / 100)) + 2,
+                MAX_UINT128, max(a0d, 2))
+    avail = w3.eth.get_balance(owner) - gas_reserve_wei(chain_id, w3)
+    if avail <= 0 or a0max <= avail:
+        return lq, False
+    lq = int(lq * avail / a0max)
+    return max(lq, 0), True
+
+
 def mint_v4(chain_id: int, pk: str, pool_info: dict, budget: float,
             strategy: dict, slippage_pct: float) -> dict:
     """Mint posisi v4 via PositionManager.modifyLiquidities.
@@ -6215,6 +6240,14 @@ def mint_v4(chain_id: int, pk: str, pool_info: dict, budget: float,
         if lq <= 0:
             raise RuntimeError("Liquidity terhitung 0 — cek amount / salah satu sisi kosong.")
         lq = lq - lq // 5000 - 1  # margin pembulatan: jumlah yang ditarik posm ≤ desired
+        if key[0].lower() == V4_NATIVE:
+            lq, trimmed = _fit_native_value(w3, chain_id, account.address, lq, sqrtp,
+                                            tick_lower, tick_upper, a0d, a1d, slippage_pct)
+            if lq <= 0:
+                raise RuntimeError(
+                    "Saldo native tidak cukup untuk deposit + gas. Kurangi jumlahnya.")
+            if trimmed:
+                _step("✂️ Deposit dipangkas sedikit supaya sisa native cukup untuk gas")
         assert_range_recoverable(lq, tick_lower, tick_upper)
         u0, u1 = amounts_from_liquidity(lq, sqrtp, tick_lower, tick_upper)
         a0max = min(int(u0 * (1 + slippage_pct / 100)) + 2, MAX_UINT128, max(a0d, 2))
@@ -6533,6 +6566,14 @@ def increase_v4(chain_id: int, pk: str, tid: int, budget_quote: float,
             raise RuntimeError(
                 "Liquidity terhitung 0 — posisi in-range butuh dua sisi tapi salah satu kosong.")
         lq = lq - lq // 5000 - 1
+        if key[0].lower() == V4_NATIVE:
+            lq, trimmed = _fit_native_value(w3, chain_id, account.address, lq, sqrtp,
+                                            tick_lo, tick_hi, a0d, a1d, slippage_pct)
+            if lq <= 0:
+                raise RuntimeError(
+                    "Saldo native tidak cukup untuk tambahan + gas. Kurangi jumlahnya.")
+            if trimmed:
+                _step("✂️ Tambahan dipangkas sedikit supaya sisa native cukup untuk gas")
         assert_range_recoverable(lq, tick_lo, tick_hi)
         u0, u1 = amounts_from_liquidity(lq, sqrtp, tick_lo, tick_hi)
         a0max = min(int(u0 * (1 + slippage_pct / 100)) + 2, MAX_UINT128, max(a0d, 2))

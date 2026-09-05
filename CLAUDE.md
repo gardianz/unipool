@@ -643,6 +643,22 @@ ditulis, dan akibatnya SEMUA pool sehat ditolak dengan deviasi ~1e24 (persis fak
 dengan kedua orientasi quote — 8 pool nyata dipakai saat ini, termasuk HOOD10/USDG
 dan INJOH/USDG yang quote-nya token1.
 
+### Deposit ETH native harus menyisakan gas
+
+Untuk pool v4 ber-`currency0` native, `value` tx = `a0max`. Budgetnya dihitung dari
+native + WETH + quote lain, lalu `ensure_native_balance()` menaikkan saldo native
+seperlunya — tapi gas tx MINT-nya sendiri belum masuk hitungan, jadi `value` bisa
+mendarat persis sebesar saldo. Terukur: punya **150.350.143.094.057.117** wei, butuh
+**150.971.630.123.489.580** → simulasi ditolak
+`insufficient funds for gas * price + value`, selisihnya persis ongkos gas
+(0,000621 ETH), padahal `gas_reserve_wei` 0,001236 ETH seharusnya menutupinya.
+
+`_fit_native_value()` dipanggil di `mint_v4` dan `increase_v4` tepat sebelum
+`a0max` dihitung: kalau `a0max > saldo − cadangan gas`, **likuiditasnya** yang
+diskalakan, bukan cuma value-nya dipotong — memotong value saja membuat tx revert
+karena jumlah yang ditarik posm tidak ikut berubah. Terukur: deposit 0,335109559 →
+0,333845815 ETH, menyisakan 0,001263744 untuk gas.
+
 ### Rentang yang modalnya tidak bisa kembali (kerugian nyata)
 
 `assert_range_recoverable()` dipanggil di SEMUA jalur yang memasukkan dana ke posisi
