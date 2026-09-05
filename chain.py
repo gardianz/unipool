@@ -663,6 +663,10 @@ def _sqrt_at_tick(tick: int) -> int:
 # (20x) — ini bukan filter kualitas, cuma pagar terhadap pool yang harganya rusak.
 _POOL_PRICE_MAX_RATIO = 20.0
 
+# Price impact maksimum sebuah swap komposisi. Di atas ini swapnya bukan
+# "agak mahal" melainkan rugi besar: pool terlalu tipis untuk jumlah itu.
+_SWAP_IMPACT_MAX = 0.25
+
 
 def assert_pool_price_sane(w3: Web3, chain_id: int, pool_info: dict) -> None:
     """Tolak mint ke pool yang harganya rusak. Panggil SEBELUM tx apa pun.
@@ -5946,6 +5950,25 @@ def v4_swap(chain_id: int, pk: str, key: tuple, token_in: str, amount_in: int,
         spot = amount_in * raw if zero_for_one else (amount_in / raw if raw else 0)
         fee_ppm = key[2] if key[2] < 0x800000 else 0
         out_est = spot * (1 - fee_ppm / 1e6)
+    # PRICE IMPACT: quoter sudah memasukkan dampak harga, jadi minOut TIDAK
+    # melindungi dari swap yang memang rugi besar — impact seberapa pun akan lolos.
+    # Terjadi sungguhan di BODKIN #1913813: 0,010423 ETH ditukar saat likuiditas
+    # aktif pool cuma 8,59e18 (sekarang 2,41e22, 2.800x lebih tebal). Swap itu
+    # menggerakkan harga pool sendiri lebih dari 2x — harga rata-rata eksekusi
+    # 0,000001574 ETH/BODKIN sedangkan harga sesudahnya 0,000003722 — dan ~$13
+    # dari $25 menguap jadi price impact.
+    raw_now = (sqrtp / Q96) ** 2
+    spot_out = amount_in * raw_now if zero_for_one else (amount_in / raw_now if raw_now else 0)
+    fee_ppm_ = key[2] if key[2] < 0x800000 else 0
+    spot_after_fee = spot_out * (1 - fee_ppm_ / 1e6)
+    if spot_after_fee > 0 and out_est > 0:
+        impact = 1 - out_est / spot_after_fee
+        if impact > _SWAP_IMPACT_MAX:
+            raise RuntimeError(
+                f"Swap dibatalkan: price impact {impact * 100:.0f}% (di luar fee "
+                f"{fee_ppm_ / 10000:g}%). Pool ini terlalu tipis untuk jumlah segitu — "
+                f"dana yang masuk sebagian besar menguap jadi selisih harga. "
+                f"Kecilkan jumlahnya atau pakai pool yang lebih dalam. Dana masih utuh.")
     min_out = int(out_est * (100 - slippage_pct) / 100)
     if min_out <= 0:
         raise RuntimeError("Estimasi hasil swap v4 = 0.")

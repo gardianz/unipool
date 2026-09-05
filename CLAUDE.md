@@ -147,6 +147,28 @@ mendarat ~0,16% di atas hasil nyata (terbukti `V4TooLittleReceived`: minta
   nilai statis, jadi kalau quoter gagal fee dianggap 0 dan slippage user yang menahan.
 - v3: `swap_to_token()` mengalikan estimasi spot dengan `(1 − fee/1e6)`.
 
+### minOut TIDAK melindungi dari price impact — itu tugas penjagaan terpisah
+
+`minOut` diambil dari quoter, dan quoter **sudah** memasukkan dampak harga. Jadi
+impact seberapa pun akan lolos: swap yang menggerakkan harga pool 2× tetap "sesuai
+quote" dan tidak pernah revert.
+
+Terjadi sungguhan di BODKIN #1913813: budget 0,021 ETH, yang benar-benar keluar
+wallet 0,014658434 ETH (~$36,04), yang mendarat di posisi cuma **$19,87**. Swap
+komposisi 0,010423 ETH dieksekusi saat likuiditas aktif pool cuma **8,59e18**
+(sekarang 2,41e22 — 2.800× lebih tebal); harga rata-rata eksekusi 0,000001574
+ETH/BODKIN sedangkan harga pool SESUDAHNYA 0,000003722, jadi swap itu menggerakkan
+harganya sendiri lebih dari 2×.
+
+`v4_swap()` karena itu membandingkan hasil quoter dengan hasil harga spot dikurangi
+fee, dan menolak kalau selisihnya di atas `_SWAP_IMPACT_MAX` (25%). Diuji di pool
+yang sama saat tebal: 0,0104 ETH → impact 0,2%, 1,0 ETH → 13,2% — semuanya lolos,
+jadi penjagaan ini tidak mengganggu swap normal.
+
+**Jangan simpulkan "pool-nya beda" dari keadaan pool yang berubah.** poolId swap dan
+poolId posisi di kasus itu SAMA; yang beda adalah keadaan pool sesudah swap
+(tick 125017) vs sekarang (tick 141958). Bandingkan poolId, bukan harga/likuiditas.
+
 ### Pemilihan rute swap: bukan fee terendah, tapi biaya terendah
 
 `find_pool_dex(..., amount_in_wei)` memberi skor tiap pool
