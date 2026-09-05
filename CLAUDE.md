@@ -1251,10 +1251,22 @@ muncul di kartu konfirmasi mint sebagai `💰 <quote>` / `🪙 <meme>`, disembun
 mode `upper` karena mode itu memang selalu memakai meme.
 
 Untuk `"meme"`, sisi quote **menyesuaikan mengikuti rasio range** — bukan sekadar
-menukar satuan. `compute_amount()` menghitung nilai meme dalam quote lalu
-membaginya dengan porsi meme range: `budget = nilai_meme / (1 − keep_frac)`, dengan
-`keep_frac` dari `plan_two_sided()`. Terukur di GME/WETH: 75% dari 226.545,62 GME
-menghasilkan sisi meme 169.909,22 = **75,0%** persis.
+menukar satuan.
+
+**Yang dikembalikan `compute_amount()` adalah porsi QUOTE, bukan totalnya.** Mesin
+mint memakai `budget` sebagai sisi quote saja dan MENAMBAHKAN meme wallet di atasnya
+(`quote_dep = (budget + meme_val) × keep_frac`). Jadi rumusnya
+
+    budget_quote = nilai_meme × keep_frac / (1 − keep_frac)
+
+Mengembalikan totalnya (`nilai_meme / (1 − keep_frac)`) membuat posisi jadi
+`1/keep_frac` kali lebih besar, dan bot lalu MEMBELI meme tambahan lewat swap padahal
+user memilih memakai saldo meme yang sudah ada — persis kebalikan dari yang diminta.
+Terukur di BODKIN/USDG dengan saldo 14.915,77: rumus lama memaksa "swap baru 5,7658
+USDG → BODKIN"; sesudah diperbaiki **swap 0** dan sisi meme persis 14.915,77.
+
+Diuji untuk 25/50/100%: sisi meme selalu tepat sasaran dan swap selalu 0. Sumber
+`"quote"` tidak berubah perilakunya.
 
 Dua syarat yang gampang terlewat:
 

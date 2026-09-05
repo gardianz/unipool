@@ -1011,8 +1011,19 @@ def compute_amount(ctx_data: dict, sqrtp: int | None = None,
         if ticks and mode in ("wide", "stable"):
             keep, _ = ch.plan_two_sided(s, ticks[0], ticks[1], 10 ** 18, p["quote_is_token1"])
             keep_frac = keep / 10 ** 18
-            if keep_frac < 0.999:                    # ada sisi meme → skalakan ke total
-                val_q = val_q / (1 - keep_frac)
+            # Budget yang diminta mesin mint adalah sisi QUOTE saja — meme di wallet
+            # DITAMBAHKAN di atasnya (`quote_dep = (budget + meme_val) * keep_frac`).
+            # Jadi yang dikembalikan bukan totalnya, melainkan porsi quote-nya:
+            #   quote = nilai_meme × keep_frac / (1 − keep_frac)
+            # Mengembalikan total (nilai_meme / (1 − keep_frac)) membuat posisi jadi
+            # 1/keep_frac kali lebih besar, dan bot lalu MEMBELI meme tambahan lewat
+            # swap padahal user memilih memakai saldo meme yang ada.
+            if keep_frac >= 0.999:
+                pass                                 # praktis 100% quote
+            elif keep_frac <= 0:
+                return 0.0                           # 100% meme → tidak butuh quote
+            else:
+                val_q = val_q * keep_frac / (1 - keep_frac)
         # mode "lower" = 100% quote: seluruh meme dijual, jadi nilainya apa adanya.
         return val_q / 10 ** p["quote_decimals"]
     if mode == "upper":
