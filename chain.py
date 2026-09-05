@@ -5917,8 +5917,33 @@ def _v4_unlock(actions: list[int], params: list[bytes]) -> bytes:
 _V4_POOLKEY_T = "(address,address,uint24,int24,address)"
 
 
+def swap_impact_v4(chain_id: int, key: tuple, token_in: str, amount_in: int) -> float | None:
+    """Perkiraan price impact swap v4 (0..1). None kalau tak bisa dihitung.
+
+    Dipakai kartu konfirmasi supaya user melihat angkanya SEBELUM menekan tombol —
+    bukan ditolak diam-diam saat eksekusi. Impact = selisih hasil quoter terhadap
+    hasil harga spot yang sudah dipotong fee, jadi fee pool TIDAK dihitung sebagai
+    impact."""
+    try:
+        w3 = get_w3(chain_id)
+        sqrtp, _ = v4_slot0(w3, chain_id, v4_pool_id(key))
+        zero_for_one = token_in.lower() == key[0].lower()
+        qt = _v4c(w3, chain_id, "v4_quoter", V4_QUOTER_ABI)
+        out = qt.functions.quoteExactInputSingle(
+            (tuple(key), zero_for_one, min(amount_in, MAX_UINT128), b"")).call()[0]
+        raw = (sqrtp / Q96) ** 2
+        spot = amount_in * raw if zero_for_one else (amount_in / raw if raw else 0)
+        fee_ppm = key[2] if key[2] < 0x800000 else 0
+        spot = spot * (1 - fee_ppm / 1e6)
+        if spot <= 0 or out <= 0:
+            return None
+        return max(0.0, 1 - out / spot)
+    except Exception:
+        return None
+
+
 def v4_swap(chain_id: int, pk: str, key: tuple, token_in: str, amount_in: int,
-            slippage_pct: float) -> str | None:
+            slippage_pct: float, max_impact: float | None = None) -> str | None:
     """Swap exact-in single via UniversalRouter (command V4_SWAP).
     minOut dihitung dari harga pool sekarang − slippage."""
     if amount_in <= 0:
@@ -5963,7 +5988,8 @@ def v4_swap(chain_id: int, pk: str, key: tuple, token_in: str, amount_in: int,
     spot_after_fee = spot_out * (1 - fee_ppm_ / 1e6)
     if spot_after_fee > 0 and out_est > 0:
         impact = 1 - out_est / spot_after_fee
-        if impact > _SWAP_IMPACT_MAX:
+        limit = _SWAP_IMPACT_MAX if max_impact is None else max_impact
+        if impact > limit:
             raise RuntimeError(
                 f"Swap dibatalkan: price impact {impact * 100:.0f}% (di luar fee "
                 f"{fee_ppm_ / 10000:g}%). Pool ini terlalu tipis untuk jumlah segitu — "
@@ -6221,7 +6247,8 @@ def mint_v4(chain_id: int, pk: str, pool_info: dict, budget: float,
             swap_wei = max(0, budget_wei - quote_dep)
             swapped = False
             if swap_wei > budget_wei // 500:
-                h = v4_swap(chain_id, pk, key, quote, swap_wei, slippage_pct)
+                h = v4_swap(chain_id, pk, key, quote, swap_wei, slippage_pct,
+                            strategy.get("max_impact"))
                 if h:
                     steps.append(("swap", h))
                     swapped = True

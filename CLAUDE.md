@@ -161,9 +161,22 @@ ETH/BODKIN sedangkan harga pool SESUDAHNYA 0,000003722, jadi swap itu menggerakk
 harganya sendiri lebih dari 2×.
 
 `v4_swap()` karena itu membandingkan hasil quoter dengan hasil harga spot dikurangi
-fee, dan menolak kalau selisihnya di atas `_SWAP_IMPACT_MAX` (25%). Diuji di pool
-yang sama saat tebal: 0,0104 ETH → impact 0,2%, 1,0 ETH → 13,2% — semuanya lolos,
-jadi penjagaan ini tidak mengganggu swap normal.
+fee, dan menolak kalau selisihnya di atas `_SWAP_IMPACT_MAX` (25%).
+
+**Angkanya ditampilkan di kartu SEBELUM user menekan tombol**, bukan ditolak
+diam-diam saat eksekusi: `swap_impact_v4()` menghitungnya tanpa mengirim tx, kartu
+menulis "price impact swap: X%" plus perkiraan dolar yang terbakar, dan tombol
+"⚠️ Saya paham, lanjut walau impact X%" muncul **hanya kalau ambangnya terlewati**
+(kalau selalu ada, user terbiasa menekannya dan penjagaannya jadi percuma).
+Persetujuan itu menaikkan ambang untuk KARTU ITU saja lewat `ctx["max_impact"]` →
+`strategy["max_impact"]` → `v4_swap(..., max_impact)`, bukan setelan global.
+
+Terukur di pool BODKIN saat tebal: 0,0104 ETH → 0,2%, 0,5 → 4,7%, 2,0 → 38,5%,
+8,0 → 84,6%. Jadi swap normal tidak terganggu dan yang besar tetap minta izin.
+
+Belum dikerjakan: merutekan swap komposisi ke pool LAIN yang lebih dalam.
+`swap_any`/`swap_route`/`find_pool_dex` yang sudah ada hanya melayani v3 —
+untuk v4 swapnya selalu di pool tujuan.
 
 **Jangan simpulkan "pool-nya beda" dari keadaan pool yang berubah.** poolId swap dan
 poolId posisi di kasus itu SAMA; yang beda adalah keadaan pool sesudah swap

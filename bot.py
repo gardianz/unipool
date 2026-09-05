@@ -1241,6 +1241,21 @@ def build_preview(ctx_data: dict) -> str:
             L.append(f"   └ dari wallet: ~{ch.fmt_amount(in_meme(from_wallet_q))} {esc(tsym)} ✓")
         if swap > 0:
             L.append(f"   └ swap baru : {ch.fmt_amount(swap / 10 ** qd)} {esc(qs)} → {esc(tsym)}")
+            # Price impact swap komposisi WAJIB ditampilkan: minOut tidak
+            # melindunginya (quoter sudah memasukkannya), jadi tanpa angka ini user
+            # tidak punya cara tahu berapa yang menguap. Terukur di BODKIN: $36
+            # keluar wallet, $19,87 mendarat di posisi.
+            imp = (ch.swap_impact_v4(cid, p["key"], p["quote_addr"], swap)
+                   if p.get("ver") == 4 and p.get("key") else None)
+            ctx_data["_impact"] = imp
+            if imp is not None:
+                lim = ctx_data.get("max_impact") or ch._SWAP_IMPACT_MAX
+                tag = "  ⚠️ TINGGI" if imp > lim else ""
+                L.append(f"   └ price impact swap: {imp * 100:.1f}%{tag}")
+                if imp > lim:
+                    L.append(f"   └ <b>swap ini membakar ~{ch.fmt_usd(swap / 10 ** qd * p['quote_usd'] * imp)}</b> "
+                             f"— pool terlalu tipis untuk jumlah segini. Kecilkan jumlah, "
+                             f"pilih pool lebih dalam, atau pakai mode Lower (tanpa swap).")
         else:
             L.append(f"   └ tanpa swap — {esc(tsym)} existing sudah cukup")
         if excess_q > qwei // 100:
@@ -1383,6 +1398,14 @@ def confirm_kb(key: str, ctx_data: dict) -> InlineKeyboardMarkup:
     if mode != "upper":
         rows.append([srcbtn("quote", f"💰 {ctx_data['pool_info']['quote_sym']}"),
                      srcbtn("meme", f"🪙 {ctx_data['token']['symbol']}")])
+    # Tombol izin impact tinggi hanya muncul kalau memang terlewati — kalau selalu
+    # ada, user terbiasa menekannya dan penjagaannya jadi percuma.
+    imp = ctx_data.get("_impact")
+    lim = ctx_data.get("max_impact") or ch._SWAP_IMPACT_MAX
+    if imp is not None and imp > lim:
+        rows.append([InlineKeyboardButton(
+            f"⚠️ Saya paham, lanjut walau impact {imp * 100:.0f}%",
+            callback_data=f"okimp|{key}")])
     rows += [
         [abtn(a) for a in (25, 50, 75, 100)],
         [InlineKeyboardButton("✏️ Custom Range…", callback_data=f"askrng|{key}"),
@@ -1699,7 +1722,8 @@ async def do_mint(update: Update, ctx_data: dict):
     ver = p.get("ver", 3)
     tsym = ctx_data["token"]["symbol"]
     mode = ctx_data["mode"]
-    strategy = {"mode": mode, "low_pct": ctx_data["low_pct"], "up_pct": ctx_data["up_pct"],
+    strategy = {"max_impact": ctx_data.get("max_impact"),
+                "mode": mode, "low_pct": ctx_data["low_pct"], "up_pct": ctx_data["up_pct"],
                 "gap": ctx_data.get("gap", 1)}
 
     # Sama persis dengan kartu konfirmasi: untuk `amount_src="meme"` budget-nya
@@ -2892,6 +2916,13 @@ async def _route_callback(update: Update):
         ctx["mode"] = "stable" if m in ("stable", "wide") else "wide"
         ctx["gap"] = 0
         await show_confirm(q.message, key)
+        return
+    if data.startswith("okimp|"):
+        ctx = PENDING.get(data.split("|", 1)[1])
+        if ctx is not None:
+            # Ambang dinaikkan HANYA untuk kartu ini, bukan setelan global.
+            ctx["max_impact"] = 1.0
+        await show_confirm(q.message, data.split("|", 1)[1])
         return
     if data.startswith(("wd|", "amt|", "st|", "amtsrc|")):
         parts = data.split("|")
