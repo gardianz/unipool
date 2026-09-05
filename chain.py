@@ -6806,6 +6806,7 @@ def close_v4(chain_id: int, pk: str, tid: int, slippage_pct: float, autoswap: bo
     steps = [("burn", h)]
 
     swaps = []
+    swap_info: list[dict] = []          # jumlah nyata + perkiraan wajar tiap swap
     if autoswap and meme.lower() != V4_NATIVE:
         got_meme = u0 + f0 if q_is_t1 else u1 + f1
         expected = pre_meme + int(got_meme * 0.9)
@@ -6816,14 +6817,33 @@ def close_v4(chain_id: int, pk: str, tid: int, slippage_pct: float, autoswap: bo
         if bal == 0:
             swaps.append((msym, "SWAP GAGAL: saldo terbaca 0 (RPC lag) — jual manual"))
         else:
+            # Nilai meme SEBELUM swap (harga pool saat itu, sudah dipotong fee) dan
+            # jumlah quote yang BENAR-BENAR diterima. Tanpa dua angka ini user tidak
+            # punya cara tahu berapa yang termakan fee + price impact — kartu close
+            # dulu cuma menulis "swapped MEME → …" tanpa jumlah sama sekali.
+            qcur = key[1] if q_is_t1 else key[0]
+
+            def _qbal():
+                if qcur.lower() == V4_NATIVE:
+                    return w3.eth.get_balance(account.address)
+                return erc20(w3, qcur).functions.balanceOf(account.address).call()
+
+            pre_q = _qbal()
+            sq_before, _ = v4_slot0(w3, chain_id, pid)
+            raw_b = (sq_before / Q96) ** 2
+            mq = raw_b if q_is_t1 else (1 / raw_b if raw_b else 0)   # quote-wei per meme-wei
+            fee_ppm = key[2] if key[2] < 0x800000 else 0
+            expect_q = int(bal * mq * (1 - fee_ppm / 1e6))
             try:
                 sh = v4_swap(chain_id, pk, key, meme, bal, slippage_pct)
                 if sh:
                     swaps.append((msym, sh))
+                    swap_info.append({"sym": msym, "sold": bal, "got": max(0, _qbal() - pre_q),
+                                      "expect": expect_q, "quote": qcur})
             except Exception as e:
                 swaps.append((msym, f"SWAP GAGAL: {e}"))
 
-    return {"steps": steps, "swaps": swaps,
+    return {"steps": steps, "swaps": swaps, "swap_info": swap_info,
             "got0": (u0 + f0) / 10 ** i0["decimals"], "got1": (u1 + f1) / 10 ** i1["decimals"],
             "sym0": i0["symbol"], "sym1": i1["symbol"]}
 

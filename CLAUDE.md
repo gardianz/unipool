@@ -230,6 +230,22 @@ atau tokennya fee-on-transfer.
 
 ### Auto-swap saat close cuma menjual HASIL close
 
+**Swapnya di POOL POSISI ITU SENDIRI** (`v4_swap(..., key, meme, ...)`), sama seperti
+swap komposisi saat mint — bukan dirutekan ke pool lain yang lebih dalam.
+`swap_any`/`swap_route`/`find_pool_dex` hanya melayani v3.
+
+**Kartu WAJIB menyebut jumlah yang diterima dan biayanya.** Dulu cuma menulis
+"swapped MEME → WETH" — dua-duanya salah: tujuannya sebenarnya QUOTE POOL (mis.
+USDG, sedangkan label di-hardcode ke `wrapped_symbol`), dan tidak ada satu pun angka
+sehingga user tidak bisa tahu berapa yang termakan. `close_v4` sekarang mengembalikan
+`swap_info` berisi jumlah quote yang BENAR-BENAR diterima (delta saldo) plus nilai
+wajar sebelum swap (harga pool dikurangi fee), dan kartu menghitung selisihnya.
+
+Terukur di #1774674: 5.859,04 MEME → **261,00 USDG**, nilai wajar $269,57 → biaya
+**3,2%**, yaitu fee pool 1,51% + price impact 1,7%.
+
+
+
 `close_position`/`close_v4`/`reduce_v2` memotret saldo kedua sisi sebelum eksekusi,
 lalu auto-swap hanya menjual selisihnya. Dulu ketiganya menjual **seluruh saldo**
 token itu di wallet — token yang user pegang untuk keperluan lain ikut terjual.

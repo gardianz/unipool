@@ -2707,11 +2707,34 @@ async def do_close(update: Update, pid: str, autoswap: bool):
 
         if r["swaps"]:
             lines = ["🔄 Auto-swap hasil close:"]
+            # Info per-swap: jumlah yang benar-benar diterima + biayanya. Dulu label
+            # tujuannya di-hardcode ke wrapped_symbol padahal close v4 menjual meme
+            # ke QUOTE POOL (mis. USDG) — jadi kartunya menyebut token yang salah dan
+            # tidak pernah menyebut berapa yang termakan fee + price impact.
+            info = {d["sym"]: d for d in (r.get("swap_info") or [])}
             for sym, h in r["swaps"]:
-                if str(h).startswith("0x"):
-                    lines.append(f"swapped {esc(sym)} → {esc(ch.CHAINS[cid]['wrapped_symbol'])}: {ch.tx_link(cid, h)}")
-                else:
+                if not str(h).startswith("0x"):
                     lines.append(f"{esc(sym)}: {esc(h)}")
+                    continue
+                d = info.get(sym)
+                if not d:
+                    lines.append(f"swapped {esc(sym)}: {ch.tx_link(cid, h)}")
+                    continue
+                try:
+                    qi = ch.token_info(ch.get_w3(cid), ch.Web3.to_checksum_address(d["quote"])) \
+                        if str(d["quote"]).lower() != ch.V4_NATIVE else \
+                        {"symbol": ch.CHAINS[cid]["native_symbol"], "decimals": 18}
+                except Exception:
+                    qi = {"symbol": "?", "decimals": 18}
+                got = d["got"] / 10 ** qi["decimals"]
+                lines.append(f"swapped {esc(sym)} → {ch.fmt_amount(got)} {esc(qi['symbol'])}: "
+                             f"{ch.tx_link(cid, h)}")
+                exp = d.get("expect") or 0
+                if exp > 0 and d["got"] > 0:
+                    cost = 1 - d["got"] / exp
+                    lines.append(f"   └ biaya swap {cost * 100:.1f}% "
+                                 f"(fee pool + price impact) — nilai wajar sebelum swap "
+                                 f"~{ch.fmt_amount(exp / 10 ** qi['decimals'])} {esc(qi['symbol'])}")
             await reply(update, "\n".join(lines), DEL_KB)
 
 
