@@ -669,6 +669,21 @@ Dua penjagaan:
   `_POOL_PRICE_MAX_RATIO` = 20x. Longgar disengaja: yang dikejar pool rusak, bukan
   pool mahal. Kalau salah satu harga tak terbaca, mint TIDAK dihalangi.
 
+**`priceUsd` DexScreener selalu milik `baseToken` — WAJIB dicocokkan.** API-nya
+mengembalikan pair di mana token yang dicari justru jadi QUOTE, dan harganya milik
+token lain. Terbukti di FATCOIN: pair terlikuid `LLY/FATCOIN` ($539.592) membawa
+`priceUsd` **1147,36** yaitu harga LLY; angka itu jadi "harga pasar FATCOIN" lalu
+memblokir mint ke pool yang harganya justru benar ($0,0203) dengan pesan
+*"meleset 56.726x"*. Filter `baseToken.address == token` menutupnya — sesudahnya
+FATCOIN $0,02026, cocok dengan pool.
+
+Ini juga sempat menyesatkan diagnosis: ROBINVAULT terbaca $1,35 dari pair
+mis-orientasi, padahal harga sebenarnya **~$0,0044** (pool ETH 5,3% $0,00445, pool
+USDG 4% $0,00438, 5 pair DexScreener ~$0,00425 — semuanya sepakat). Yang rusak justru
+pool ETH 5% ber-TVL $41.688 yang tick-nya **887271 = MAX_TICK−1**. Pelajarannya: satu
+sumber harga yang menyimpang jauh dari SEMUA sumber lain adalah sumbernya yang salah,
+bukan pool-nya — cek beberapa pool on-chain sebelum menyimpulkan.
+
 **Patokan pasarnya sendiri bisa rusak, dan itu memblokir mint yang SAH.**
 `token_usd_price()` memilih pool ber-saldo quote terbesar, dan pool yang harganya
 mentok di batas kisi tetap lolos filter itu karena masih memegang >$10 quote.

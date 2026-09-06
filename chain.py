@@ -4817,8 +4817,16 @@ def token_usd_price(w3: Web3, chain_id: int, token_addr: str, _cache={}) -> floa
     if not price or best_liq_usd < 500:
         try:
             r = _cf_get(f"https://api.dexscreener.com/latest/dex/tokens/{token}", timeout=8)
+            # `priceUsd` selalu harga baseToken. DexScreener juga mengembalikan pair
+            # di mana token yang dicari justru jadi QUOTE — harganya milik token lain.
+            # Terbukti di FATCOIN: pair terlikuid "LLY/FATCOIN" ($539.592) membawa
+            # priceUsd 1147,36 yaitu harga LLY, dan angka itu dipakai sebagai "harga
+            # pasar FATCOIN" lalu memblokir mint ke pool yang harganya justru benar
+            # ($0,0203) dengan pesan "meleset 56.726x".
             pairs = [p for p in (r.json().get("pairs") or [])
-                     if p.get("chainId") == cfg.get("dexscreener")]
+                     if p.get("chainId") == cfg.get("dexscreener")
+                     and str((p.get("baseToken") or {}).get("address", "")).lower()
+                     == token.lower()]
             pairs.sort(key=lambda p: float((p.get("liquidity") or {}).get("usd") or 0), reverse=True)
             if pairs:
                 dex_liq = float((pairs[0].get("liquidity") or {}).get("usd") or 0)
