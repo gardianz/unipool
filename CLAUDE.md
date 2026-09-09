@@ -1340,6 +1340,17 @@ Dua hal yang membuat ini murah, jangan dibalik:
   satu tx per 20 detik masih lolos. Endpoint yang benar-benar mati gagal murah
   (0,06 detik untuk host yang diblokir DNS ISP).
 
+**Sebelum menyerah, `wait_ok()` menyapu SEMUA endpoint sekali lagi.** Tx bisa
+mendarat persis di detik terakhir, atau mendarat di node yang belum terlihat endpoint
+aktif. Terukur di Base: wrap `0x19579ae0…` masuk blok **51084522 pada 19:53:11** —
+detik yang SAMA dengan saat bot melapor "tidak masuk chain", dan 3 dari 4 endpoint
+sudah punya receipt-nya. Gas bukan sebabnya (maxFee 0,489 gwei vs baseFee 0,193).
+
+Pesan gagalnya juga tidak boleh menjanjikan "tidak ada dana yang berpindah" — untuk
+wrap/approve/swap itu KELIRU kalau tx-nya menyusul, dan user yang mengulang akan
+menjalankan langkah itu dua kali. Sekarang bunyinya "tx MASIH BISA menyusul — jangan
+langsung mengulang; cek /wallet dan explorer".
+
 Kalau `wait_ok` menyerah, `_NONCE_NEXT`/`_LAST_TX` WAJIB di-reset — tanpa itu tx
 berikutnya lahir dengan lubang nonce dan ikut mati satu per satu.
 

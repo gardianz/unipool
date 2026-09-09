@@ -1376,14 +1376,34 @@ def wait_ok(w3: Web3, txhash: str, what: str, total_wait: int = 180):
             _step(f"✅ {what} beres ({int(time.time() - started)}s"
                   + (f", gas {cost / 1e18:.6f}" if cost else "") + ")")
     if r is None:
+        # Sapuan terakhir SEBELUM menyerah: tx bisa mendarat persis di detik terakhir,
+        # atau mendarat di node lain yang belum terlihat endpoint aktif. Terukur di
+        # Base: wrap `0x19579ae0…` masuk blok 51084522 pada 19:53:11 — detik yang SAMA
+        # dengan saat bot melapor "tidak masuk chain". Melaporkannya gagal berarti user
+        # mengulang langkah yang sebenarnya sudah jalan.
+        _step(f"🔎 {what} belum terlihat — memeriksa semua endpoint sekali lagi")
+        try:
+            peers = _peer_w3s(w3.eth.chain_id, getattr(w3.provider, "endpoint_uri", ""))
+        except Exception:
+            peers = []
+        for cand in [w3] + peers:
+            try:
+                rr = cand.eth.get_transaction_receipt(txhash)
+            except Exception:
+                continue
+            if rr is not None:
+                r = rr
+                _step(f"✅ {what} ternyata SUDAH masuk blok {rr['blockNumber']}")
+                break
+    if r is None:
         # Menyerah. WAJIB reset pelacak nonce: kalau tidak, tx berikutnya lahir
         # dengan lubang nonce dan ikut mati satu per satu.
         _NONCE_NEXT.clear()
         _LAST_TX.clear()
         raise RuntimeError(
-            f"Tx {what} tidak masuk chain setelah {total_wait} detik dan sudah disiarkan "
-            f"ulang berkali-kali — kemungkinan besar dibuang mempool RPC. "
-            f"Tidak ada dana yang berpindah di langkah ini; ulangi saja. ({txhash})")
+            f"Tx {what} belum masuk chain setelah {total_wait} detik walau sudah "
+            f"disiarkan ulang berkali-kali. Tx-nya MASIH BISA menyusul — jangan "
+            f"langsung mengulang; cek dulu /wallet dan tx ini di explorer. ({txhash})")
     if r.status != 1:
         # Ulangi call-nya di blok sebelum tx itu untuk mendapat ALASAN revert —
         # "FAILED" saja memaksa user menebak. Murah: satu eth_call, read-only.
