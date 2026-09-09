@@ -5150,14 +5150,37 @@ def swap_to_token(chain_id: int, pk: str, token_in: str, token_out: str, fee: in
         # — bisa terbaca basi dari replika RPC, atau habis dipakai swap sebelumnya.
         # Setel ulang sekali lalu simulasikan lagi sebelum menyerah.
         if "STF" in str(e) or "TRANSFER_FROM_FAILED" in str(e):
-            c = erc20(w3, token_in)
-            h_ap = send_tx(w3, pk, {"to": token_in,
-                                    "data": calldata(c.functions.approve(cfg["router"], MAX_UINT256))})
-            wait_ok(w3, h_ap, "approve ulang")
-            try:
-                _preflight(w3, account.address, tx)
-            except Exception as e2:
-                raise RuntimeError(f"Swap {sym_in}→{sym_out} (fee {fee}) ditolak pool: {e2}")
+            # Dua sebab STF, dan urutannya penting. Yang PERTAMA dicoba: saldo
+            # ternyata lebih kecil dari yang dipakai membangun tx. `poll_balance`
+            # berhenti begitu saldo >= target, jadi replika RPC yang menjawab
+            # lebih tinggi dari kenyataan membuat pemangkasan di atas TIDAK jalan
+            # dan router gagal menarik token. Membaca ulang saldo di sini murah dan
+            # menutup kasus itu tanpa mengirim tx approve yang belum tentu perlu.
+            fresh = erc20(w3, token_in).functions.balanceOf(account.address).call()
+            if 0 < fresh < amount_in_wei:
+                out_est *= fresh / amount_in_wei
+                amount_in_wei = fresh
+                min_out = int(out_est * (100 - slippage_pct) / 100)
+                tx = _build()
+                _step(f"✂️ swap dipangkas ke saldo nyata {fresh / 10 ** dec_in:.8f} {sym_in}")
+                try:
+                    _preflight(w3, account.address, tx)
+                    e = None
+                except Exception as e3:
+                    e = e3
+            if e is not None:
+                # Sisanya soal allowance — bisa terbaca basi dari replika RPC, atau
+                # habis dipakai swap sebelumnya. Setel ulang sekali lalu simulasikan
+                # lagi sebelum menyerah.
+                c = erc20(w3, token_in)
+                h_ap = send_tx(w3, pk, {"to": token_in,
+                                        "data": calldata(c.functions.approve(cfg["router"], MAX_UINT256))})
+                wait_ok(w3, h_ap, "approve ulang")
+                try:
+                    _preflight(w3, account.address, tx)
+                except Exception as e2:
+                    raise RuntimeError(
+                        f"Swap {sym_in}→{sym_out} (fee {fee}) ditolak pool: {e2}")
         else:
             raise RuntimeError(f"Swap {sym_in}→{sym_out} (fee {fee}) ditolak pool: {e}")
     h = send_tx(w3, pk, tx)

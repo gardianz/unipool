@@ -222,6 +222,19 @@ menyebut token, jumlah, maupun sebabnya. Terbukti di BSC dengan allowance MAX:
 swap sebesar saldo LOLOS simulasi, swap 10× saldo memberi `execution reverted: STF`
 yang persis sama. Jadi jangan cari-cari masalah di pool.
 
+**Pemangkasan itu bisa TIDAK jalan, dan STF-nya lolos ke user.** `poll_balance`
+berhenti begitu saldo ≥ target, jadi replika RPC yang menjawab lebih tinggi dari
+kenyataan membuat `bal_in < amount_in_wei` bernilai False — tidak ada yang dipangkas,
+dan router gagal menarik token. Gejalanya di Base: *"Gagal beli USDC dari WETH: Swap
+WETH→USDC (fee 100) ditolak pool: execution reverted: STF"* padahal pool-nya sehat
+(55,9 WETH + $240k USDC) dan allowance MAX.
+
+Penanganan STF karena itu MEMBACA ULANG saldo dulu dan memangkas, baru meng-approve
+ulang kalau masih gagal — bukan langsung approve. Approve tidak menolong kalau
+sebabnya saldo, dan ia mengirim tx (bayar gas) untuk dugaan yang belum tentu benar.
+Terbukti: minta 0,013452132 WETH dengan saldo 0,012811555 → STF; dipangkas ke saldo
+nyata → SUKSES (32,1649 USDC).
+
 `swap_to_token()` karena itu memangkas `amount_in_wei` ke saldo NYATA (dan menurunkan
 `min_out` proporsional — kalau tidak, swap revert karena minOut kekinggian), lalu
 kalau tetap STF ia menyetel ulang approval sekali dan menyimulasikan lagi. Selisih
