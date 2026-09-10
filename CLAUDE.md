@@ -336,6 +336,30 @@ Beda per versi, jangan disamaratakan:
 - **reduce/close** (v3 `decrease+collect`, v4 `DECREASE`+`TAKE_PAIR`) — fee ditarik
   **penuh ke wallet** berapa pun pct-nya, jadi event `fees` dicatat 100%, bukan pro-rata.
 
+### Kartu hasil mint: sebut yang NYATA masuk, bukan budget
+
+`mint_v4`/`mint_position` mengembalikan `"deposited": budget` — itu **rencana**,
+sedangkan `deposited_usd` nilai **nyata** yang masuk posisi. Menaruh keduanya di satu
+baris ("Deposited ~246,093 USDG ($235,71)") membuat user membaca selisihnya sebagai
+kerugian $10, padahal sebagian besar cuma budget yang tidak terpakai dan masih ada
+di wallet.
+
+Terukur di NUDES #2298038 — enam tx, dan biayanya cuma di SATU tempat:
+
+| langkah | masuk | keluar | biaya |
+|---|---|---|---|
+| wrap | 0,097697018 ETH | 0,097697 WETH | 0 (1:1) |
+| swap WETH→USDG | $241,21 | 241,153925 USDG | **$0,06** (0,02%) |
+| swap komposisi USDG→NUDES | 122,194841 USDG | 16.103,49 NUDES ($117,20) | **$4,99** (4,08%) |
+| mint | 119,435324 USDG + 16.100,27 NUDES | posisi $235,71 | — |
+
+Gas keenam tx 0,000126 ETH (~$0,31), sisa 3,22 NUDES ($0,02) di wallet. Jadi
+kerugian nyata **~$5,4**, bukan $10,4 — dan semuanya di swap komposisi (fee pool 4%
++ price impact), bukan di mint.
+
+`mint_v4` karena itu ikut mengembalikan `in_quote`/`in_meme` (jumlah NYATA kedua
+sisi) dan kartu menyebutnya; budget disebut terpisah sebagai keterangan.
+
 ### Gas dilaporkan otomatis di semua alur
 
 `wait_ok()` menghitung `gasUsed × effectiveGasPrice` tiap tx dan menjumlahkannya di

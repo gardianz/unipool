@@ -1826,8 +1826,23 @@ async def do_mint(update: Update, ctx_data: dict):
                          f"(now {ch.fmt_usd(now * qu * supply)})"))
     else:
         lines.insert(1, f"Range: {ch.fmt_price(lo)}–{ch.fmt_price(hi)} (now {ch.fmt_price(now)})")
-    lines.insert(2, (f"Deposited ~{ch.fmt_amount(r['deposited'])} {esc(r['deposit_sym'])} "
-                     f"({ch.fmt_usd(r['deposited_usd'])})"))
+    # Sebut yang NYATA masuk posisi, bukan budget. "Deposited ~246,093 USDG
+    # ($235,71)" menaruh rencana dan realisasi di satu baris, dan user membaca
+    # selisihnya sebagai kerugian — padahal sebagian besar cuma budget yang tidak
+    # terpakai dan masih ada di wallet.
+    if r.get("in_quote") is not None and r.get("in_meme") is not None:
+        sisi = f"{ch.fmt_amount(r['in_quote'])} {esc(r.get('quote_sym') or '')}"
+        if r["in_meme"] > 0:
+            sisi += f" + {ch.fmt_amount(r['in_meme'])} {esc(r.get('meme_sym') or '')}"
+        lines.insert(2, f"Masuk posisi: {sisi} ({ch.fmt_usd(r['deposited_usd'])})")
+        sisa = (r.get("deposited") or 0) - (r["in_quote"] or 0)
+        if r.get("deposit_sym") == r.get("quote_sym") and sisa > (r.get("deposited") or 0) * 0.01:
+            lines.insert(3, (f"<i>· dari budget {ch.fmt_amount(r['deposited'])} "
+                             f"{esc(r['deposit_sym'])} — sisanya dipakai beli "
+                             f"{esc(r.get('meme_sym') or 'meme')} / tetap di wallet</i>"))
+    else:
+        lines.insert(2, (f"Deposited ~{ch.fmt_amount(r['deposited'])} {esc(r['deposit_sym'])} "
+                         f"({ch.fmt_usd(r['deposited_usd'])})"))
     if r["token_id"]:
         lines.append(ch.pos_link_any(cid, pid))
     g = gas_line(cid)

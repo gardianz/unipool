@@ -6416,9 +6416,16 @@ def mint_v4(chain_id: int, pk: str, pool_info: dict, budget: float,
     uq, um = (u1, u0) if q_is_t1 else (u0, u1)
     deposited_usd = (uq + um * mprice_q) / 10 ** qdec * qusd
     deposit_sym = minfo["symbol"] if mode == "upper" else pool_info["quote_sym"]
+    # `deposited` itu BUDGET (rencana), sedangkan `deposited_usd` nilai NYATA yang
+    # masuk posisi. Menampilkan keduanya berdampingan — "Deposited ~246,093 USDG
+    # ($235,71)" — membuat user mengira kehilangan $10, padahal sebagian besar
+    # selisihnya cuma budget yang tidak terpakai dan masih di wallet. Jumlah NYATA
+    # kedua sisi ikut dikembalikan supaya UI bisa menyebut yang benar.
     return {"token_id": token_id, "steps": steps, "mode": mode,
             "tick_lower": tick_lower, "tick_upper": tick_upper, "cur_tick": cur_tick,
-            "deposited": budget, "deposit_sym": deposit_sym, "deposited_usd": deposited_usd}
+            "deposited": budget, "deposit_sym": deposit_sym, "deposited_usd": deposited_usd,
+            "in_quote": uq / 10 ** qdec, "in_meme": um / 10 ** minfo["decimals"],
+            "quote_sym": pool_info["quote_sym"], "meme_sym": minfo["symbol"]}
 
 
 def _v4_tick_from_info(info: int) -> tuple[int, int]:
