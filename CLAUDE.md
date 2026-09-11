@@ -1635,6 +1635,46 @@ Kalau perlu memangkas lebih jauh: monitor sebenarnya cuma memakai `in_range`,
 panggilan per posisi. Belum dikerjakan — perlu jalur "ringan" di
 `_position_detail`/`_v4_position_detail` dan sentuh jalur eksekutor TP/SL.
 
+### Daftar posisi: satu pembaca, banyak pembaca gratis
+
+Membaca daftar itu N posisi x ~12 panggilan RPC. Dulu SETIAP klik `/list`,
+`Refresh`, dan SETIAP putaran `monitor_loop` membayarnya lagi dari nol — dua
+pemakai yang butuh data SAMA saling menggandakan tagihan CU, lalu 429 mengenai
+keduanya. Terukur di VPS: `menu|list makan 16.9s`, `refresh 19.2s`,
+`pos|… 10.3s`, semuanya `lag loop 0.0s`.
+
+`list_positions_all(cid, key, errors, fresh=False)` sekarang stale-while-revalidate
+(`_POS_CACHE`, segar `_POS_FRESH_SECS` 45 detik, basi masih disajikan sampai
+`_POS_MAX_STALE` 900 detik sambil disegarkan di thread latar — satu per
+`(chain, wallet)`, dijaga `_POS_BUSY`). Terukur: klik pertama 0,80 detik,
+**klik berikutnya 0,00 detik tanpa satu pun pembacaan chain**, dan saat basi
+daftarnya keluar SEKARANG sementara penyegarannya jalan di latar.
+
+`monitor_loop` yang MENGISI cache (`fresh=True`), jadi volume RPC total justru
+TURUN, bukan cuma berpindah: UI berhenti menembak pembacaannya sendiri.
+
+Dua aturan yang wajib ikut, dan keduanya lebih penting daripada kecepatannya:
+
+- **`fresh=True` untuk jalur yang memindahkan uang.** Eksekutor TP/SL dan
+  snapshot sebelum migrate memutuskan aksi dana — angka basi di situ tidak boleh.
+  Jalur tampilan boleh basi.
+- **Cache DIBUANG sesudah tiap perubahan posisi** (`pos_cache_drop()`): di
+  `position_busy` (mencakup 6 alur add/reduce/collect/rebalance/close/compound),
+  di `do_mint`, `/recover`, `/cleanup`, dan tombol Refresh. Menampilkan posisi
+  yang sudah ditutup jauh lebih buruk daripada menunggu satu pembacaan.
+
+Yang dikembalikan salinan DANGKAL: pemanggil boleh menyaring/mengurutkan, tapi
+dict posisinya dipakai bersama semua pembaca — baca saja, jangan dimutasi
+(jebakan yang sama dengan `store._hist()`).
+
+### Read timeout RPC 10 detik, bukan 30
+
+Terukur di VPS: `ReadTimeoutError(host='rpc.mainnet.chain.robinhood.com',
+read timeout=30)` berulang — endpoint publiknya menerima koneksi lalu diam.
+Dengan retry di atasnya, satu panggilan bisa menghabiskan menit. `get_w3`
+mencoba endpoint berurutan, jadi menunggu lama di yang menggantung selalu lebih
+buruk daripada pindah. `_RPC_READ_TIMEOUT` = 10; timeout konek tetap 5.
+
 ### Serialisasi transaksi & eksekutor tunggal
 
 Masing-masing proses punya lock nonce sendiri (`TX_LOCK`: `asyncio.Lock` di bot.py,

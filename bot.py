@@ -15,6 +15,7 @@ import math
 import os
 import re
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 import uuid
@@ -178,18 +179,87 @@ def pk_for(addr: str) -> str | None:
     return None
 
 
+# ---------- Cache daftar posisi (stale-while-revalidate) ----------
+# Membaca daftar itu N posisi x ~12 panggilan RPC. Dulu SETIAP klik /list, Refresh,
+# dan tiap putaran monitor_loop membayarnya lagi dari nol, jadi dua pemakai yang
+# sebenarnya butuh data yang SAMA saling menggandakan tagihan CU — lalu 429 mengenai
+# keduanya dan kliknya jadi belasan detik (terukur `menu|list makan 16.9s`).
+#
+# Sekarang satu pembaca (monitor_loop, `fresh=True`) mengisi cache dan semua klik UI
+# membacanya gratis. Volume RPC-nya JADI LEBIH KECIL, bukan cuma dipindah.
+_POS_CACHE: dict[tuple, tuple] = {}   # (cid, addr) -> (positions, errors, ts)
+_POS_BUSY: set = set()
+_POS_CLOCK = threading.Lock()
+_POS_FRESH_SECS = 45                  # dianggap segar: disajikan apa adanya
+_POS_MAX_STALE = 900                  # masih boleh disajikan sambil disegarkan di latar
+
+
+def _pos_read(cid: int, key: str, addr: str) -> tuple[list, list]:
+    errs: list = []
+    pos = ch.list_all_positions(cid, key, store.refs(cid, addr, "v2"),
+                                store.refs(cid, addr, "v4"), errors=errs)
+    _POS_CACHE[(cid, addr)] = (pos, errs, time.time())
+    return pos, errs
+
+
+def _pos_refresh_bg(cid: int, key: str, addr: str) -> None:
+    """Segarkan cache di thread latar, satu per (chain, wallet)."""
+    ck = (cid, addr)
+    with _POS_CLOCK:
+        if ck in _POS_BUSY:
+            return
+        _POS_BUSY.add(ck)
+
+    def work():
+        try:
+            _pos_read(cid, key, addr)
+        except Exception as e:
+            log.warning("refresh posisi latar %s/%s: %s", cid, addr, e)
+        finally:
+            with _POS_CLOCK:
+                _POS_BUSY.discard(ck)
+
+    threading.Thread(target=work, daemon=True, name="pos-refresh").start()
+
+
+def pos_cache_drop(cid: int | None = None) -> None:
+    """Buang cache sesudah aksi yang MENGUBAH posisi (mint/close/reduce/…).
+
+    Tanpa ini user menutup posisi lalu `/list` masih menampilkannya — jauh lebih
+    buruk daripada lambat. Dipanggil di `position_busy` (6 alur aksi) dan do_mint."""
+    for k in [k for k in _POS_CACHE if cid is None or k[0] == cid]:
+        _POS_CACHE.pop(k, None)
+
+
 def list_positions_all(cid: int, key: str | None = None,
-                       errors: list | None = None) -> list[dict]:
+                       errors: list | None = None, fresh: bool = False) -> list[dict]:
     """Posisi v3 + v4 + v2 wallet (v4/v2 dari registry yang dicatat saat mint).
 
     `errors`: ref yang GAGAL dibaca ditampung di sini. WAJIB disebut ke user kalau
     terisi — posisi yang gagal dibaca beda dari posisi yang tidak ada, dan kalau
-    dibuang diam-diam RPC sibuk terlihat seperti dana hilang."""
+    dibuang diam-diam RPC sibuk terlihat seperti dana hilang.
+
+    `fresh=True` melewati cache — WAJIB untuk jalur yang memutuskan aksi dana
+    (monitor_loop/eksekutor TP-SL, snapshot sebelum migrate). Jalur tampilan boleh
+    basi; jalur yang memindahkan uang tidak."""
     key = key or pk()
     w = _addr_of(key)
-    return ch.list_all_positions(cid, key,
-                                 store.refs(cid, w, "v2"), store.refs(cid, w, "v4"),
-                                 errors=errors)
+    ck = (cid, w)
+    hit = _POS_CACHE.get(ck)
+    age = (time.time() - hit[2]) if hit else None
+    if not fresh and hit and age < _POS_MAX_STALE:
+        if age >= _POS_FRESH_SECS:
+            _pos_refresh_bg(cid, key, w)   # sajikan yang lama, segarkan di latar
+        if errors is not None:
+            errors.extend(hit[1])
+        # Salinan dangkal: pemanggil yang menyaring/mengurutkan tidak boleh mengubah
+        # daftar milik cache. Dict posisinya sendiri TETAP dipakai bersama — baca
+        # saja, jangan dimutasi (jebakan yang sama dengan `store._hist()`).
+        return list(hit[0])
+    pos, errs = _pos_read(cid, key, w)
+    if errors is not None:
+        errors.extend(errs)
+    return pos
 
 
 def position_one(cid: int, pid, key: str | None = None) -> dict | None:
@@ -1788,6 +1858,7 @@ async def do_mint(update: Update, ctx_data: dict):
             await edit(status, f"❌ Mint gagal: {esc(e)}")
             return
 
+    pos_cache_drop(cid)            # posisi baru lahir — daftar lama sudah salah
     if ver == 2:
         pid = f"v2:{r['pair'].lower()}"
         store.add_ref(cid, wallet_address(), "v2", r["pair"])
@@ -2338,6 +2409,10 @@ async def position_busy(update: Update, pid) -> "AsyncIterator[bool]":
     try:
         yield True
     finally:
+        # Aksi apa pun di sini (add/reduce/collect/rebalance/close/compound) mengubah
+        # posisi, jadi cache daftar WAJIB dibuang — menampilkan posisi yang sudah
+        # ditutup jauh lebih buruk daripada menunggu satu pembacaan.
+        pos_cache_drop()
         async with _BUSY_LOCK:
             _BUSY_PIDS.discard(key)
 
@@ -2826,6 +2901,7 @@ async def _route_callback(update: Update):
         await do_claim_all(update)
         return
     if data == "refresh":
+        pos_cache_drop()           # tombol ini memang untuk memaksa baca ulang
         await cmd_list(update, None, status_msg=q.message)
         return
     if data == "cleanupok":
@@ -3359,6 +3435,7 @@ async def _trigger_order(app, cid: int, o: dict, p: dict, hit: tuple, mc: float)
     # catat event PnL (mirror do_close) supaya riwayat konsisten
     ev_tid = ref if ver == 3 else str(o["pid"])
     if ver == 4:
+        pos_cache_drop(cid)
         store.drop_ref(cid, waddr, "v4", str(ref))
     elif ver == 2:
         store.drop_ref(cid, waddr, "v2", str(ref))
@@ -3395,7 +3472,9 @@ async def _gather_positions(cid: int, only_wallets: set | None = None):
         if only_wallets is not None and waddr not in only_wallets:
             continue
         try:
-            pk_pos = await asyncio.to_thread(list_positions_all, cid, key)
+            # fresh=True: monitor yang MENGISI cache, dan eksekutor TP/SL tidak
+            # boleh memutuskan close dari angka basi.
+            pk_pos = await asyncio.to_thread(list_positions_all, cid, key, None, True)
         except Exception as e:
             log.warning("monitor posisi %s/%s: %s", cid, waddr, e)
             by_wallet[waddr] = None  # fetch gagal → JANGAN anggap posisi hilang
@@ -3737,6 +3816,7 @@ async def cmd_recover(update: Update, _=None):
         if str(t).lower() in known:
             continue
         store.add_ref(cid, w, "v4", str(t))
+        pos_cache_drop(cid)
         baru.append((t, d))
     if not baru:
         await edit(status, (f"✅ Tidak ada posisi yang hilang — {len(tids)} NFT v4 "
@@ -3849,7 +3929,8 @@ async def show_migrate_confirm(msg, key: str, src_pid: str):
     dest = ctx["pool_info"]
 
     def snap():
-        return next((x for x in list_positions_all(cid) if x["pid"] == str(src_pid)), None)
+        # fresh: snapshot ini jadi dasar pindah dana, bukan sekadar tampilan
+        return next((x for x in list_positions_all(cid, fresh=True) if x["pid"] == str(src_pid)), None)
 
     p = await asyncio.to_thread(snap)
     if not p:
@@ -3908,7 +3989,8 @@ async def do_migrate(update: Update, key: str, mode: str):
     status = await reply(update, head)
 
     def snap():
-        return next((x for x in list_positions_all(cid) if x["pid"] == str(src_pid)), None)
+        # fresh: snapshot ini jadi dasar pindah dana, bukan sekadar tampilan
+        return next((x for x in list_positions_all(cid, fresh=True) if x["pid"] == str(src_pid)), None)
 
     pos = await asyncio.to_thread(snap)
     async with TX_LOCK:

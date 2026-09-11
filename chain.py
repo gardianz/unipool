@@ -926,7 +926,7 @@ def _forced_ip_w3(rpc_url: str) -> Web3 | None:
     session.mount(f"https://{ip}", _SNIAdapter(u.hostname))
     session.headers["Host"] = u.hostname
     ip_url = rpc_url.replace(u.hostname, ip, 1)
-    provider = Web3.HTTPProvider(ip_url, request_kwargs={"timeout": (5, 30)}, session=session)
+    provider = Web3.HTTPProvider(ip_url, request_kwargs={"timeout": (5, _RPC_READ_TIMEOUT)}, session=session)
     provider.cache_allowed_requests = True  # eth_chainId dkk tidak di-query berulang
     return _poa(Web3(provider))
 
@@ -1036,6 +1036,7 @@ def _alchemy_urls(cfg: dict) -> list[str]:
     return [f"https://{net}.g.alchemy.com/v2/{k}" for k in alchemy_keys()] if net else []
 
 
+_RPC_READ_TIMEOUT = 10              # detik; endpoint yang menggantung jangan ditunggu lama
 _RPC_BAD: dict[str, float] = {}     # url -> kapan terakhir kena rate limit
 _RPC_BAD_COOLDOWN = 120             # detik endpoint dilewati setelah 429
 _RPC_FAILOVER_MAX = 2               # endpoint lain yang dicoba dalam SATU panggilan
@@ -1189,7 +1190,7 @@ def w3_for_url(url: str, chain_id: int) -> Web3:
         # (connect, read): endpoint mati/diblokir DNS ketahuan dalam 5 detik, bukan 30 —
         # `get_w3` mencoba beberapa endpoint berurutan, jadi timeout konek yang lama
         # berlipat ganda sebelum sampai ke endpoint yang hidup.
-        provider = _Provider(url, request_kwargs={"timeout": (5, 30)},
+        provider = _Provider(url, request_kwargs={"timeout": (5, _RPC_READ_TIMEOUT)},
                              session=_rpc_session(), _chain_id=chain_id,
                              exception_retry_configuration=_w3_retry_cfg())
         provider.cache_allowed_requests = True  # eth_chainId dkk tidak di-query berulang
