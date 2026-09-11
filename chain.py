@@ -841,16 +841,24 @@ def _rpc_retry() -> Retry:
     menggantung menit-menit. Endpoint yang benar-benar bermasalah ditangani
     failover di `get_w3`, bukan dengan menunggu lebih lama di endpoint yang sama.
 
-    **429 SENGAJA TIDAK di-retry di sini, dan `Retry-After` sengaja diabaikan.**
-    Alchemy membalas 429 dengan `Retry-After`, dan `respect_retry_after_header`
-    MENGALAHKAN backoff_factor: terukur dengan header `Retry-After: 5`, satu
-    panggilan RPC memakan **20,01 detik** lalu tetap gagal (`RetryError`) — persis
-    angka yang muncul di log user (`callback st|… makan 20.8s`, `wd|… 20.2s`)
-    dengan lag event loop 0,0 detik. Menunggu di endpoint yang jatahnya habis tidak
-    pernah menolong: jatah Alchemy dihitung per-app, jadi yang benar adalah pindah
-    ke key/endpoint LAIN seketika — itu tugas `_Provider.make_request`. 502/503/504
-    tetap di-retry karena itu gangguan sesaat, bukan jatah habis."""
-    return Retry(total=4, backoff_factor=0.3, status_forcelist=(502, 503, 504),
+    **`Retry-After` WAJIB diabaikan** (`respect_retry_after_header=False`). Header
+    itu MENGALAHKAN `backoff_factor`, jadi backoff pendek di atas tidak berpengaruh
+    sama sekali selama ia dihormati. Terukur pada server 429 lokal: tanpa header
+    4,21 detik, `Retry-After: 1` 4,01 detik, `Retry-After: 5` **20,01 detik** —
+    lalu tetap gagal. Alchemy mengirim header itu, dan angkanya cocok persis dengan
+    log user (`callback st|… makan 20.8s`, `wd|… 20.2s`, `mint|… 57.5s`).
+
+    **429 tetap di-retry, tapi DIBATASI `status=2`** (jeda 0 + 0,5 = ~0,5 detik).
+    Sempat dibuang sama sekali dari `status_forcelist`, dan itu MEMATIKAN chain:
+    eth-rpc Blockscout Robinhood membalas 429 untuk `eth_chainId` sebagai rate
+    limit biasa — dengan nol retry ia langsung dianggap endpoint mati, `get_w3`
+    kehabisan kandidat, dan log penuh *"Semua RPC Robinhood gagal"*. Burst 429
+    sesaat (Alchemy 300 CU/s) juga lazim dan hilang sendiri dalam ratusan mili-
+    detik. Jadi: retry PENDEK untuk burst, rotasi endpoint untuk jatah yang
+    benar-benar habis. `status=2` membatasi retry berbasis status saja; kegagalan
+    koneksi/timeout tetap dapat jatah `total` penuh."""
+    return Retry(total=4, status=2, backoff_factor=0.25,
+                 status_forcelist=(429, 502, 503, 504),
                  allowed_methods=None, respect_retry_after_header=False)
 
 
@@ -1019,41 +1027,66 @@ class _Provider(Web3.HTTPProvider):
         except Exception as e:
             if not _is_rate_limited(e):
                 raise
+            # Menandai endpoint HANYA di jalur normal. Saat `busy` (hop failover
+            # atau probe `eth_chainId` milik `get_w3`), menandai justru menghanguskan
+            # kandidat yang cuma kena burst sesaat — satu panggilan gagal bisa
+            # menyisakan nol endpoint dan log jadi "Semua RPC <chain> gagal". Hop
+            # menandai sendiri endpoint yang benar-benar dicoba.
+            if getattr(_RPC_FAILOVER_TL, "busy", False):
+                raise
             self._mark_bad(self.endpoint_uri)
-            # `get_w3(fresh=True)` di bawah ikut memverifikasi `eth_chainId` lewat
-            # provider baru — yang juga `_Provider`. Tanpa penjaga ini, endpoint
-            # pengganti yang ikut kena limit memulai failover-nya SENDIRI dan
-            # bersarang sedalam jumlah endpoint. Satu lapis sudah cukup: lapisan
-            # luar tetap mencoba `_RPC_FAILOVER_MAX` endpoint.
-            if self._chain_id is None or getattr(_RPC_FAILOVER_TL, "busy", False):
+            if self._chain_id is None:
                 raise
             # Menandai endpoint saja TIDAK cukup: panggilan INI tetap gagal, dan
             # yang dilihat user adalah "Collect gagal: too many 429" walau key
             # lain masih punya jatah. Jadi request-nya diulang SEKARANG lewat
-            # endpoint lain — `get_w3(fresh=True)` melewati yang baru ditandai.
+            # endpoint lain.
+            #
+            # **JANGAN memakai `get_w3(fresh=True)` di sini.** Ia memverifikasi
+            # tiap kandidat dengan `eth_chainId` lewat `_Provider` baru, jadi tiap
+            # kandidat yang ikut kena 429 ditandai `_RPC_BAD` juga — SATU panggilan
+            # gagal menghanguskan SELURUH key Alchemy sekaligus, menyisakan hanya
+            # RPC publik, dan log jadi "Semua RPC <chain> gagal". Endpoint di sini
+            # datang dari `CHAINS`/`_alchemy_urls` untuk chain ini, jadi chain_id-nya
+            # sudah pasti — verifikasinya cuma round-trip tambahan.
             seen = {self.endpoint_uri}
             _RPC_FAILOVER_TL.busy = True
             try:
-                for _ in range(_RPC_FAILOVER_MAX):
-                    try:
-                        prov = get_w3(self._chain_id, fresh=True).provider
-                    except Exception:
-                        raise e from None
-                    uri = getattr(prov, "endpoint_uri", None)
-                    if uri in seen:
-                        raise                  # tidak ada endpoint lain — menyerah
+                hops = 0
+                for uri in _chain_rpcs(self._chain_id):
+                    if uri in seen or time.time() - _RPC_BAD.get(uri, 0) <= _RPC_BAD_COOLDOWN:
+                        continue
                     seen.add(uri)
+                    hops += 1
+                    alt = Web3.HTTPProvider(uri, request_kwargs={"timeout": (5, 30)},
+                                            session=_rpc_session(),
+                                            exception_retry_configuration=_w3_retry_cfg())
+                    alt.cache_allowed_requests = True
                     try:
-                        # Kelas dasar langsung: jangan lewat override ini, nanti tiap
-                        # hop memulai anggaran failover-nya sendiri.
-                        return Web3.HTTPProvider.make_request(prov, method, params)
+                        return alt.make_request(method, params)
                     except Exception as e2:
                         if not _is_rate_limited(e2):
                             raise
-                        self._mark_bad(uri)
+                        _RPC_BAD[uri] = time.time()
+                    if hops >= _RPC_FAILOVER_MAX:
+                        break
                 raise
             finally:
                 _RPC_FAILOVER_TL.busy = False
+
+
+def _chain_rpcs(chain_id: int) -> list[str]:
+    """Endpoint chain ini, urut prioritas. Alchemy duluan kalau ada API key
+    (host g.alchemy.com tidak kena blokir DNS ISP); SETIAP key jadi endpoint
+    sendiri sehingga rotasi `_RPC_BAD` memperlakukan key yang kehabisan jatah
+    sama seperti endpoint mati."""
+    cfg = CHAINS[chain_id]
+    rpcs = []
+    if os.environ.get(cfg["rpc_env"]):
+        rpcs.append(os.environ[cfg["rpc_env"]])
+    rpcs += _alchemy_urls(cfg)
+    rpcs += cfg["rpcs"]
+    return rpcs
 
 
 def get_w3(chain_id: int, fresh: bool = False) -> Web3:
@@ -1062,22 +1095,26 @@ def get_w3(chain_id: int, fresh: bool = False) -> Web3:
     hit = _W3_CACHE.get(chain_id)
     if hit and not fresh and time.time() - hit[1] < 300:
         return hit[0]
+    rpcs = _chain_rpcs(chain_id)
     cfg = CHAINS[chain_id]
-    rpcs = []
-    if os.environ.get(cfg["rpc_env"]):
-        rpcs.append(os.environ[cfg["rpc_env"]])
-    # Alchemy prioritas kalau API key ada (host g.alchemy.com tidak kena blokir DNS
-    # ISP). SETIAP key jadi endpoint sendiri, jadi rotasi `_RPC_BAD` memperlakukan
-    # key yang kehabisan jatah sama seperti endpoint mati: dilewati 120 detik lalu
-    # dicoba lagi, dan panggilan berikutnya jalan lewat key lain.
-    rpcs += _alchemy_urls(cfg)
-    rpcs += cfg["rpcs"]
     # Endpoint yang baru saja kehabisan jatah dilewati dulu — tapi hanya kalau masih
     # ada pilihan lain, supaya chain ber-RPC tunggal tidak jadi mati total.
     fresh_rpcs = [r for r in rpcs if time.time() - _RPC_BAD.get(r, 0) > _RPC_BAD_COOLDOWN]
     if fresh_rpcs:
         rpcs = fresh_rpcs
     errs = []
+    # Probe `eth_chainId` di bawah lewat `_Provider` juga. Tanpa penanda ini, tiap
+    # kandidat yang kebetulan kena 429 saat diprobe ikut ditandai `_RPC_BAD` dan
+    # memulai failover-nya sendiri — satu sapuan bisa menghanguskan seluruh key.
+    _prev_busy = getattr(_RPC_FAILOVER_TL, "busy", False)
+    _RPC_FAILOVER_TL.busy = True
+    try:
+        return _get_w3_scan(chain_id, cfg, rpcs, errs)
+    finally:
+        _RPC_FAILOVER_TL.busy = _prev_busy
+
+
+def _get_w3_scan(chain_id: int, cfg: dict, rpcs: list[str], errs: list[str]) -> Web3:
     for rpc in rpcs:
         # (connect, read): endpoint mati/diblokir DNS ketahuan dalam 5 detik, bukan 30 —
         # `get_w3` mencoba beberapa endpoint berurutan, jadi timeout konek yang lama
