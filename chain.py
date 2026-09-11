@@ -21,6 +21,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from web3 import Web3
 from web3.exceptions import ContractLogicError
+from web3.providers.rpc.utils import ExceptionRetryConfiguration
 
 try:    # BSC itu PoA: extraData 280 byte, jauh di atas 32 byte yang divalidasi web3.
     from web3.middleware import ExtraDataToPOAMiddleware as _POA   # web3 v7
@@ -838,15 +839,36 @@ def _rpc_retry() -> Retry:
     0,6+1,2+2,4+4,8+9,6+19,2 ≈ 37 detik SEBELUM pemanggilnya tahu ada masalah —
     dan satu kartu posisi butuh ~11 panggilan, jadi satu klik tombol bisa
     menggantung menit-menit. Endpoint yang benar-benar bermasalah ditangani
-    failover di `get_w3`, bukan dengan menunggu lebih lama di endpoint yang sama."""
-    return Retry(total=4, backoff_factor=0.3, status_forcelist=(429, 502, 503, 504),
-                 allowed_methods=None, respect_retry_after_header=True)
+    failover di `get_w3`, bukan dengan menunggu lebih lama di endpoint yang sama.
+
+    **429 SENGAJA TIDAK di-retry di sini, dan `Retry-After` sengaja diabaikan.**
+    Alchemy membalas 429 dengan `Retry-After`, dan `respect_retry_after_header`
+    MENGALAHKAN backoff_factor: terukur dengan header `Retry-After: 5`, satu
+    panggilan RPC memakan **20,01 detik** lalu tetap gagal (`RetryError`) — persis
+    angka yang muncul di log user (`callback st|… makan 20.8s`, `wd|… 20.2s`)
+    dengan lag event loop 0,0 detik. Menunggu di endpoint yang jatahnya habis tidak
+    pernah menolong: jatah Alchemy dihitung per-app, jadi yang benar adalah pindah
+    ke key/endpoint LAIN seketika — itu tugas `_Provider.make_request`. 502/503/504
+    tetap di-retry karena itu gangguan sesaat, bukan jatah habis."""
+    return Retry(total=4, backoff_factor=0.3, status_forcelist=(502, 503, 504),
+                 allowed_methods=None, respect_retry_after_header=False)
 
 
 # Listing posisi menembak banyak read paralel (per posisi: slot0 + collect +
 # supply, plus cost_basis nested). Pool default requests = 10 → "pool full,
 # discarding connection" lalu koneksi dibuka ulang tiap kali = lambat. Besarkan.
 _POOL = 32
+
+
+def _w3_retry_cfg():
+    """Retry internal web3, TANPA `HTTPError`.
+
+    Default web3 mengulang `HTTPError` 5× (backoff 0,125) — jadi 429 ditunggu di
+    endpoint yang jatahnya sudah habis, lapisan kedua di atas urllib3. Terukur
+    1,89 detik per panggilan hanya dari lapisan ini, dan hasilnya tetap gagal.
+    Rate limit ditangani rotasi endpoint di `_Provider.make_request`; koneksi
+    putus / timeout tetap layak diulang karena itu gangguan sesaat."""
+    return ExceptionRetryConfiguration(errors=(ConnectionError, requests.Timeout))
 
 
 def _rpc_session() -> requests.Session:
@@ -954,6 +976,8 @@ def _alchemy_urls(cfg: dict) -> list[str]:
 
 _RPC_BAD: dict[str, float] = {}     # url -> kapan terakhir kena rate limit
 _RPC_BAD_COOLDOWN = 120             # detik endpoint dilewati setelah 429
+_RPC_FAILOVER_MAX = 2               # endpoint lain yang dicoba dalam SATU panggilan
+_RPC_FAILOVER_TL = threading.local()  # penjaga: failover tidak boleh bersarang
 _UNI_EMPTY_TTL = 20                 # detik hasil indexer KOSONG boleh di-cache
 _SWR_MAX_STALE = 600                # detik hasil indexer boleh basi (disegarkan di latar)
 _FOREIGN_POOL_BUDGET = 12           # detik maks untuk pencarian pool ber-quote aneh
@@ -983,16 +1007,53 @@ class _Provider(Web3.HTTPProvider):
         self._chain_id = _chain_id
         super().__init__(*a, **kw)
 
+    def _mark_bad(self, uri: str) -> None:
+        _RPC_BAD[uri] = time.time()
+        hit = _W3_CACHE.get(self._chain_id)
+        if hit and getattr(hit[0].provider, "endpoint_uri", None) == uri:
+            _W3_CACHE.pop(self._chain_id, None)
+
     def make_request(self, method, params):
         try:
             return super().make_request(method, params)
         except Exception as e:
-            if _is_rate_limited(e):
-                _RPC_BAD[self.endpoint_uri] = time.time()
-                hit = _W3_CACHE.get(self._chain_id)
-                if hit and getattr(hit[0].provider, "endpoint_uri", None) == self.endpoint_uri:
-                    _W3_CACHE.pop(self._chain_id, None)
-            raise
+            if not _is_rate_limited(e):
+                raise
+            self._mark_bad(self.endpoint_uri)
+            # `get_w3(fresh=True)` di bawah ikut memverifikasi `eth_chainId` lewat
+            # provider baru — yang juga `_Provider`. Tanpa penjaga ini, endpoint
+            # pengganti yang ikut kena limit memulai failover-nya SENDIRI dan
+            # bersarang sedalam jumlah endpoint. Satu lapis sudah cukup: lapisan
+            # luar tetap mencoba `_RPC_FAILOVER_MAX` endpoint.
+            if self._chain_id is None or getattr(_RPC_FAILOVER_TL, "busy", False):
+                raise
+            # Menandai endpoint saja TIDAK cukup: panggilan INI tetap gagal, dan
+            # yang dilihat user adalah "Collect gagal: too many 429" walau key
+            # lain masih punya jatah. Jadi request-nya diulang SEKARANG lewat
+            # endpoint lain — `get_w3(fresh=True)` melewati yang baru ditandai.
+            seen = {self.endpoint_uri}
+            _RPC_FAILOVER_TL.busy = True
+            try:
+                for _ in range(_RPC_FAILOVER_MAX):
+                    try:
+                        prov = get_w3(self._chain_id, fresh=True).provider
+                    except Exception:
+                        raise e from None
+                    uri = getattr(prov, "endpoint_uri", None)
+                    if uri in seen:
+                        raise                  # tidak ada endpoint lain — menyerah
+                    seen.add(uri)
+                    try:
+                        # Kelas dasar langsung: jangan lewat override ini, nanti tiap
+                        # hop memulai anggaran failover-nya sendiri.
+                        return Web3.HTTPProvider.make_request(prov, method, params)
+                    except Exception as e2:
+                        if not _is_rate_limited(e2):
+                            raise
+                        self._mark_bad(uri)
+                raise
+            finally:
+                _RPC_FAILOVER_TL.busy = False
 
 
 def get_w3(chain_id: int, fresh: bool = False) -> Web3:
@@ -1022,7 +1083,8 @@ def get_w3(chain_id: int, fresh: bool = False) -> Web3:
         # `get_w3` mencoba beberapa endpoint berurutan, jadi timeout konek yang lama
         # berlipat ganda sebelum sampai ke endpoint yang hidup.
         provider = _Provider(rpc, request_kwargs={"timeout": (5, 30)},
-                             session=_rpc_session(), _chain_id=chain_id)
+                             session=_rpc_session(), _chain_id=chain_id,
+                             exception_retry_configuration=_w3_retry_cfg())
         provider.cache_allowed_requests = True  # eth_chainId dkk tidak di-query berulang
         candidates = [_poa(Web3(provider))]
         for i, w3 in enumerate(candidates):

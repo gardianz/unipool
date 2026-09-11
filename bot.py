@@ -251,7 +251,14 @@ async def edit(msg, text: str, kb: InlineKeyboardMarkup | None = None):
 
 
 def gas_line(cid: int) -> str:
-    """Baris '⛽ gas' untuk kartu hasil. Kosong kalau tidak ada tx (mis. aksi batal)."""
+    """Baris '⛽ gas' untuk kartu hasil. Kosong kalau tidak ada tx (mis. aksi batal).
+
+    **Melakukan RPC** (`fmt_gas` → `quote_usd_price` untuk kurs native), jadi
+    pemanggilnya WAJIB `await asyncio.to_thread(gas_line, cid)`. Dipanggil langsung
+    di event loop, ia menahan SELURUH bot selama panggilan itu — terukur di log VPS
+    `event loop tertahan 12,8 detik` tepat sebelum kartu hasil mint muncul, dan
+    selama itu tidak ada klik lain yang bisa dijawab (query callback keburu
+    kedaluwarsa)."""
     wei = ch.gas_spent_wei()
     return f"⛽ gas terpakai: {ch.fmt_gas(cid, wei)}" if wei else ""
 
@@ -1794,7 +1801,7 @@ async def do_mint(update: Update, ctx_data: dict):
         for label, h in r["steps"]:
             lines.append(f"{label}: {ch.tx_link(cid, h)}")
         lines.append(ch.pos_link_any(cid, pid))
-        g = gas_line(cid)
+        g = await asyncio.to_thread(gas_line, cid)
         if g:
             lines.append(g)
         await edit(status, "\n".join(lines), NAV_KB)
@@ -1845,7 +1852,7 @@ async def do_mint(update: Update, ctx_data: dict):
                          f"({ch.fmt_usd(r['deposited_usd'])})"))
     if r["token_id"]:
         lines.append(ch.pos_link_any(cid, pid))
-    g = gas_line(cid)
+    g = await asyncio.to_thread(gas_line, cid)
     if g:
         lines.append(g)
     await edit(status, "\n".join(lines), NAV_KB)
@@ -2205,7 +2212,10 @@ async def show_position(update: Update, msg, pid: str):
         await edit(msg, f"❌ Posisi {disp_pid(pid)} tidak ditemukan (sudah ditutup?).",
                    InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Posisi", callback_data="menu|list")], BACK_ROW]))
         return
-    await edit(msg, position_card(cid, p), position_kb(cid, p))
+    # position_card → _pool_info_line → pool_stats (StateView + dexscreener), jadi
+    # dirakit di thread. Di event loop ia menahan semua klik lain selama RPC-nya.
+    card = await asyncio.to_thread(position_card, cid, p)
+    await edit(msg, card, position_kb(cid, p))
 
 
 # ---------- Chart (link eksternal) ----------
@@ -2400,7 +2410,7 @@ async def do_add_exec(update: Update, pid: str, val: float, is_pct: bool):
         for label, h in r["steps"]:
             lines.append(f"{label}: {ch.tx_link(cid, h)}")
         lines.append(ch.pos_link_any(cid, pid))
-        g = gas_line(cid)
+        g = await asyncio.to_thread(gas_line, cid)
         if g:
             lines.append(g)
         await edit(status, "\n".join(lines), NAV_KB)
@@ -2485,7 +2495,7 @@ async def do_reduce_exec(update: Update, pid: str, pct: int):
         for label, h in r["steps"]:
             lines.append(f"{label}: {ch.tx_link(cid, h)}")
         lines.append(ch.pos_link_any(cid, pid))
-        g = gas_line(cid)
+        g = await asyncio.to_thread(gas_line, cid)
         if g:
             lines.append(g)
         await edit(status, "\n".join(lines), NAV_KB)
@@ -2521,7 +2531,7 @@ async def do_collect(update: Update, pid: str):
                  "<i>Posisi tetap jalan — liquidity tidak berubah.</i>"]
         for label, h in r["steps"]:
             lines.append(f"{label}: {ch.tx_link(cid, h)}")
-        g = gas_line(cid)
+        g = await asyncio.to_thread(gas_line, cid)
         if g:
             lines.append(g)
         await edit(status, "\n".join(lines), NAV_KB)
@@ -2627,7 +2637,7 @@ async def finish_rebalance(update, status, cid: int, pid: str, pos, r: dict,
         lines.append(f"{label}: {ch.tx_link(cid, h)}")
     if r["token_id"]:
         lines.append(ch.pos_link_any(cid, new_pid))
-    g = gas_line(cid)
+    g = await asyncio.to_thread(gas_line, cid)
     if g:
         lines.append(g)
     await edit(status, "\n".join(lines), NAV_KB)
@@ -2726,7 +2736,7 @@ async def do_close(update: Update, pid: str, autoswap: bool):
         lines.append(f"Withdrawal value ~{ch.fmt_usd(usd)}")
         for label, h in r["steps"]:
             lines.append(f"{label}: {ch.tx_link(cid, h)}")
-        g = gas_line(cid)
+        g = await asyncio.to_thread(gas_line, cid)
         if g:
             lines.append(g)
         await edit(status, "\n".join(lines), NAV_KB)
@@ -2746,10 +2756,13 @@ async def do_close(update: Update, pid: str, autoswap: bool):
                 if not d:
                     lines.append(f"swapped {esc(sym)}: {ch.tx_link(cid, h)}")
                     continue
+                def _qinfo(q=d["quote"]):
+                    if str(q).lower() == ch.V4_NATIVE:
+                        return {"symbol": ch.CHAINS[cid]["native_symbol"], "decimals": 18}
+                    return ch.token_info(ch.get_w3(cid), ch.Web3.to_checksum_address(q))
+
                 try:
-                    qi = ch.token_info(ch.get_w3(cid), ch.Web3.to_checksum_address(d["quote"])) \
-                        if str(d["quote"]).lower() != ch.V4_NATIVE else \
-                        {"symbol": ch.CHAINS[cid]["native_symbol"], "decimals": 18}
+                    qi = await asyncio.to_thread(_qinfo)   # decimals+symbol = 2 RPC
                 except Exception:
                     qi = {"symbol": "?", "decimals": 18}
                 got = d["got"] / 10 ** qi["decimals"]
@@ -3564,7 +3577,7 @@ async def do_cleanup(update: Update):
         lines.append(f"<i>Sisa {r['sisa']} — jalankan /cleanup lagi.</i>")
     for label, h in r["steps"]:
         lines.append(f"{label}: {ch.tx_link(cid, h)}")
-    g = gas_line(cid)
+    g = await asyncio.to_thread(gas_line, cid)
     if g:
         lines.append(g)
     await edit(status, "\n".join(lines), NAV_KB)
@@ -3633,7 +3646,7 @@ async def do_claim_all(update: Update):
                      + (ch.tx_link(cid, h) if h else "ok"))
     for p, err in gagal:
         lines.append(f"❌ {_pos_disp(p)}: {esc(err)}")
-    g = gas_line(cid)
+    g = await asyncio.to_thread(gas_line, cid)
     if g:
         lines.append(g)
     await edit(status, "\n".join(lines), NAV_KB)
@@ -3942,9 +3955,11 @@ async def ask_compound(update: Update, pid: str):
         [InlineKeyboardButton(f"♻️ Compound {ch.fmt_usd(p['unclaimed_usd'])}",
                               callback_data=f"cmpok|{pid}")],
         [InlineKeyboardButton("❌ Cancel", callback_data="cancel")]])
+    # pool_stats di dalamnya menembak StateView + dexscreener — jangan di event loop.
+    pool_line = await asyncio.to_thread(_pool_info_line, cid, p, ver)
     await edit(msg, (
         f"♻️ <b>Compound {_pos_disp(p)}?</b>\n\n"
-        f"{_pool_info_line(cid, p, ver)}\n"
+        f"{pool_line}\n"
         f"💼 Posisi sekarang <b>{ch.fmt_usd(p['value_usd'])}</b> · "
         f"{'🟢 IN range' if p['in_range'] else '🔴 OUT of range'}\n"
         f"💰 Fee unclaimed <b>{ch.fmt_usd(p['unclaimed_usd'])}</b>\n"
@@ -3993,7 +4008,7 @@ async def do_compound(update: Update, pid: str):
         for label, h in r["steps"]:
             lines.append(f"{label}: {ch.tx_link(cid, h)}")
         lines.append(ch.pos_link_any(cid, pid))
-        g = gas_line(cid)
+        g = await asyncio.to_thread(gas_line, cid)
         if g:
             lines.append(g)
         await edit(status, "\n".join(lines), NAV_KB)
@@ -4029,7 +4044,7 @@ async def do_revoke(update: Update, key: str, idx: int | None):
         lines.append(f"· {esc(it['symbol'])} → {esc(it['spender_label'])}: {ch.tx_link(cid, h)}")
     for it, err in fail:
         lines.append(f"❌ {esc(it['symbol'])} → {esc(it['spender_label'])}: {esc(err)}")
-    g = gas_line(cid)
+    g = await asyncio.to_thread(gas_line, cid)
     if g:
         lines.append(g)
     await edit(status, "\n".join(lines), NAV_KB)

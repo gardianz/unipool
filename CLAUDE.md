@@ -838,6 +838,70 @@ mencocokkan teks exception karena urllib3 menghabiskan retry lalu melempar
 Endpoint bertanda dilewati `_RPC_BAD_COOLDOWN` (120 detik), **tapi hanya kalau masih
 ada pilihan lain** supaya chain ber-RPC tunggal tidak jadi mati total.
 
+#### 429 JANGAN pernah ditunggu — dua lapis retry sempat melakukannya
+
+Sumber utama "bot lambat sekali" yang terukur: **satu panggilan RPC yang kena 429
+memakan 20,01 detik lalu tetap gagal.** Bukan kerja, murni tidur. Cocok persis
+dengan log VPS — `callback st|… makan 20.8s (lag loop 0.0s)`, `wd|… 20.2s`, dan
+`mint|… 57.5s` (tiga panggilan semacam itu). Lag loop 0,0 karena tidurnya di
+thread, bukan di event loop, jadi kelihatan seperti "RPC lambat" padahal endpoint
+lain menganggur.
+
+Dua lapis yang menunggu, keduanya harus dimatikan:
+
+| lapis | setelan lama | biaya terukur |
+|---|---|---|
+| urllib3 `Retry` | `status_forcelist` memuat 429 + `respect_retry_after_header=True` | **20,01 detik** (Alchemy kirim `Retry-After: 5` × 4 retry) |
+| web3 `ExceptionRetryConfiguration` | default memuat `requests.HTTPError` | **1,89 detik** (5 retry, backoff 0,125) |
+
+`respect_retry_after_header` **MENGALAHKAN** `backoff_factor` — jadi backoff
+pendek yang sudah disetel di `_rpc_retry()` tidak berpengaruh sama sekali selama
+header itu dihormati. Terukur pada server 429 lokal: tanpa `Retry-After` 4,21
+detik, `Retry-After: 1` 4,01 detik, `Retry-After: 5` **20,01 detik**.
+
+Sekarang: `status_forcelist=(502, 503, 504)` (429 dibuang),
+`respect_retry_after_header=False`, dan `_w3_retry_cfg()` membuang `HTTPError`
+dari retry web3. Sesudahnya **20,01 detik → 0,00 detik**. 502/503/504 tetap
+diulang — itu gangguan sesaat, bukan jatah habis.
+
+Menunggu tidak pernah bisa menolong di sini: **kuota Alchemy dihitung per-app**,
+jadi jatah tidak pulih dalam hitungan detik. Yang menolong cuma pindah key.
+
+**Menandai endpoint saja TIDAK cukup.** Panggilan yang kena 429 tetap gagal, dan
+yang dilihat user adalah *"Collect gagal: too many 429"* walau key lain masih
+punya jatah — rotasinya baru berlaku untuk panggilan BERIKUTNYA.
+`_Provider.make_request` karena itu mengulang request itu juga lewat endpoint lain
+(`get_w3(fresh=True)`, maks `_RPC_FAILOVER_MAX` = 2 hop). Terukur: request yang
+dulu 20 detik lalu gagal sekarang **pulih dalam 0,14 detik**.
+
+Dua penjagaan di failover itu, jangan dihapus:
+
+- **Hop memanggil `Web3.HTTPProvider.make_request` (kelas dasar), bukan override
+  ini** — kalau lewat override, tiap hop memulai anggaran failover-nya sendiri.
+- **`_RPC_FAILOVER_TL.busy` melarang failover bersarang.** `get_w3(fresh=True)`
+  memverifikasi `eth_chainId` lewat provider baru yang juga `_Provider`; tanpa
+  penjaga ini endpoint pengganti yang ikut kena limit memulai failover sendiri
+  dan bersarang sedalam jumlah endpoint.
+
+### Kartu hasil & kartu posisi WAJIB dirakit di thread
+
+`gas_line()` melakukan RPC (`fmt_gas` → `quote_usd_price` untuk kurs native) dan
+dipanggil di **11** tempat; `position_card()` memanggil `_pool_info_line` →
+`pool_stats` (StateView + dexscreener). Semuanya dulu jalan langsung di event
+loop — terukur di log VPS `event loop tertahan 12,8 detik` tepat sebelum kartu
+hasil mint muncul, dan selama itu **tidak ada** klik lain yang bisa dijawab
+(query callback keburu kedaluwarsa, gejalanya tombol berputar terus).
+
+`concurrent_updates(True)` tidak menolong sama sekali untuk ini: yang tertahan
+loop-nya, bukan antreannya.
+
+Aturannya: apa pun yang menyentuh RPC/HTTP di `bot.py` masuk
+`asyncio.to_thread`, termasuk yang "cuma satu panggilan" dan yang di-cache
+(cache miss tetap RPC). Yang sudah dipindah: `gas_line` (11 tempat),
+`position_card` (`show_position`), `_pool_info_line` (`ask_compound`),
+`token_info` (`do_close`). Pemeriksaan ulangnya murah — scan AST `bot.py` untuk
+panggilan bernama itu yang ada di badan `async def` tanpa `to_thread`.
+
 ### Nilai event mustahil = PnL rusak selamanya
 
 PnL portfolio itu **jumlah**, bukan rata-rata — tidak ada yang meredam satu nilai
