@@ -1112,10 +1112,9 @@ class _Provider(Web3.HTTPProvider):
                         continue
                     seen.add(uri)
                     hops += 1
-                    alt = Web3.HTTPProvider(uri, request_kwargs={"timeout": (5, 30)},
-                                            session=_rpc_session(),
-                                            exception_retry_configuration=_w3_retry_cfg())
-                    alt.cache_allowed_requests = True
+                    # provider HANGAT (session & koneksi TLS dipakai ulang);
+                    # `busy` sudah menyala jadi override-nya tidak ikut failover.
+                    alt = w3_for_url(uri, self._chain_id).provider
                     try:
                         return alt.make_request(method, params)
                     except Exception as e2:
@@ -1168,19 +1167,48 @@ def get_w3(chain_id: int, fresh: bool = False) -> Web3:
         _RPC_FAILOVER_TL.busy = _prev_busy
 
 
-def _get_w3_scan(chain_id: int, cfg: dict, rpcs: list[str], errs: list[str]) -> Web3:
-    for rpc in rpcs:
+_W3_BY_URL: dict[str, Web3] = {}     # url -> Web3 hangat (session & koneksi TLS dipakai ulang)
+_CHAIN_OK: dict[str, int] = {}       # url -> chain_id yang sudah terverifikasi
+
+
+def w3_for_url(url: str, chain_id: int) -> Web3:
+    """Web3 per ENDPOINT, dipakai ulang selamanya.
+
+    Dulu tiap sapuan `get_w3` membangun provider DAN `requests.Session` baru.
+    Session baru = pool koneksi baru = **handshake TLS baru** ke Alchemy tiap
+    kali — dan `_mark_bad()` membuang `_W3_CACHE` pada SETIAP 429, jadi di bawah
+    tekanan rate limit sapuan itu terjadi terus-menerus. Terukur pada proses
+    dingin: `eth_chainId` 2× = **1,78 detik** dari total 2,12 detik untuk membaca
+    satu posisi, sementara 11 `eth_call` isinya cuma 0,32 detik. Ongkosnya
+    hampir seluruhnya koneksi, bukan kerja.
+
+    Dengan Web3 per-URL, berpindah endpoint tinggal memilih objek yang koneksinya
+    sudah hangat — dan `cache_allowed_requests` milik provider ikut bertahan."""
+    w3 = _W3_BY_URL.get(url)
+    if w3 is None:
         # (connect, read): endpoint mati/diblokir DNS ketahuan dalam 5 detik, bukan 30 —
         # `get_w3` mencoba beberapa endpoint berurutan, jadi timeout konek yang lama
         # berlipat ganda sebelum sampai ke endpoint yang hidup.
-        provider = _Provider(rpc, request_kwargs={"timeout": (5, 30)},
+        provider = _Provider(url, request_kwargs={"timeout": (5, 30)},
                              session=_rpc_session(), _chain_id=chain_id,
                              exception_retry_configuration=_w3_retry_cfg())
         provider.cache_allowed_requests = True  # eth_chainId dkk tidak di-query berulang
-        candidates = [_poa(Web3(provider))]
+        w3 = _poa(Web3(provider))
+        _W3_BY_URL[url] = w3
+    return w3
+
+
+def _get_w3_scan(chain_id: int, cfg: dict, rpcs: list[str], errs: list[str]) -> Web3:
+    for rpc in rpcs:
+        candidates = [w3_for_url(rpc, chain_id)]
         for i, w3 in enumerate(candidates):
             try:
-                if w3.eth.chain_id == chain_id:
+                # chain_id sebuah endpoint TIDAK bisa berubah, jadi sekali
+                # terverifikasi probe-nya dilewati selamanya. Tanpa ini tiap
+                # pemilihan ulang endpoint membayar satu round-trip penuh, dan
+                # pemilihan ulang itu terjadi pada tiap 429.
+                if _CHAIN_OK.get(rpc) == chain_id or w3.eth.chain_id == chain_id:
+                    _CHAIN_OK[rpc] = chain_id
                     _W3_CACHE[chain_id] = (w3, time.time())
                     return w3
                 errs.append(f"{rpc}: chain_id salah")
@@ -1687,21 +1715,40 @@ def quote_usd_price(w3: Web3, chain_id: int, quote_sym: str, _cache={}) -> float
     return 0.0
 
 
+_DEX_PAIRS_TTL = 120        # detik hasil SUKSES dipakai ulang
+_DEX_PAIRS_FAIL_TTL = 60    # detik KEGAGALAN diingat (jangan bayar budget tiap klik)
+_DEX_PAIRS_BUDGET = 4       # detik maks per pengambilan — ini duduk di jalur klik
+
+
 def _dex_pairs(chain_id: int, token_addr: str, _cache={}) -> list[dict]:
     """Daftar pair dexscreener utk token di chain ini (cache 2 menit).
-    Data eksternal — SELALU verifikasi on-chain sebelum dipakai."""
+    Data eksternal — SELALU verifikasi on-chain sebelum dipakai.
+
+    **Kegagalan WAJIB ikut diingat.** Dulu `except: return []` tanpa menyentuh
+    cache, jadi di host yang dexscreener-nya diblokir SETIAP pemanggilan membayar
+    ULANG seluruh budget `_cf_request` (jalur langsung + tiap proxy). `pool_stats`
+    memanggil fungsi ini DUA kali (`dex_volumes` + `_dexliq_of`), dan ia duduk
+    persis di jalur klik tombol: terukur di VPS `callback pos|v4:2452060 makan
+    19.9s (lag loop 0.0s)` — 2 × 8 detik budget, sisanya pembacaan posisi.
+
+    Kegagalan mengembalikan hasil LAMA kalau ada (angka tampilan — basi jauh lebih
+    baik daripada hilang), dan TTL-nya lebih pendek supaya pulih cepat begitu
+    sumbernya hidup lagi."""
     cfg = CHAINS[chain_id]
     key = (chain_id, token_addr.lower())
     hit = _cache.get(key)
-    if hit and time.time() - hit[1] < 120:
+    if hit and time.time() - hit[1] < (_DEX_PAIRS_TTL if hit[2] else _DEX_PAIRS_FAIL_TTL):
         return hit[0]
+    stale = hit[0] if hit else []
     try:
-        r = _cf_get(f"https://api.dexscreener.com/latest/dex/tokens/{token_addr}", timeout=8)
+        r = _cf_get(f"https://api.dexscreener.com/latest/dex/tokens/{token_addr}",
+                    timeout=_DEX_PAIRS_BUDGET)
         pairs = [p for p in (r.json().get("pairs") or [])
                  if p.get("chainId") == cfg.get("dexscreener")]
     except Exception:
-        return []
-    _cache[key] = (pairs, time.time())
+        _cache[key] = (stale, time.time(), False)
+        return stale
+    _cache[key] = (pairs, time.time(), True)
     return pairs
 
 

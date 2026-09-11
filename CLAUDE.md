@@ -923,6 +923,46 @@ Tiga penjagaan sekarang, jangan dihapus:
 - **Marking terjadi SESUDAH cek `busy`, bukan sebelum.** Urutan terbalik persis
   itulah yang meloloskan cascade di atas.
 
+### Koneksi RPC dipakai ULANG per endpoint
+
+`w3_for_url(url, chain_id)` menyimpan satu `Web3` per ENDPOINT di `_W3_BY_URL`,
+dan `_CHAIN_OK` mengingat endpoint yang chain_id-nya sudah terverifikasi.
+
+Dulu tiap sapuan `get_w3` membangun provider **dan `requests.Session` baru**.
+Session baru = pool koneksi baru = **handshake TLS baru** — dan `_mark_bad()`
+membuang `_W3_CACHE` pada SETIAP 429, jadi di bawah tekanan rate limit sapuan itu
+terjadi terus-menerus. Terukur membaca satu posisi v4 di proses dingin: total
+2,12 detik, yang **1,78 detik-nya cuma 2× `eth_chainId`**, sementara 11
+`eth_call` isinya 0,32 detik. Ongkosnya hampir seluruhnya koneksi, bukan kerja.
+
+chain_id sebuah endpoint tidak bisa berubah, jadi sekali terverifikasi probenya
+dilewati selamanya. Sesudah keduanya: `get_w3` setelah cache dibuang
+**1,78 detik → 0,000 detik (0 request)**, dan `position_by_pid` 2,12 → **0,30
+detik dingin / 0,16 detik hangat**. Hop failover juga memakai provider hangat itu,
+bukan membuka session baru tiap hop.
+
+### Kegagalan sumber luar WAJIB ikut di-cache
+
+`_dex_pairs()` dulu `except: return []` tanpa menyentuh cache. Di host yang
+dexscreener-nya diblokir, SETIAP pemanggilan karena itu membayar ULANG seluruh
+budget `_cf_request` (jalur langsung + tiap proxy). `pool_stats()` memanggilnya
+**dua kali** (`dex_volumes` + `_dexliq_of`) dan duduk persis di jalur klik
+tombol — terukur di VPS: `callback pos|v4:2452060 makan 19.9s (lag loop 0.0s)`.
+
+Sekarang kegagalan disimpan dengan TTL sendiri (`_DEX_PAIRS_FAIL_TTL` 60 detik,
+sukses 120) dan mengembalikan hasil LAMA kalau ada — angka tampilan, basi jauh
+lebih baik daripada hilang. Budget juga dipotong 8 → 4 detik
+(`_DEX_PAIRS_BUDGET`); fungsi ini ada di jalur klik, bukan cuma discovery.
+
+Terukur dengan dexscreener dimatikan paksa: panggilan pertama 4,00 detik,
+**berikutnya 0,00 detik**, dan `dex_volumes` + `_dexliq_of` bersama-sama 4,00
+detik (dulu 2 × 8).
+
+Bedakan dari aturan `krystal_raw()` yang justru **tidak boleh** meng-cache hasil
+kosong: di sana yang di-cache adalah JAWABAN SUKSES yang isinya kosong, dan itu
+menghapus pool dari daftar. Di sini yang di-cache adalah fakta bahwa request-nya
+GAGAL, supaya klik berikutnya tidak membayar timeout yang sama lagi.
+
 ### Kartu hasil & kartu posisi WAJIB dirakit di thread
 
 `gas_line()` melakukan RPC (`fmt_gas` → `quote_usd_price` untuk kurs native) dan
