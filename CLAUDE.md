@@ -818,8 +818,24 @@ terlapor sebagai error (diuji dengan tokenId palsu: 0 error).
 ### Rate limit RPC: rotasi endpoint, bukan menunggu
 
 **Beberapa API key Alchemy didukung** lewat `alchemy_keys()`: `ALCHEMY_API_KEY`,
-`ALCHEMY_API_KEYS` (dipisah koma/spasi), dan `ALCHEMY_API_KEY_2..10`, dedupe dengan
-urutan dipertahankan. Tiap key jadi **endpoint tersendiri** di `get_w3`, jadi tidak
+`ALCHEMY_API_KEYS` (dipisah koma/spasi), `ALCHEMY_API_KEY_2..10`, **dan
+`alchemy_keys.txt` (satu key per baris)** — semuanya di-UNION, dedupe dengan
+urutan dipertahankan.
+
+File-nya default di samping `chain.py`, dipindah lewat `ALCHEMY_KEY_FILE`, dan
+**WAJIB ada di .gitignore** (kredensial, sama seperti `proxies.txt`; contohnya
+`alchemy_keys.txt.example`). Dipakai karena menambah key = menambah baris,
+tanpa mengurus nomor urut `_2..10`. Dua detail yang sengaja ada:
+
+- **URL penuh diterima.** Yang paling gampang tersalin dari dashboard Alchemy
+  adalah `https://<net>.g.alchemy.com/v2/<key>`, bukan key telanjang — ditempel
+  apa adanya, `_alchemy_urls()` membangun URL di dalam URL dan endpoint-nya 404.
+  Gejalanya cuma "lambat", karena `get_w3` diam-diam jatuh ke RPC publik.
+  `_clean_alchemy_key()` mengambil bagian setelah `/v2/` dan membuang tanda kutip.
+- **Cache berkunci `(mtime_ns, ukuran)`.** Key yang ditambahkan saat bot jalan
+  langsung terpakai tanpa restart, tapi filenya tidak dibaca ulang tiap panggilan
+  — `_chain_rpcs()` memanggilnya di jalur failover. Terukur 2.000 panggilan
+  0,018 detik. Tiap key jadi **endpoint tersendiri** di `get_w3`, jadi tidak
 ada mekanisme baru yang perlu ditulis — rotasi `_RPC_BAD` yang sudah ada langsung
 bekerja: key yang kena 429 ditandai, dilewati 120 detik, dan panggilan berikutnya
 jalan lewat key berikutnya. Kuota Alchemy dihitung per-app, jadi N key = N jatah.

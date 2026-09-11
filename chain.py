@@ -959,6 +959,9 @@ def alchemy_keys() -> list[str]:
     rotasi yang sudah ada ikut bekerja: begitu satu key kena 429, `_Provider`
     menandainya di `_RPC_BAD` dan panggilan berikutnya memakai key lain.
 
+    Ditambah **`alchemy_keys.txt`** (satu key per baris) — lihat
+    `_alchemy_keys_file()`. Sumber file dan env di-UNION, bukan saling menggantikan.
+
     Kuota Alchemy dihitung per-app, jadi beberapa key = beberapa jatah. Ini yang
     paling langsung menolong `monitor_loop`, pemakai CU terbesar."""
     out = []
@@ -969,12 +972,63 @@ def alchemy_keys() -> list[str]:
         k = os.environ.get(f"ALCHEMY_API_KEY_{i}", "").strip()
         if k:
             out.append(k)
+    out += _alchemy_keys_file()
     seen, res = set(), []
     for k in out:
-        if k not in seen:
+        k = _clean_alchemy_key(k)
+        if k and k not in seen:
             seen.add(k)
             res.append(k)
     return res
+
+
+def _clean_alchemy_key(tok: str) -> str:
+    """Ambil key-nya saja dari apa pun yang ditempel user.
+
+    Yang paling gampang tersalin dari dashboard Alchemy adalah URL penuh
+    (`https://<net>.g.alchemy.com/v2/<key>`), bukan key telanjang. Ditempel apa
+    adanya, `_alchemy_urls()` akan membangun URL di dalam URL dan endpoint-nya
+    404 — gejalanya cuma "lambat" karena `get_w3` diam-diam jatuh ke RPC publik.
+    Tanda kutip ikut dibuang: lazim terbawa saat menyalin dari file env."""
+    tok = tok.strip().strip("\"'")
+    if "/v2/" in tok:
+        tok = tok.rsplit("/v2/", 1)[1]
+    return tok.strip("/").strip()
+
+
+def _alchemy_keys_file(_cache={}) -> list[str]:
+    """Key Alchemy dari file teks, satu per baris.
+
+    Lebih enak dikelola daripada `ALCHEMY_API_KEY_2..10` di `.env`: menambah key
+    = menambah baris, tanpa menyentuh nomor urut. Baris kosong dan yang diawali
+    `#` dilewati, komentar di ujung baris juga dipotong.
+
+    Default `alchemy_keys.txt` di samping chain.py, bisa dipindah lewat
+    `ALCHEMY_KEY_FILE`. **WAJIB ada di .gitignore** — isinya kredensial, sama
+    seperti `proxies.txt`.
+
+    Di-cache dengan kunci `(mtime_ns, ukuran)` supaya key yang ditambahkan saat
+    bot jalan langsung terpakai tanpa restart, tapi filenya tidak dibaca ulang
+    tiap panggilan (`_chain_rpcs` memanggilnya di jalur failover)."""
+    pf = os.environ.get("ALCHEMY_KEY_FILE", "").strip() or str(Path(__file__).parent / "alchemy_keys.txt")
+    try:
+        st = os.stat(pf)
+        key = (pf, st.st_mtime_ns, st.st_size)
+    except OSError:
+        return []
+    if _cache.get("key") == key:
+        return _cache["val"]
+    out = []
+    try:
+        with open(pf) as fh:
+            for ln in fh:
+                ln = ln.split("#", 1)[0].strip()
+                if ln:
+                    out.append(ln)
+    except OSError:
+        return []
+    _cache["key"], _cache["val"] = key, out
+    return out
 
 
 def _alchemy_urls(cfg: dict) -> list[str]:

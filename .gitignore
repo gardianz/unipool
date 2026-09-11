@@ -25,3 +25,6 @@ wallets.json
 proxies.txt
 .history.lock
 history.json.*.tmp
+
+# API key Alchemy — jangan pernah di-commit
+alchemy_keys.txt

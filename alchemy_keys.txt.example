@@ -1,0 +1,18 @@
+# API key Alchemy — SATU KEY PER BARIS.
+# Salin file ini jadi `alchemy_keys.txt` (sudah ada di .gitignore) lalu isi.
+#
+# Tiap key jadi endpoint tersendiri di get_w3, dan kuota Alchemy dihitung
+# per-app — jadi N key = N jatah. Key yang kena 429 ditandai, dilewati 120
+# detik, dan panggilan berikutnya jalan lewat key berikutnya.
+#
+# Baris kosong dan yang diawali '#' dilewati. Komentar di ujung baris juga.
+# Boleh menempel URL penuh dari dashboard Alchemy — bagian setelah /v2/ yang
+# diambil, jadi dua bentuk di bawah sama saja.
+#
+# Gabung dengan .env (ALCHEMY_API_KEY / ALCHEMY_API_KEYS / ALCHEMY_API_KEY_2..10),
+# bukan menggantikan; duplikat dibuang otomatis.
+#
+# Pindah lokasi file: set ALCHEMY_KEY_FILE=/path/ke/file.txt
+
+# aBcD1234contoh-key-pertama
+# https://robinhood-mainnet.g.alchemy.com/v2/eFgH5678contoh-key-kedua
