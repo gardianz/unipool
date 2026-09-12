@@ -854,6 +854,53 @@ mencocokkan teks exception karena urllib3 menghabiskan retry lalu melempar
 Endpoint bertanda dilewati `_RPC_BAD_COOLDOWN` (120 detik), **tapi hanya kalau masih
 ada pilihan lain** supaya chain ber-RPC tunggal tidak jadi mati total.
 
+#### 429 Alchemy ada DUA jenis, dan bedanya menentukan segalanya
+
+Terukur pada key user: satu key menjawab **`Monthly capacity limit exceeded`**
+untuk SETIAP request — jatah bulanan habis, 100% gagal, tidak akan pulih sampai
+siklus billing berganti. Key satunya sehat: 40 request berurutan 1,10 detik,
+median 24 ms. Jadi "bot lambat" di chain itu sebagian besar adalah bot yang
+mencoba key mati berulang kali.
+
+`_rate_limit_kind()` membedakan `"quota"` dari `"burst"`, dan hukumannya beda
+jauh: `_RPC_DEAD_COOLDOWN` **6 jam** vs `_RPC_BAD_COOLDOWN` **15 detik**.
+Memperlakukan keduanya sama berarti key mati dicoba ulang tiap 2 menit selamanya,
+dan tiap percobaan duduk di jalur klik user. Key yang mati **dicatat di log satu
+kali** dengan nama (4 karakter terakhir) — dari luar gejalanya cuma "lambat", dan
+tidak ada perubahan kode yang bisa memperbaikinya.
+
+Burst 429 (throughput 300 CU/s) pulih dalam milidetik, jadi 15 detik sudah
+kebanyakan. Dulu 120 detik, disetel waktu kedua jenis ini belum dibedakan — di
+chain yang endpoint sehatnya cuma SATU itu berarti dua menit tanpa RPC layak.
+
+**`raise_on_status=False` WAJIB di `_rpc_retry()`.** Tanpa itu urllib3 melempar
+`RetryError` setelah retry status habis, dan objek itu TIDAK membawa response —
+body-nya hilang, dan body itulah satu-satunya yang membedakan kedua jenis 429.
+Dengan `False`, response 429 terakhir dikembalikan, `raise_for_status()` melempar
+`HTTPError` ber-`.response` utuh, dan `_rate_limit_kind()` bisa membacanya.
+
+#### Endpoint bermasalah DIURUTKAN, jangan dibuang
+
+`get_w3` dulu menyaring `fresh_rpcs` dan memakai hanya itu. Itu mematikan chain:
+eth-rpc Blockscout Robinhood menjawab **403 Cloudflare** ("Just a moment…"), dan
+403 **bukan** rate limit sehingga ia tidak pernah ditandai — jadi selamanya
+terhitung "segar", `fresh_rpcs` berisi dia saja, dan katup pengaman "kalau semua
+ditandai, pakai semua" TIDAK PERNAH terpicu. Key Alchemy sehat yang cuma kena
+burst kalah dari endpoint yang dijamin gagal, dan log penuh
+*"Semua RPC Robinhood gagal"* yang cuma menyebut blockscout.
+
+Sekarang `rpcs = sorted(rpcs, key=_bad_left)` — tidak ada yang dibuang, yang
+sehat selalu dicoba dulu, yang sedang dihukum tetap jadi cadangan terakhir. Gagal
+bukan-rate-limit (Cloudflare 403, SSL, timeout) ikut dihukum `_RPC_HARD_COOLDOWN`
+600 detik, jadi ia tenggelam sendiri ke dasar urutan.
+
+**Pesan gagalnya wajib menyebut SEBAB.** "HTTPError" saja memaksa user menebak,
+padahal tiga sebab tersering butuh tiga tindakan berbeda: jatah bulanan habis
+(tambah key / naikkan paket), Cloudflare menolak IP (pakai proxy/WARP), endpoint
+menggantung (tidak ada yang bisa dilakukan selain pindah). `_why()` menarik
+`error.message` dari body JSON-RPC dan mengenali halaman tantangan Cloudflare;
+`_short_rpc()` menyensor API key jadi 4 karakter terakhir supaya aman di log.
+
 #### 429 JANGAN pernah ditunggu — dua lapis retry sempat melakukannya
 
 Sumber utama "bot lambat sekali" yang terukur: **satu panggilan RPC yang kena 429

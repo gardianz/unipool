@@ -3,6 +3,7 @@ chain.py — Web3 core untuk LP bot: discovery pool, mint single-sided,
 listing posisi, close, dan auto-swap.
 DEX per chain: Uniswap v2/v3/v4 di Robinhood (4663), PancakeSwap v2/v3 di BSC (56).
 """
+import json
 import logging
 import math
 import os
@@ -857,8 +858,14 @@ def _rpc_retry() -> Retry:
     detik. Jadi: retry PENDEK untuk burst, rotasi endpoint untuk jatah yang
     benar-benar habis. `status=2` membatasi retry berbasis status saja; kegagalan
     koneksi/timeout tetap dapat jatah `total` penuh."""
+    # `raise_on_status=False` WAJIB: tanpa itu urllib3 melempar `RetryError` setelah
+    # retry status habis, dan objek itu TIDAK membawa response — body-nya hilang.
+    # Padahal body itulah yang membedakan "sibuk sebentar" dari
+    # `Monthly capacity limit exceeded`. Dengan False, response 429 terakhir
+    # dikembalikan apa adanya, `raise_for_status()` melempar `HTTPError` yang
+    # `.response`-nya utuh, dan `_rate_limit_kind()` bisa membacanya.
     return Retry(total=4, status=2, backoff_factor=0.25,
-                 status_forcelist=(429, 502, 503, 504),
+                 status_forcelist=(429, 502, 503, 504), raise_on_status=False,
                  allowed_methods=None, respect_retry_after_header=False)
 
 
@@ -1038,12 +1045,77 @@ def _alchemy_urls(cfg: dict) -> list[str]:
 
 _RPC_READ_TIMEOUT = 10              # detik; endpoint yang menggantung jangan ditunggu lama
 _RPC_BAD: dict[str, float] = {}     # url -> kapan terakhir kena rate limit
-_RPC_BAD_COOLDOWN = 120             # detik endpoint dilewati setelah 429
+# Burst 429 (throughput) pulih dalam MILIDETIK, jadi hukumannya pendek. Dulu 120
+# detik — disetel waktu jatah-habis dan sibuk-sesaat belum dibedakan — dan di chain
+# yang endpoint sehatnya cuma SATU itu berarti dua menit tanpa RPC yang layak,
+# kalah dari endpoint yang dijamin gagal. Jatah bulanan habis ditangani
+# `_RPC_DEAD_COOLDOWN`, bukan angka ini.
+_RPC_BAD_COOLDOWN = 15              # detik endpoint dilewati setelah 429 sesaat
+_RPC_HARD_COOLDOWN = 600            # gagal bukan-rate-limit (Cloudflare 403, SSL, timeout)
+_RPC_DEAD_COOLDOWN = 6 * 3600       # jatah BULANAN habis — tidak pulih hari ini
+_RPC_DEAD_SEEN: set = set()         # url yang sudah dilaporkan mati, supaya log tidak banjir
 _RPC_FAILOVER_MAX = 2               # endpoint lain yang dicoba dalam SATU panggilan
 _RPC_FAILOVER_TL = threading.local()  # penjaga: failover tidak boleh bersarang
 _UNI_EMPTY_TTL = 20                 # detik hasil indexer KOSONG boleh di-cache
 _SWR_MAX_STALE = 600                # detik hasil indexer boleh basi (disegarkan di latar)
 _FOREIGN_POOL_BUDGET = 12           # detik maks untuk pencarian pool ber-quote aneh
+
+
+def _err_body(e: Exception) -> str:
+    """Isi jawaban HTTP dari sebuah exception, kalau ada.
+
+    `raise_for_status()` melempar `HTTPError` yang pesannya cuma status code —
+    alasan sebenarnya ada di BODY. Untuk Alchemy itu bedanya antara "sibuk
+    sebentar" dan "jatah bulanan habis", dan dua hal itu butuh penanganan yang
+    sama sekali berbeda."""
+    r = getattr(e, "response", None)
+    if r is None:
+        return ""
+    try:
+        return (r.text or "")[:400]
+    except Exception:
+        return ""
+
+
+def _why(e: Exception) -> str:
+    """Sebab gagal yang bisa DIBACA user, dari body jawaban kalau ada.
+
+    "HTTPError" saja memaksa user menebak, padahal tiga sebab tersering butuh tiga
+    tindakan berbeda: jatah bulanan habis (tambah key / naikkan paket), Cloudflare
+    menolak IP (pakai proxy), atau endpoint menggantung (tidak ada yang bisa
+    dilakukan selain pindah)."""
+    body = _err_body(e).strip()
+    if body.startswith("{"):
+        try:
+            msg = (json.loads(body).get("error") or {}).get("message")
+            if msg:
+                return str(msg)[:110]
+        except Exception:
+            pass
+    low = body.lower()
+    if "just a moment" in low or "<!doctype html" in low:
+        return "ditolak Cloudflare (403) — butuh proxy/WARP"
+    if body:
+        return body[:110]
+    return f"{type(e).__name__}: {e}".strip()[:110]
+
+
+def _rate_limit_kind(e: Exception) -> str | None:
+    """`"quota"` | `"burst"` | None.
+
+    **Membedakan keduanya itu wajib.** Alchemy membalas 429 untuk DUA hal yang
+    sangat berbeda: throughput sesaat (pulih dalam milidetik) dan
+    *"Monthly capacity limit exceeded"* — jatah bulanan habis, yang TIDAK akan
+    pulih sampai siklus billing berganti. Memperlakukan keduanya sama berarti key
+    mati dicoba ulang tiap `_RPC_BAD_COOLDOWN` (120 detik) selamanya, dan tiap
+    percobaan itu duduk di jalur klik user. Terukur pada key user: SETIAP request
+    balas 429 `Monthly capacity limit exceeded`, 100% gagal."""
+    s = f"{type(e).__name__}: {e} {_err_body(e)}".lower()
+    if "capacity limit" in s or "monthly capacity" in s or "quota" in s:
+        return "quota"
+    if "429" in s or "too many request" in s or "rate limit" in s or "rate-limit" in s:
+        return "burst"
+    return None
 
 
 def _is_rate_limited(e: Exception) -> bool:
@@ -1052,8 +1124,47 @@ def _is_rate_limited(e: Exception) -> bool:
     urllib3 menghabiskan retry lalu melempar `MaxRetryError`/`RetryError` yang
     pesannya "too many 429 error responses" — bukan objek HTTP yang bisa dibaca
     status code-nya. Sebagian RPC membalas 429 sebagai error JSON-RPC biasa."""
-    s = f"{type(e).__name__}: {e}".lower()
-    return "429" in s or "too many request" in s or "rate limit" in s or "rate-limit" in s
+    return _rate_limit_kind(e) is not None
+
+
+def _cooldown_for(e: Exception) -> float:
+    """Berapa lama endpoint ini pantas dilewati, dari SEBAB gagalnya."""
+    kind = _rate_limit_kind(e)
+    if kind == "quota":
+        return _RPC_DEAD_COOLDOWN
+    if kind == "burst":
+        return _RPC_BAD_COOLDOWN
+    return _RPC_HARD_COOLDOWN
+
+
+def _note_bad(url: str, e: Exception) -> None:
+    """Catat endpoint gagal + lamanya dilewati, dan LAPORKAN yang mati sekali saja.
+
+    Key yang jatah bulanannya habis wajib kelihatan di log: dari luar gejalanya
+    cuma "bot lambat", dan tidak ada perubahan kode yang bisa memperbaikinya —
+    user harus menambah key atau menaikkan paket."""
+    _RPC_BAD[url] = (time.time(), _cooldown_for(e))
+    if _rate_limit_kind(e) == "quota" and url not in _RPC_DEAD_SEEN:
+        _RPC_DEAD_SEEN.add(url)
+        log.warning("RPC %s JATAH BULANANNYA HABIS (%s) — dilewati %d jam. "
+                    "Tambah API key di alchemy_keys.txt atau naikkan paket.",
+                    _short_rpc(url), _why(e), _RPC_DEAD_COOLDOWN // 3600)
+
+
+def _short_rpc(url: str) -> str:
+    """URL RPC tanpa API key penuh — aman ditulis ke log/pesan user."""
+    if "/v2/" in url:
+        host, key = url.split("/v2/", 1)
+        return f"{host}/v2/…{key[-4:]}"
+    return url
+
+
+def _bad_left(url: str) -> float:
+    """Sisa detik endpoint ini masih dilewati (0 = boleh dipakai)."""
+    hit = _RPC_BAD.get(url)
+    if not hit:
+        return 0.0
+    return max(0.0, hit[0] + hit[1] - time.time())
 
 
 class _Provider(Web3.HTTPProvider):
@@ -1070,8 +1181,8 @@ class _Provider(Web3.HTTPProvider):
         self._chain_id = _chain_id
         super().__init__(*a, **kw)
 
-    def _mark_bad(self, uri: str) -> None:
-        _RPC_BAD[uri] = time.time()
+    def _mark_bad(self, uri: str, e: Exception) -> None:
+        _note_bad(uri, e)
         hit = _W3_CACHE.get(self._chain_id)
         if hit and getattr(hit[0].provider, "endpoint_uri", None) == uri:
             _W3_CACHE.pop(self._chain_id, None)
@@ -1089,7 +1200,7 @@ class _Provider(Web3.HTTPProvider):
             # menandai sendiri endpoint yang benar-benar dicoba.
             if getattr(_RPC_FAILOVER_TL, "busy", False):
                 raise
-            self._mark_bad(self.endpoint_uri)
+            self._mark_bad(self.endpoint_uri, e)
             if self._chain_id is None:
                 raise
             # Menandai endpoint saja TIDAK cukup: panggilan INI tetap gagal, dan
@@ -1109,7 +1220,7 @@ class _Provider(Web3.HTTPProvider):
             try:
                 hops = 0
                 for uri in _chain_rpcs(self._chain_id):
-                    if uri in seen or time.time() - _RPC_BAD.get(uri, 0) <= _RPC_BAD_COOLDOWN:
+                    if uri in seen or _bad_left(uri) > 0:
                         continue
                     seen.add(uri)
                     hops += 1
@@ -1121,7 +1232,7 @@ class _Provider(Web3.HTTPProvider):
                     except Exception as e2:
                         if not _is_rate_limited(e2):
                             raise
-                        _RPC_BAD[uri] = time.time()
+                        _note_bad(uri, e2)
                     if hops >= _RPC_FAILOVER_MAX:
                         break
                 raise
@@ -1151,11 +1262,16 @@ def get_w3(chain_id: int, fresh: bool = False) -> Web3:
         return hit[0]
     rpcs = _chain_rpcs(chain_id)
     cfg = CHAINS[chain_id]
-    # Endpoint yang baru saja kehabisan jatah dilewati dulu — tapi hanya kalau masih
-    # ada pilihan lain, supaya chain ber-RPC tunggal tidak jadi mati total.
-    fresh_rpcs = [r for r in rpcs if time.time() - _RPC_BAD.get(r, 0) > _RPC_BAD_COOLDOWN]
-    if fresh_rpcs:
-        rpcs = fresh_rpcs
+    # Endpoint bermasalah DIURUTKAN ke belakang, TIDAK dibuang. Membuangnya pernah
+    # mematikan chain: eth-rpc Blockscout Robinhood menjawab **403 Cloudflare**
+    # ("Just a moment…"), dan 403 bukan rate limit sehingga dulu ia tidak pernah
+    # ditandai — jadi ia selalu terhitung "segar", `fresh_rpcs` berisi dia saja, dan
+    # katup pengaman "kalau semua ditandai, pakai semua" TIDAK PERNAH terpicu.
+    # Akibatnya key Alchemy yang cuma kena burst 120 detik kalah dari endpoint yang
+    # dijamin gagal, dan log penuh "Semua RPC <chain> gagal" yang cuma menyebut
+    # blockscout. Dengan pengurutan, yang sehat selalu dicoba lebih dulu dan yang
+    # sedang dihukum tetap jadi cadangan terakhir.
+    rpcs = sorted(rpcs, key=_bad_left)
     errs = []
     # Probe `eth_chainId` di bawah lewat `_Provider` juga. Tanpa penanda ini, tiap
     # kandidat yang kebetulan kena 429 saat diprobe ikut ditandai `_RPC_BAD` dan
@@ -1214,9 +1330,13 @@ def _get_w3_scan(chain_id: int, cfg: dict, rpcs: list[str], errs: list[str]) -> 
                     return w3
                 errs.append(f"{rpc}: chain_id salah")
             except Exception as e:
-                errs.append(f"{rpc}{' (via IP)' if i else ''}: {type(e).__name__}")
-                # koneksi normal gagal → coba bypass DNS ISP via DoH + IP langsung
+                # Sebab gagalnya WAJIB ikut: "HTTPError" saja memaksa user menebak,
+                # padahal bedanya besar — 403 Cloudflare, jatah bulanan habis, atau
+                # timeout adalah tiga masalah dengan tiga solusi berbeda.
+                errs.append(f"{_short_rpc(rpc)}{' (via IP)' if i else ''}: {_why(e)}")
                 if i == 0:
+                    _note_bad(rpc, e)
+                    # koneksi normal gagal → coba bypass DNS ISP via DoH + IP langsung
                     forced = _forced_ip_w3(rpc)
                     if forced is not None:
                         candidates.append(forced)
