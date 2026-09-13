@@ -174,9 +174,47 @@ Persetujuan itu menaikkan ambang untuk KARTU ITU saja lewat `ctx["max_impact"]` 
 Terukur di pool BODKIN saat tebal: 0,0104 ETH → 0,2%, 0,5 → 4,7%, 2,0 → 38,5%,
 8,0 → 84,6%. Jadi swap normal tidak terganggu dan yang besar tetap minta izin.
 
-Belum dikerjakan: merutekan swap komposisi ke pool LAIN yang lebih dalam.
-`swap_any`/`swap_route`/`find_pool_dex` yang sudah ada hanya melayani v3 —
-untuk v4 swapnya selalu di pool tujuan.
+### Swap v4 dirutekan ke pool TERBAIK, dan patokannya quoter
+
+`v4_swap(..., route=True)` (default) memilih pool terbaik untuk jumlah itu, bukan
+selalu pool posisi. Dulu swap komposisi (mint) dan auto-swap (close) selalu jalan
+di pool posisi sendiri, jadi posisi di pool kecil DIJAMIN membayar price impact
+besar saat keluar — terjadi berulang ke user, terukur di close BLAST/ETH: biaya
+swap **7,3%**.
+
+**Patokannya hasil `quoteExactInputSingle`, BUKAN TVL.** Quoter memasukkan fee DAN
+price impact sekaligus, jadi ia satu-satunya angka yang sebanding antar pool. TVL
+sebagai patokan salah, dan salahnya besar — terukur pada microduck di Robinhood
+untuk swap 100.000 token:
+
+| pasangan | pool ber-TVL terbesar | pool terbaik menurut quoter | selisih |
+|---|---|---|---|
+| USDG | fee 5%, TVL $224.388 | fee 0,78%, TVL $175.345 | **+135,8%** |
+| ETH native | fee 3,2%, TVL $963 | fee 1,0024%, TVL $71.503 | +72% |
+
+Memilih lewat TVL berarti membuang lebih dari separuh hasil swap.
+
+Empat syarat, jangan dilemahkan:
+
+- **Pasangan currency harus PERSIS sama.** Merutekan ke pool ber-quote lain
+  mengubah token yang diterima user, padahal kartu sudah menjanjikan yang satunya
+  dan pemanggil membaca delta saldo token itu.
+- **Kandidat dari `discover_any()`**, yang tiap pool-nya sudah diverifikasi lewat
+  hash PoolKey — jadi aman dipakai membangun transaksi. Pool ber-hooks tidak pernah
+  lolos hash, dan quoter-nya juga revert; dua-duanya memang tidak diinginkan.
+- **Daftar kandidat di-cache `_V4_ROUTE_TTL` (600 detik).** Discovery terukur ~2,3
+  detik bahkan saat hangat, sedangkan quote 12 pool paralel cuma **0,09 detik** —
+  jadi yang mahal pencarian kandidatnya, bukan quote-nya. Sesudah cache: 0,000s.
+- **Kegagalan routing TIDAK boleh membatalkan swap** — apa pun yang salah,
+  kembalikan pool asal.
+
+`swap_impact_v4(..., route=True)` memakai pool yang SAMA dengan yang akan
+dieksekusi. Tanpa itu kartu menampilkan impact pool posisi sedangkan swapnya di
+pool lain — terukur pada pasangan yang sama: kartu menulis **58,1%** padahal yang
+benar-benar terjadi **0,7%**.
+
+`swap_any`/`swap_route`/`find_pool_dex` tetap hanya melayani v3; routing v4 berdiri
+sendiri karena pool v4 tidak bisa dienumerasi on-chain.
 
 **Jangan simpulkan "pool-nya beda" dari keadaan pool yang berubah.** poolId swap dan
 poolId posisi di kasus itu SAMA; yang beda adalah keadaan pool sesudah swap

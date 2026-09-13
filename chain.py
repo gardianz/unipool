@@ -6289,14 +6289,24 @@ def _v4_unlock(actions: list[int], params: list[bytes]) -> bytes:
 _V4_POOLKEY_T = "(address,address,uint24,int24,address)"
 
 
-def swap_impact_v4(chain_id: int, key: tuple, token_in: str, amount_in: int) -> float | None:
+def swap_impact_v4(chain_id: int, key: tuple, token_in: str, amount_in: int,
+                   route: bool = True) -> float | None:
     """Perkiraan price impact swap v4 (0..1). None kalau tak bisa dihitung.
 
     Dipakai kartu konfirmasi supaya user melihat angkanya SEBELUM menekan tombol —
     bukan ditolak diam-diam saat eksekusi. Impact = selisih hasil quoter terhadap
     hasil harga spot yang sudah dipotong fee, jadi fee pool TIDAK dihitung sebagai
-    impact."""
+    impact.
+
+    `route=True` memakai pool yang BENAR-BENAR akan dipakai `v4_swap` — kalau tidak,
+    kartu menampilkan impact pool posisi sedangkan eksekusinya di pool lain, dan
+    angka di kartu jadi bohong."""
     try:
+        if route:
+            cands = _v4_route_keys(chain_id, key[0], key[1], tuple(key))
+            best, _out = v4_pick_pool(chain_id, cands, token_in, amount_in)
+            if best:
+                key = tuple(best)
         w3 = get_w3(chain_id)
         sqrtp, _ = v4_slot0(w3, chain_id, v4_pool_id(key))
         zero_for_one = token_in.lower() == key[0].lower()
@@ -6314,16 +6324,118 @@ def swap_impact_v4(chain_id: int, key: tuple, token_in: str, amount_in: int) -> 
         return None
 
 
+_V4_ROUTE_TTL = 600      # detik daftar pool kandidat rute dipakai ulang
+_V4_ROUTE_MAX = 12       # pool yang di-quote (urut TVL) — quote-nya paralel & murah
+
+
+def _v4_route_keys(chain_id: int, c0: str, c1: str, given: tuple, _cache={}) -> list[tuple]:
+    """PoolKey v4 LAIN untuk pasangan currency yang sama.
+
+    Wajib pasangan PERSIS sama supaya user menerima token yang sama seperti yang
+    dijanjikan kartu — merutekan ke pool ber-quote lain akan mengubah hasilnya.
+
+    Sumbernya `discover_any()` (semua pool sudah diverifikasi hash PoolKey di sana,
+    jadi aman dipakai membangun transaksi) dan hasilnya di-cache: discovery terukur
+    ~5 detik bahkan saat hangat, sedangkan quote-nya cuma 0,18 detik untuk 12 pool.
+    Gagal apa pun mengembalikan `[given]` — routing tidak boleh sampai membatalkan
+    swap-nya."""
+    a, b = sorted((_norm_currency(c0).lower(), _norm_currency(c1).lower()))
+    ck = (chain_id, a, b)
+    hit = _cache.get(ck)
+    if hit and time.time() - hit[1] < _V4_ROUTE_TTL:
+        keys = hit[0]
+    else:
+        try:
+            cfg = CHAINS[chain_id]
+            quotes = {str(v).lower() for v in (cfg.get("quotes") or {}).values()}
+            quotes |= {str(cfg.get("wrapped", "")).lower(), V4_NATIVE}
+            probe = b if a in quotes else a          # sisi meme yang dicari di discovery
+            res = discover_any(chain_id, Web3.to_checksum_address(probe)
+                               if probe != V4_NATIVE else cfg["wrapped"])
+            found = []
+            for p in res.get("pools") or []:
+                if p.get("ver") != 4 or not p.get("key"):
+                    continue
+                k = tuple(p["key"])
+                if sorted((_norm_currency(k[0]).lower(), _norm_currency(k[1]).lower())) != [a, b]:
+                    continue
+                found.append((p.get("tvl_usd") or 0, k))
+            found.sort(key=lambda r: -r[0])
+            keys = [k for _, k in found[:_V4_ROUTE_MAX]]
+            _cache[ck] = (keys, time.time())
+        except Exception as e:
+            log.warning("cari rute v4 %s/%s: %s", a[:10], b[:10], e)
+            return [given]
+    out = [given] + [k for k in keys if tuple(k) != tuple(given)]
+    return out[:_V4_ROUTE_MAX + 1]
+
+
+def v4_pick_pool(chain_id: int, keys: list, token_in: str, amount_in: int) -> tuple:
+    """(key terbaik, hasil quoter) — pool dengan HASIL TERBESAR untuk jumlah ini.
+
+    **Patokannya quoter, bukan TVL.** Quoter memasukkan fee DAN price impact
+    sekaligus, jadi ia satu-satunya angka yang sebanding antar pool. TVL sebagai
+    patokan SALAH dan salahnya besar: terukur pada microduck/USDG di Robinhood,
+    pool ber-TVL terbesar ($224.388, fee 5%) memberi **57,7% lebih sedikit** dari
+    pool fee 0,78% ber-TVL $175.345 — memilih lewat TVL berarti membuang lebih
+    dari separuh hasil swap. Pasangan ETH-nya sama: pool $963 vs $71.503, −41,9%.
+
+    Pool yang quoter-nya revert (belum diinisialisasi / ber-hooks) dilewati, dan
+    itu memang yang diinginkan."""
+    if not keys:
+        return None, 0
+    w3 = get_w3(chain_id)
+    qt = _v4c(w3, chain_id, "v4_quoter", V4_QUOTER_ABI)
+    amt = min(int(amount_in), MAX_UINT128)
+
+    def q(k):
+        try:
+            zfo = token_in.lower() == k[0].lower()
+            return int(qt.functions.quoteExactInputSingle((tuple(k), zfo, amt, b"")).call()[0])
+        except Exception:
+            return 0
+
+    ex = ThreadPoolExecutor(max_workers=min(8, len(keys)))
+    try:
+        outs = list(ex.map(q, keys))
+    finally:
+        ex.shutdown(wait=False)
+    best_i = max(range(len(keys)), key=lambda i: outs[i])
+    return (keys[best_i], outs[best_i]) if outs[best_i] > 0 else (None, 0)
+
+
 def v4_swap(chain_id: int, pk: str, key: tuple, token_in: str, amount_in: int,
-            slippage_pct: float, max_impact: float | None = None) -> str | None:
+            slippage_pct: float, max_impact: float | None = None,
+            route: bool = True) -> str | None:
     """Swap exact-in single via UniversalRouter (command V4_SWAP).
-    minOut dihitung dari harga pool sekarang − slippage."""
+    minOut dihitung dari hasil quoter − slippage.
+
+    `route=True` memilih pool TERDALAM untuk jumlah ini, bukan selalu pool posisi.
+    Dulu swap komposisi (mint) dan auto-swap (close) selalu dieksekusi di pool
+    posisi itu sendiri, jadi posisi di pool kecil selalu membayar price impact
+    besar saat keluar — terjadi berulang ke user (terukur di close BLAST/ETH:
+    biaya swap **7,3%**). Pool tujuannya WAJIB berpasangan currency sama, jadi
+    token yang diterima tetap sama persis."""
     if amount_in <= 0:
         return None
     w3 = get_w3(chain_id)
     cfg = CHAINS[chain_id]
     if not verify_v4(w3, chain_id):
         raise RuntimeError("Kontrak V4 gagal verifikasi on-chain — swap dibatalkan.")
+    if route:
+        try:
+            cands = _v4_route_keys(chain_id, key[0], key[1], tuple(key))
+            if len(cands) > 1:
+                best, best_out = v4_pick_pool(chain_id, cands, token_in, amount_in)
+                if best and tuple(best) != tuple(key):
+                    _, here = v4_pick_pool(chain_id, [tuple(key)], token_in, amount_in)
+                    if best_out > here:
+                        _step(f"rute swap: pool fee {best[2] / 1e4:g}% "
+                              f"(+{(best_out / here - 1) * 100:.1f}% vs pool posisi)"
+                              if here else f"rute swap: pool fee {best[2] / 1e4:g}%")
+                        key = tuple(best)
+        except Exception as e:      # routing tidak boleh membatalkan swap
+            log.warning("rute swap v4: %s", e)
     account = w3.eth.account.from_key(pk)
     ur_addr = Web3.to_checksum_address(cfg["v4_router"])
     ur = _v4c(w3, chain_id, "v4_router", V4_UR_ABI)
