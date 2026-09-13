@@ -6166,6 +6166,39 @@ def v4_slot0(w3: Web3, chain_id: int, pool_id: bytes) -> tuple[int, int]:
     return s[0], s[1]
 
 
+def v4_fee_ppm(w3: Web3, chain_id: int, pool_id: bytes, zero_for_one: bool,
+               fallback: int = 0) -> int:
+    """Fee swap SEBENARNYA pool v4 (ppm) = LP fee + protocol fee.
+
+    **`key[2]` bukan fee yang benar-benar dibayar**, dua sebab:
+
+    - **Protocol fee duduk DI ATAS LP fee** dan tidak ada di PoolKey. Terukur pada
+      BLAST/USDG Robinhood: PoolKey 48900 (4,8900%) sedangkan event `Swap`
+      mengemisikan **49852 (4,9852%)** — selisihnya protocol fee 0,1%. Kartu yang
+      memakai `key[2]` karena itu selalu MENGECILKAN fee, dan selisihnya masuk ke
+      angka "price impact" yang jadi terlihat lebih besar dari kenyataan.
+    - **Fee dinamis** (`key[2] >= 0x800000`) sama sekali tidak punya nilai di
+      PoolKey; yang berlaku disimpan pool dan berubah tiap saat. `slot0.lpFee`
+      selalu berisi nilai yang SEDANG berlaku, jadi membacanya dari sana menangani
+      kedua kasus sekaligus. (Pool ber-fee dinamis WAJIB punya hook di v4, dan bot
+      melewati semua pool ber-hooks — jadi ini jaring pengaman, bukan jalur utama.)
+
+    Rumus gabungannya persis `ProtocolFeeLibrary.calculateSwapFee` Uniswap:
+    `p + lp − (p × lp) / 1e6`. Terbukti: 1000 + 48900 − 48 = **49852**, cocok
+    dengan event. Protocol fee berbeda per ARAH — 12 bit bawah untuk
+    zeroForOne, 12 bit atas untuk oneForZero."""
+    try:
+        sv = _v4c(w3, chain_id, "v4_stateview", V4_STATEVIEW_ABI)
+        _sq, _tk, pfee, lpfee = sv.functions.getSlot0(pool_id).call()
+        p = (pfee & 0xFFF) if zero_for_one else ((pfee >> 12) & 0xFFF)
+        lp = int(lpfee)
+        if lp <= 0 and fallback:
+            lp = fallback
+        return int(p + lp - (p * lp) // 1_000_000)
+    except Exception:
+        return int(fallback)
+
+
 def _v4_currency_info(w3: Web3, chain_id: int, cur: str) -> dict:
     if cur.lower() == V4_NATIVE:
         cfg = CHAINS[chain_id]
@@ -6349,14 +6382,18 @@ def swap_impact_v4(chain_id: int, key: tuple, token_in: str, amount_in: int,
             if best:
                 key = tuple(best)
         w3 = get_w3(chain_id)
-        sqrtp, _ = v4_slot0(w3, chain_id, v4_pool_id(key))
+        pid_ = v4_pool_id(key)
+        sqrtp, _ = v4_slot0(w3, chain_id, pid_)
         zero_for_one = token_in.lower() == key[0].lower()
         qt = _v4c(w3, chain_id, "v4_quoter", V4_QUOTER_ABI)
         out = qt.functions.quoteExactInputSingle(
             (tuple(key), zero_for_one, min(amount_in, MAX_UINT128), b"")).call()[0]
         raw = (sqrtp / Q96) ** 2
         spot = amount_in * raw if zero_for_one else (amount_in / raw if raw else 0)
-        fee_ppm = key[2] if key[2] < 0x800000 else 0
+        # fee NYATA (LP + protocol), bukan key[2]: kalau tidak, protocol fee
+        # terhitung sebagai price impact dan angkanya jadi lebih besar dari kenyataan
+        fee_ppm = v4_fee_ppm(w3, chain_id, pid_, zero_for_one,
+                             key[2] if key[2] < 0x800000 else 0)
         spot = spot * (1 - fee_ppm / 1e6)
         if spot <= 0 or out <= 0:
             return None
@@ -6482,7 +6519,9 @@ def v4_swap(chain_id: int, pk: str, key: tuple, token_in: str, amount_in: int,
         # wajib memakai ini, bukan pool yang ia kirim: kalau routing pindah pool,
         # fee dan harga spot pembandingnya juga ikut pindah.
         out["key"] = tuple(key)
-        out["fee_ppm"] = key[2] if key[2] < 0x800000 else 0
+        out["fee_ppm"] = v4_fee_ppm(w3, chain_id, v4_pool_id(key),
+                                    token_in.lower() == key[0].lower(),
+                                    key[2] if key[2] < 0x800000 else 0)
     account = w3.eth.account.from_key(pk)
     ur_addr = Web3.to_checksum_address(cfg["v4_router"])
     ur = _v4c(w3, chain_id, "v4_router", V4_UR_ABI)
@@ -6504,7 +6543,8 @@ def v4_swap(chain_id: int, pk: str, key: tuple, token_in: str, amount_in: int,
         # Quoter gagal (mis. fee dinamis) → harga spot dikurangi fee statis kalau ada.
         raw = (sqrtp / Q96) ** 2  # c1 per c0
         spot = amount_in * raw if zero_for_one else (amount_in / raw if raw else 0)
-        fee_ppm = key[2] if key[2] < 0x800000 else 0
+        fee_ppm = v4_fee_ppm(w3, chain_id, pid, zero_for_one,
+                             key[2] if key[2] < 0x800000 else 0)
         out_est = spot * (1 - fee_ppm / 1e6)
     # PRICE IMPACT: quoter sudah memasukkan dampak harga, jadi minOut TIDAK
     # melindungi dari swap yang memang rugi besar — impact seberapa pun akan lolos.
@@ -6515,7 +6555,8 @@ def v4_swap(chain_id: int, pk: str, key: tuple, token_in: str, amount_in: int,
     # dari $25 menguap jadi price impact.
     raw_now = (sqrtp / Q96) ** 2
     spot_out = amount_in * raw_now if zero_for_one else (amount_in / raw_now if raw_now else 0)
-    fee_ppm_ = key[2] if key[2] < 0x800000 else 0
+    fee_ppm_ = v4_fee_ppm(w3, chain_id, pid, zero_for_one,
+                          key[2] if key[2] < 0x800000 else 0)
     spot_after_fee = spot_out * (1 - fee_ppm_ / 1e6)
     if spot_after_fee > 0 and out_est > 0:
         impact = 1 - out_est / spot_after_fee
@@ -7462,7 +7503,9 @@ def close_v4(chain_id: int, pk: str, tid: int, slippage_pct: float, autoswap: bo
                     sq_b, _ = v4_slot0(w3, chain_id, v4_pool_id(ukey))
                     raw_b = (sq_b / Q96) ** 2
                     mq = raw_b if q_is_t1 else (1 / raw_b if raw_b else 0)
-                    fee_ppm = info.get("fee_ppm", ukey[2] if ukey[2] < 0x800000 else 0)
+                    fee_ppm = info.get("fee_ppm") or v4_fee_ppm(
+                        w3, chain_id, v4_pool_id(ukey), meme.lower() == ukey[0].lower(),
+                        ukey[2] if ukey[2] < 0x800000 else 0)
                     ideal_q = int(bal * mq)                     # tanpa fee, tanpa impact
                     got_q = max(0, _qbal() - pre_q)
                     # Quote NATIVE: delta saldo ikut terpotong gas tx swap itu sendiri,

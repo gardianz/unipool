@@ -312,6 +312,38 @@ tindakannya beda: fee pool cuma bisa dihindari dengan pindah pool (dan routing
 sudah memilih yang termurah), sedangkan impact dikecilkan dengan memperkecil
 jumlah swap.
 
+**`key[2]` BUKAN fee yang benar-benar dibayar — pakai `v4_fee_ppm()`.** Dua sebab,
+dan yang pertama mengenai SEMUA pool:
+
+- **Protocol fee duduk DI ATAS LP fee** dan tidak ada di PoolKey. Terukur pada dua
+  pool Robinhood, dibandingkan dengan field `fee` di event `Swap` on-chain:
+
+  | pool | `key[2]` | `slot0.lpFee` | protocolFee | fee NYATA (event) |
+  |---|---|---|---|---|
+  | BLAST/USDG | 48900 (4,8900%) | 48900 | 1000 (0,1%) | **49852 (4,9852%)** |
+  | BLAST/ETH | 40000 (4,0000%) | 40000 | 1000 (0,1%) | **40960 (4,0960%)** |
+
+  Kartu yang memakai `key[2]` karena itu selalu MENGECILKAN fee, dan selisihnya
+  bocor ke angka "price impact" yang jadi terlihat lebih besar dari kenyataan
+  (terukur pada close BLAST/USDG: impact dilaporkan 0,19% padahal 0,09%).
+
+- **Fee dinamis** (`key[2] >= 0x800000`) sama sekali tidak punya nilai di PoolKey.
+  `slot0.lpFee` selalu berisi yang SEDANG berlaku, jadi membacanya dari sana
+  menangani kedua kasus sekaligus. Pool ber-fee dinamis di v4 **wajib punya hook**,
+  dan bot melewati semua pool ber-hooks — jadi ini jaring pengaman, bukan jalur
+  utama. Jangan simpulkan "pool v4 fee-nya dinamis jadi angkanya tidak bisa
+  dipastikan": untuk pool yang bot pakai, fee-nya statis dan terbaca pasti.
+
+Rumus gabungannya persis `ProtocolFeeLibrary.calculateSwapFee` Uniswap:
+`p + lp − (p × lp) / 1e6` — **bukan** `p + lp × (1 − p)`. Terbukti:
+`1000 + 48900 − 48 = 49852`, cocok dengan event; rumus yang salah memberi 49851.
+Protocol fee berbeda per ARAH: 12 bit bawah untuk zeroForOne, 12 bit atas untuk
+oneForZero.
+
+Dipakai di EMPAT tempat yang semuanya dulu memakai `key[2]`: penjaga price impact
+`v4_swap`, fallback minOut saat quoter gagal, `swap_impact_v4` (kartu), dan
+`fee_ppm` yang dilaporkan `close_v4`.
+
 **Quote NATIVE: `got` dari delta saldo ikut terpotong GAS tx swap itu sendiri.**
 Terukur 0,0000124 ETH = 0,14% pada swap $22 — dan makin kecil swapnya makin besar
 porsinya. `close_v4` menambahkan `gasUsed × effectiveGasPrice` kembali.
