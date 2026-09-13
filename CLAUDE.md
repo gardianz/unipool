@@ -2198,6 +2198,55 @@ Private key lewat chat itu permanen di riwayat Telegram, jadi: pesan impor dihap
 begitu dibaca, hasil ekspor dihapus otomatis 60 detik (`_autodelete()`), dan ekspor
 maupun hapus selalu dua langkah dengan peringatan. Jangan hilangkan penjagaan itu.
 
+### Jembatan alert token trending (lp-scanner / GMGN)
+
+Scanner GMGN adalah **proses dan repo TERPISAH**
+(`alert/`, github.com/gardianz/lp-scanner — di-`.gitignore` di sini, bukan
+submodule). Ia menulis kandidat yang lolos saringannya ke file JSONL; bot ini
+membacanya, mencari pool, menghitung saran posisi, lalu mengirim kartu bertombol
+yang masuk ke **alur konfirmasi mint yang sudah ada**.
+
+`LP_ALERT_INBOX` di kedua sisi harus menunjuk file yang sama. Tanpa env itu,
+jembatannya mati total dan tidak ada perilaku yang berubah.
+
+**Mint tetap manual.** Jalur ini tidak pernah mengirim transaksi — ia berhenti di
+kartu pool yang sama persis dengan hasil tempel-CA manual (`show_pools_for`,
+tombol `pool|<key>`). Konsekuensinya tidak ada jalur transaksi baru yang perlu
+diuji ulang, dan itu memang tujuannya.
+
+- **File, bukan HTTP.** Dua proses restart sendiri-sendiri; tidak perlu port,
+  token, atau salah satunya hidup. `_lp_take()` mengambil isinya lewat
+  `os.replace()` lalu mengosongkan — penulis membuka file lewat PATH tiap append,
+  jadi sesudah rename ia membuat file baru dan tidak ada baris yang tertimpa. Sisa
+  `.taking` dari proses yang mati di tengah dibaca duluan supaya kandidat tidak
+  hilang gara-gara restart.
+- **Chain dipetakan lewat `CHAINS[cid]["gmgn"]`**, bukan tabel baru. Slug yang
+  tidak punya padanan (`sol`, `eth`, `arbitrum`, …) dilewati — scanner sudah
+  menyaringnya juga, ini lapis kedua.
+- **Redaman ganda `_LP_SEEN`.** Scanner punya cooldown sendiri, tapi restart-nya
+  mengosongkan state; tanpa lapis ini satu restart bisa membanjiri chat dengan
+  token yang sama.
+
+**Saran posisi hanya dari yang benar-benar diukur.** `lp_suggestion()` menyebut
+dasar tiap angkanya:
+
+- **Pool** dari discovery bot sendiri (sudah diverifikasi on-chain), bukan dari
+  GMGN. Ditunjuk dua: terdalam dan APR-terbaik.
+- **APR pool debu TIDAK pernah ditunjuk.** APR dihitung ÷TVL, jadi pool $800
+  dengan sedikit volume selalu mengalahkan pool $150k — terukur 40.899% vs 1.587%
+  pada microduck. Kandidat dibatasi ke TVL ≥ `_LP_APR_MIN_SHARE` (20%) pool
+  terdalam, dan yang terbuang **tetap disebut berikut alasannya**, bukan
+  dihilangkan diam-diam.
+- **Mode range** dari `recommend_strategy()` yang mengukur volatilitas pool lewat
+  oracle TWAP. Pool v4 tidak punya oracle itu — kalau tidak terukur, kartu
+  MENGATAKAN tidak terukur, bukan diganti tebakan.
+- **Kelayakan lebar range** itu aritmetika lurus dari gerak harga yang dilaporkan
+  GMGN pada interval alert: berapa kali gerakan sebesar itu, searah, sampai harga
+  keluar range. Bukan model apa pun.
+- **Likuiditas GMGN vs TVL per-pool** disilang-cek dan selisih besar disebutkan —
+  GMGN menjumlah semua pool token itu, bot menghitung per-pool. Dua sumber yang
+  tidak sepakat adalah informasi, bukan gangguan.
+
 ## Batasan yang disengaja
 
 - Pool v4 **ber-hooks dilewati** (hook = kode arbitrer, risiko rug). Jumlahnya

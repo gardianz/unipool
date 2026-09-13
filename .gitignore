@@ -28,3 +28,9 @@ history.json.*.tmp
 
 # API key Alchemy — jangan pernah di-commit
 alchemy_keys.txt
+
+# Scanner token trending — repo TERPISAH (github.com/gardianz/lp-scanner),
+# bukan submodule. Disambung lewat file JSONL LP_ALERT_INBOX.
+alert/
+lp-inbox.jsonl
+lp-inbox.jsonl.taking

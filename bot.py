@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 import functools
 import html
 import logging
+import json
 import math
 import os
 import re
@@ -1274,9 +1275,14 @@ async def on_address(update: Update, _):
     await show_pools_for(status, cid, token)
 
 
-async def show_pools_for(status, cid: int, token: str):
+async def show_pools_for(status, cid: int, token: str, extra: dict | None = None):
     """Discovery + daftar pool untuk (chain, token). Dipisah dari on_address supaya
-    tombol pilih-chain bisa memakai jalur yang sama persis."""
+    tombol pilih-chain bisa memakai jalur yang sama persis.
+
+    `extra` = entri alert token trending (lihat `_lp_alert`). Kalau ada, saran
+    posisi ikut ditempel di kartu. Jalur tombolnya TIDAK berubah sama sekali —
+    alert masuk ke alur konfirmasi mint yang sudah ada, jadi tidak ada jalur
+    transaksi baru yang perlu diuji ulang."""
     s = store.load_settings()
     cfg = ch.CHAINS[cid]
     amount_desc = f"amount {s['amount_fixed']} fix" if s["amount_fixed"] else f"amount {s['amount_pct']}%"
@@ -1381,7 +1387,13 @@ async def show_pools_for(status, cid: int, token: str):
             f"<pre>{esc(chr(10).join(rows))}</pre>\n"
             f"<i>P=PancakeSwap · U=Uniswap · ! = harga menyimpang · TVL/volume USD · "
             f"APR estimasi · V/TVL = volume 24j ÷ TVL (makin tinggi makin produktif) "
-            f"· – = belum terindeks</i>\n<i>{src_line}</i>{off_line}\n\nPilih pool:")
+            f"· – = belum terindeks</i>\n<i>{src_line}</i>{off_line}")
+    if extra:
+        try:
+            text += "\n" + "\n".join(lp_suggestion(cid, res, extra))
+        except Exception as err:
+            log.warning("saran posisi gagal dirakit: %s", err)
+    text += "\n\nPilih pool:"
     await edit(status, text, InlineKeyboardMarkup(buttons))
 
 
@@ -4028,6 +4040,264 @@ async def cmd_orders(update: Update, _, status_msg=None):
 
 
 # ---------- Monitor: alert in/out range + eksekusi order TP/SL ----------
+# ---------- Jembatan alert token trending (lp-scanner / GMGN) ----------
+# Scanner GMGN jalan sebagai proses TERPISAH (Node) dan menulis kandidat yang lolos
+# saringannya ke file JSONL. Bot ini yang menyambungnya ke dunia LP: cari pool,
+# hitung saran posisi dari data ON-CHAIN sendiri, lalu kirim kartu bertombol yang
+# masuk ke alur mint biasa. **Mint tetap manual** — bot tidak pernah mengirim tx
+# dari jalur ini.
+#
+# File, bukan HTTP: dua proses bisa restart sendiri-sendiri, tidak perlu port,
+# tidak perlu token, dan tidak ada yang gagal kalau salah satunya sedang mati.
+LP_INBOX = os.environ.get("LP_ALERT_INBOX", "").strip() or None
+_LP_INBOX_TICK = 10          # detik antar pemeriksaan inbox
+_LP_SEEN: dict = {}          # "cid:token" -> ts, redaman ganda di sisi bot ini
+_LP_SEEN_TTL = 3600
+_LP_APR_MIN_SHARE = 0.2      # pool baru layak ditunjuk kalau TVL-nya >= 20% pool terdalam
+
+
+def _lp_take() -> list[dict]:
+    """Ambil semua entri inbox lalu kosongkan, atomik lewat rename.
+
+    Rename dulu baru baca: penulis (proses scanner) membuka file lewat PATH tiap
+    kali append, jadi sesudah rename ia membuat file baru dan tidak ada baris yang
+    tertimpa. Sisa `.taking` dari proses yang mati di tengah ikut dibaca duluan,
+    supaya kandidat tidak hilang gara-gara restart."""
+    if not LP_INBOX:
+        return []
+    out: list[dict] = []
+    tmp = LP_INBOX + ".taking"
+
+    def _slurp(path):
+        try:
+            with open(path) as fh:
+                for ln in fh:
+                    ln = ln.strip()
+                    if not ln:
+                        continue
+                    try:
+                        out.append(json.loads(ln))
+                    except Exception:
+                        log.warning("baris inbox LP tidak bisa di-parse, dilewati")
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+
+    _slurp(tmp)                      # sisa dari crash sebelumnya
+    try:
+        os.replace(LP_INBOX, tmp)
+    except (FileNotFoundError, OSError):
+        return out
+    _slurp(tmp)
+    return out
+
+
+def _lp_cid(slug: str) -> int | None:
+    """Slug chain GMGN → chain id bot. None = chain itu tidak didukung di sini."""
+    for cid, cfg in ch.CHAINS.items():
+        if cfg.get("gmgn") == slug:
+            return cid
+    return None
+
+
+def _lp_ctx_lines(e: dict) -> list[str]:
+    """Konteks dari GMGN — angka MENTAH apa adanya, tanpa turunan baru.
+
+    `None` berarti belum diketahui dan ditulis begitu; menyulapnya jadi 0 akan
+    membuat 'belum diuji' terbaca sebagai 'aman' (aturan yang sama dipegang
+    scanner-nya)."""
+    iv = e.get("interval") or "?"
+
+    def u(v):
+        return ch.fmt_usd(v) if isinstance(v, (int, float)) else "belum diketahui"
+
+    def p(v, d=0):
+        return f"{v * 100:.{d}f}%" if isinstance(v, (int, float)) else "belum diketahui"
+
+    L = [f"📡 <b>Alert token trending</b> · {esc(e.get('tier') or '?')}",
+         f"🌑 <b>{esc(e.get('symbol') or '?')}</b>"
+         + (f" ({esc(e['name'])})" if e.get("name") and e["name"] != e.get("symbol") else ""),
+         f"📋 <code>{esc(e.get('address') or '')}</code>",
+         f"💸 Volume {esc(iv)} {u(e.get('volume'))} · 📦 MC {u(e.get('marketCap'))}",
+         f"💧 Likuiditas GMGN {u(e.get('liquidity'))} <i>(dua sisi)</i>"
+         + (f" · putaran {e['turnover']:.2f}×" if isinstance(e.get("turnover"), (int, float)) else ""),
+         ]
+    if isinstance(e.get("ageSeconds"), (int, float)):
+        jam = e["ageSeconds"] / 3600
+        L.append(f"🕐 Umur token {jam:.1f} jam" + (" — sangat baru" if jam < 1 else ""))
+    if isinstance(e.get("priceChangePercent"), (int, float)):
+        L.append(f"📈 Gerak harga {esc(iv)}: {e['priceChangePercent']:+.2f}%")
+    L.append(f"👥 Holder {e.get('holderCount') if e.get('holderCount') is not None else '?'}"
+             f" · smart-money {e.get('smartDegenCount') if e.get('smartDegenCount') is not None else '?'}"
+             f" · KOL {e.get('renownedCount') if e.get('renownedCount') is not None else '?'}")
+    L.append(f"🛡 Skor rug GMGN {p(e.get('rugRatio'), 1)} · 10 holder teratas "
+             f"{p(e.get('top10HolderRate'))}")
+    if e.get("pollHits") and e.get("pollWindow"):
+        L.append(f"🕐 Terkonfirmasi {e['pollHits']}/{e['pollWindow']} polling")
+    for r in (e.get("skips") or [])[:4]:
+        L.append(f"🔴 {esc(r)}")
+    for r in (e.get("warns") or [])[:5]:
+        L.append(f"🟡 {esc(r)}")
+    if e.get("missing"):
+        L.append(f"📦 Data belum lengkap: {esc(', '.join(e['missing'][:4]))} — "
+                 f"<i>kosong bukan berarti aman</i>")
+    L.append("<i>Semua angka di atas dari GMGN, bukan hasil pemeriksaan on-chain bot ini.</i>")
+    return L
+
+
+def lp_suggestion(cid: int, res: dict, e: dict) -> list[str]:
+    """Saran posisi. Hanya dari angka yang benar-benar diukur — bukan karangan.
+
+    Tiga hal yang disebut, dan tiap-tiapnya menyebut DASARNYA:
+
+    - **Pool mana.** Daftar dari discovery bot sendiri (sudah diverifikasi on-chain),
+      bukan dari GMGN. Yang ditunjuk dua: APR tertinggi dan TVL terdalam — dua
+      tujuan berbeda, dan menyembunyikan salah satunya berarti memilihkan untuk
+      user. Kalau pool ber-APR tertinggi jauh lebih tipis, itu disebut.
+    - **Mode range.** `recommend_strategy()` yang sudah ada, yang mengukur
+      volatilitas pool dari oracle TWAP. Pool v4 tidak punya oracle itu, jadi kalau
+      tidak terukur dikatakan tidak terukur — tidak diganti tebakan.
+    - **Apakah lebar range default masuk akal.** Ini aritmetika lurus dari gerak
+      harga yang DILAPORKAN GMGN pada interval alert, bukan model apa pun:
+      berapa kali gerakan sebesar itu, searah, sampai harga keluar range.
+
+    Silang-cek likuiditas GMGN vs TVL hitungan sendiri juga disebut kalau jauh
+    beda — dua sumber yang tidak sepakat adalah informasi, bukan gangguan.
+    """
+    pools = res.get("pools") or []
+    if not pools:
+        return []
+    s = store.load_settings(cid)
+    L = ["", "📐 <b>SARAN POSISI</b>"]
+
+    dalam = max(pools, key=lambda p: p.get("tvl_usd") or 0)
+    tv_d = dalam.get("tvl_usd") or 0
+
+    def tag(p):
+        return (f"[v{p.get('ver', 3)}] {esc(p['quote_sym'])} {p['fee'] / 10000:.2f}% · "
+                f"TVL {ch.fmt_usd(p.get('tvl_usd'))}"
+                + (f" · APR ~{p['apr_pct']:,.0f}%" if p.get("apr_pct") else ""))
+
+    # APR pool debu SELALU terlihat menang — rumusnya membagi dengan TVL, jadi
+    # pool $800 dengan sedikit volume mengalahkan pool $150k. Menunjuknya tetap
+    # salah walau diberi peringatan, karena angka terbesar yang menarik mata.
+    # Kandidat karena itu dibatasi ke pool yang TVL-nya >= _LP_APR_MIN_SHARE dari
+    # pool terdalam; yang terbuang tetap DISEBUT, bukan dihilangkan diam-diam.
+    ber_apr = [p for p in pools if p.get("apr_pct")]
+    layak = [p for p in ber_apr if (p.get("tvl_usd") or 0) >= tv_d * _LP_APR_MIN_SHARE]
+    terbaik = max(layak, key=lambda p: p["apr_pct"]) if layak else None
+    tertinggi = max(ber_apr, key=lambda p: p["apr_pct"]) if ber_apr else None
+
+    L.append(f"🌊 Terdalam: {tag(dalam)}")
+    if terbaik and terbaik is not dalam:
+        L.append(f"💰 APR terbaik yang cukup dalam: {tag(terbaik)}")
+    if tertinggi and tertinggi not in (terbaik, dalam):
+        L.append(f"   ⏭ APR tertinggi sebenarnya {tertinggi['apr_pct']:,.0f}% di "
+                 f"{tag(tertinggi)} — <b>tidak ditunjuk</b>, TVL-nya di bawah "
+                 f"{_LP_APR_MIN_SHARE * 100:.0f}% pool terdalam. APR dihitung ÷TVL, jadi "
+                 f"pool debu selalu terlihat menang padahal masuk-keluarnya mahal.")
+    pilih = terbaik or dalam
+
+    # Mode: dari pengukuran yang sudah ada, dan sebutkan kalau tidak terukur
+    try:
+        rec, vol = recommend_strategy({"chain": cid, "pool_info": pilih,
+                                       "token": res["token"]})
+        if vol is not None:
+            L.append(f"🎯 Mode: <b>{STRAT_LABEL[rec]}</b> — volatilitas pool 24 jam "
+                     f"terukur {vol:.0f}% (oracle TWAP pool)")
+        else:
+            L.append(f"🎯 Mode: <b>{STRAT_LABEL[rec]}</b> — <i>volatilitas tidak terukur "
+                     f"(pool v4 tidak punya oracle TWAP), jadi ini default, bukan hasil ukur</i>")
+    except Exception:
+        pass
+
+    # Apakah lebar default masuk akal terhadap gerak harga yang dilaporkan alert
+    gerak = e.get("priceChangePercent")
+    lebar = float(s.get("width_pct") or 0)
+    if isinstance(gerak, (int, float)) and abs(gerak) > 0.01 and lebar > 0:
+        n = lebar / abs(gerak)
+        iv = esc(e.get("interval") or "?")
+        L.append(f"📏 Lebar default kamu ±{lebar:g}%. Harga bergerak {gerak:+.2f}% dalam "
+                 f"{iv} terakhir — gerakan sebesar itu <b>{n:.1f}×</b> berturut searah sudah "
+                 f"menembus batas range.")
+        if n < 3:
+            L.append("   ⚠️ artinya range itu gampang keluar di token seaktif ini; "
+                     "range lebih lebar = fee lebih tipis tapi lebih jarang rebalance")
+
+    # Dua sumber likuiditas yang tidak sepakat itu informasi, bukan gangguan
+    gl, tv = e.get("liquidity"), dalam.get("tvl_usd")
+    if isinstance(gl, (int, float)) and gl > 0 and tv:
+        r = tv / gl
+        if r < 0.4 or r > 2.5:
+            L.append(f"🔎 Likuiditas GMGN {ch.fmt_usd(gl)} vs TVL pool terdalam hitungan "
+                     f"bot {ch.fmt_usd(tv)} ({r:.1f}×) — GMGN menjumlah SEMUA pool token ini, "
+                     f"bot menghitung per-pool. Pakai angka per-pool untuk menilai kedalaman.")
+    L.append("<i>Saran, bukan perintah. Mint tetap kamu yang menekan tombolnya.</i>")
+    return L
+
+
+async def _lp_alert(app, e: dict):
+    """Satu kandidat dari scanner → kartu + daftar pool bertombol."""
+    slug = str(e.get("chain") or "")
+    addr = str(e.get("address") or "")
+    cid = _lp_cid(slug)
+    if not cid or not ch.Web3.is_address(addr):
+        log.info("alert LP dilewati: chain %s tidak didukung / alamat tidak valid", slug)
+        return
+    # Redaman ganda: scanner punya cooldown sendiri, tapi restart-nya mengosongkan
+    # state. Ini menjaga chat tidak dibanjiri token yang sama kalau itu terjadi.
+    k = f"{cid}:{addr.lower()}"
+    now = time.time()
+    for old_k, ts in [(x, t) for x, t in _LP_SEEN.items() if now - t > _LP_SEEN_TTL]:
+        _LP_SEEN.pop(old_k, None)
+    if now - _LP_SEEN.get(k, 0) < _LP_SEEN_TTL:
+        return
+    _LP_SEEN[k] = now
+
+    chats = list(allowed_chat_ids())
+    if not chats:
+        return
+    body = "\n".join(_lp_ctx_lines(e))
+    msg = None
+    for chat_id in chats:
+        try:
+            m = await app.bot.send_message(chat_id, body, parse_mode=ParseMode.HTML,
+                                           disable_web_page_preview=True)
+            msg = msg or m
+        except Exception:
+            pass
+    if msg is None:
+        return
+    # Kartu pool memakai jalur yang SAMA PERSIS dengan tempel-CA manual, jadi
+    # tombolnya masuk ke alur konfirmasi mint yang sudah ada — tidak ada jalur
+    # transaksi baru yang perlu diuji ulang.
+    status = await app.bot.send_message(msg.chat_id, "🔎 Mencari pool…",
+                                        parse_mode=ParseMode.HTML)
+    try:
+        await show_pools_for(status, cid, ch.Web3.to_checksum_address(addr), extra=e)
+    except Exception as err:
+        log.warning("alert LP %s: %s", addr, err)
+        await edit(status, f"❌ Gagal mencari pool: {esc(err)}")
+
+
+async def _lp_inbox_loop(app):
+    """Pantau inbox scanner. Tick pendek: kandidat trending cepat basi."""
+    if not LP_INBOX:
+        return
+    log.info("jembatan alert LP aktif — memantau %s", LP_INBOX)
+    await asyncio.sleep(5)
+    while True:
+        try:
+            for e in await asyncio.to_thread(_lp_take):
+                try:
+                    await _lp_alert(app, e)
+                except Exception as err:
+                    log.warning("proses alert LP gagal: %s", err)
+        except Exception as err:
+            log.warning("baca inbox LP gagal: %s", err)
+        await asyncio.sleep(_LP_INBOX_TICK)
+
+
 async def _notify(app, body: str):
     for chat_id in allowed_chat_ids():
         try:
@@ -4401,6 +4671,7 @@ async def _start_background(app):
             break
         await asyncio.sleep(0.1)
     app.create_task(monitor_loop(app))
+    app.create_task(_lp_inbox_loop(app))
     app.create_task(_loop_watchdog())
 
 
