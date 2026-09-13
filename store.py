@@ -32,6 +32,14 @@ DEFAULT_SETTINGS = {
                             # terukur 199 request RPC, jadi ini langsung menentukan
                             # tagihan CU: 30 detik = ~30M CU/hari untuk 2 wallet
     "wallet_idx": 0,        # wallet aktif (index di daftar PRIVATE_KEY, PRIVATE_KEY_2, ...)
+    # Tombol jumlah TETAP di kartu mint, per simbol satuan budget (quote; meme untuk
+    # mode Upper). Diubah lewat /presets. Angka bukan persen — "10" berarti 10 USDG.
+    "amount_presets": {
+        "USDG": [10, 25, 50], "USDC": [10, 25, 50], "USDT": [10, 25, 50],
+        "ETH": [0.01, 0.025, 0.05], "WETH": [0.01, 0.025, 0.05],
+        "BNB": [0.02, 0.05, 0.1], "WBNB": [0.02, 0.05, 0.1],
+        "HYPE": [0.5, 1, 2], "WHYPE": [0.5, 1, 2],
+    },
 }
 
 

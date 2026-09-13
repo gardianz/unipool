@@ -614,6 +614,55 @@ async def cmd_settings(update: Update, _):
     await reply(update, settings_text(), settings_kb())
 
 
+async def cmd_presets(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/presets — atur tombol jumlah TETAP di kartu mint, per simbol.
+
+    /presets                  lihat semua
+    /presets USDG 10 20 30    ganti daftar USDG
+    /presets USDG -           hapus (kembali ke tebakan default)
+
+    Angkanya jumlah token, bukan persen: "10" untuk USDG berarti 10 USDG.
+    Satuannya mengikuti budget kartu — quote pool, atau token meme di mode Upper."""
+    if not authorized(update):
+        return
+    args = context.args or []
+    s = store.load_settings()
+    tbl = dict(s.get("amount_presets") or {})
+    if not args:
+        baris = [f"· <code>{esc(k)}</code>: {', '.join(f'{float(v):g}' for v in vals)}"
+                 for k, vals in sorted(tbl.items()) if vals]
+        await reply(update, "🔢 <b>Tombol jumlah tetap</b>\n"
+                    + ("\n".join(baris) if baris else "(kosong)")
+                    + "\n\nUbah: <code>/presets USDG 10 20 30</code>"
+                      "\nHapus: <code>/presets USDG -</code>"
+                      "\nSimbol tanpa entri memakai tebakan default."
+                      "\n\n<i>Angka = jumlah token, bukan persen. Satuannya mengikuti "
+                      "budget kartu: quote pool, atau token meme di mode Upper.</i>")
+        return
+    sym = args[0].upper()
+    if len(args) == 1 or args[1] == "-":
+        tbl.pop(sym, None)
+        store.save_settings({**s, "amount_presets": tbl})
+        await reply(update, f"🗑 Preset <b>{esc(sym)}</b> dihapus — kembali ke tebakan default.")
+        return
+    vals = []
+    for a in args[1:5]:
+        try:
+            v = float(a.replace(",", "."))
+        except ValueError:
+            await reply(update, f"❌ <code>{esc(a)}</code> bukan angka.")
+            return
+        if v <= 0:
+            await reply(update, "❌ Jumlah harus lebih dari 0.")
+            return
+        vals.append(v)
+    tbl[sym] = vals
+    store.save_settings({**s, "amount_presets": tbl})
+    await reply(update, f"✅ Preset <b>{esc(sym)}</b>: "
+                        + ", ".join(f"{v:g}" for v in vals)
+                        + "\n<i>Maksimal 4 tombol; sisanya diabaikan.</i>")
+
+
 async def cmd_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorized(update):
         return
@@ -1432,6 +1481,47 @@ def box_pct(pool_info: dict) -> float:
     return round((math.exp(0.0001 * sp) - 1) * 100, 4)
 
 
+def budget_sym(ctx_data: dict) -> str:
+    """Simbol satuan budget kartu ini. `amount_fixed` selalu dalam satuan INI.
+
+    lower/wide/stable = quote pool; upper = token meme (lihat compute_amount).
+    `amount_src` tidak ikut menentukan: jumlah tetap men-short-circuit persen."""
+    if ctx_data.get("mode") == "upper":
+        return ctx_data["token"]["symbol"]
+    return ctx_data["pool_info"]["quote_sym"]
+
+
+def amount_presets(sym: str, cid: int | None = None) -> list[float]:
+    """Jumlah tetap yang ditawarkan untuk simbol ini (dari /presets).
+
+    Tanpa entri, hanya simbol QUOTE yang ditebak — stable pakai satuan puluhan,
+    wrapped/native pakai pecahan. Token meme TIDAK pernah ditebak: satuannya bisa
+    ribuan atau miliaran tergantung supply, jadi "0,01 microduck" cuma tombol yang
+    tidak pernah masuk akal. Untuk meme, tombol A% memang sudah jawabannya.
+    Menebak lewat harga USD akan lebih tepat tapi itu panggilan RPC di jalur render
+    keyboard — tidak sepadan untuk angka yang cuma saran."""
+    tbl = store.load_settings().get("amount_presets") or {}
+    v = tbl.get(sym) or tbl.get(sym.upper())
+    if not v:
+        known = {"USD" in sym.upper()}
+        if cid in ch.CHAINS:
+            cfg = ch.CHAINS[cid]
+            known.add(sym in (cfg.get("quotes") or {}))
+            known.add(sym == cfg.get("wrapped_symbol") or sym == cfg.get("native_symbol"))
+        if not any(known):
+            return []
+        v = [10, 25, 50] if "USD" in sym.upper() else [0.01, 0.025, 0.05]
+    out = []
+    for x in v:
+        try:
+            f = float(x)
+        except (TypeError, ValueError):
+            continue
+        if f > 0:
+            out.append(f)
+    return out[:4]
+
+
 def confirm_kb(key: str, ctx_data: dict) -> InlineKeyboardMarkup:
     mode = ctx_data["mode"]
     rec = ctx_data["rec"]
@@ -1439,10 +1529,18 @@ def confirm_kb(key: str, ctx_data: dict) -> InlineKeyboardMarkup:
         def abtn2(a):
             mark = "✓ " if (not ctx_data["amount_fixed"] and ctx_data["amount_pct"] == a) else ""
             return InlineKeyboardButton(f"{mark}A {a:g}%", callback_data=f"amt|{key}|{a}")
+        bsym2 = ctx_data["pool_info"]["quote_sym"]
+
+        def fbtn2(v):
+            mark = "✓ " if ctx_data["amount_fixed"] and float(ctx_data["amount_fixed"]) == v else ""
+            return InlineKeyboardButton(f"{mark}{v:g} {bsym2}", callback_data=f"amtf|{key}|{v:g}")
+
         return InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ Confirm add", callback_data=f"mint|{key}"),
              InlineKeyboardButton("❌ Cancel", callback_data=f"cancelp|{key}")],
             [abtn2(a) for a in (25, 50, 75, 100)],
+            *([[fbtn2(v) for v in amount_presets(bsym2, ctx_data["chain"])]]
+              if amount_presets(bsym2, ctx_data["chain"]) else []),
             [InlineKeyboardButton("✏️ Custom Amount…", callback_data=f"askamt|{key}")],
         ])
 
@@ -1494,11 +1592,18 @@ def confirm_kb(key: str, ctx_data: dict) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton(
             f"⚠️ Saya paham, lanjut walau impact {imp * 100:.0f}%",
             callback_data=f"okimp|{key}")])
-    rows += [
-        [abtn(a) for a in (25, 50, 75, 100)],
-        [InlineKeyboardButton("✏️ Custom Range…", callback_data=f"askrng|{key}"),
-         InlineKeyboardButton("✏️ Custom Amount…", callback_data=f"askamt|{key}")],
-    ]
+    bsym = budget_sym(ctx_data)
+
+    def fbtn(v):
+        mark = "✓ " if ctx_data["amount_fixed"] and float(ctx_data["amount_fixed"]) == v else ""
+        return InlineKeyboardButton(f"{mark}{v:g} {bsym}", callback_data=f"amtf|{key}|{v:g}")
+
+    rows.append([abtn(a) for a in (25, 50, 75, 100)])
+    fixed = [fbtn(v) for v in amount_presets(bsym, ctx_data["chain"])]
+    if fixed:
+        rows.append(fixed)
+    rows.append([InlineKeyboardButton("✏️ Custom Range…", callback_data=f"askrng|{key}"),
+                 InlineKeyboardButton("✏️ Custom Amount…", callback_data=f"askamt|{key}")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -3062,6 +3167,15 @@ async def _route_callback(update: Update):
             ctx["max_impact"] = 1.0
         await show_confirm(q.message, data.split("|", 1)[1])
         return
+    if data.startswith("amtf|"):
+        _, key, val = data.split("|", 2)
+        ctx = PENDING.get(key)
+        if not ctx:
+            await edit(q.message, "⚠️ Tombol kadaluarsa (bot sempat restart). Paste alamat lagi.")
+            return
+        ctx["amount_fixed"] = float(val)     # satuan budget kartu ini, bukan persen
+        await show_confirm(q.message, key)
+        return
     if data.startswith(("wd|", "amt|", "st|", "amtsrc|")):
         parts = data.split("|")
         kind, key = parts[0], parts[1]
@@ -3568,6 +3682,7 @@ async def post_init(app):
             BotCommand("wallet", "Saldo semua token + nilai USD"),
             BotCommand("wallets", "Kelola wallet: impor/buat/ekspor/hapus"),
             BotCommand("settings", "Pengaturan via tombol"),
+            BotCommand("presets", "Tombol jumlah tetap di kartu mint"),
             BotCommand("chain", "Ganti chain aktif"),
             BotCommand("revoke", "Cabut approval token yang menganggur"),
             BotCommand("cleanup", "Burn NFT posisi kosong (mempercepat /list)"),
@@ -4190,6 +4305,7 @@ def main():
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("settings", cmd_settings))
     app.add_handler(CommandHandler("set", cmd_set))
+    app.add_handler(CommandHandler("presets", cmd_presets))
     app.add_handler(CommandHandler("chain", cmd_chain))
     app.add_handler(CommandHandler("wallet", cmd_wallet))
     app.add_handler(CommandHandler("wallets", cmd_wallets))

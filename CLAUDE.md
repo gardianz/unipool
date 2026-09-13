@@ -1559,6 +1559,27 @@ Dua syarat yang gampang terlewat:
 
 Mode `lower` (100% quote) memakai nilai meme apa adanya: seluruh meme dijual.
 
+### Tombol jumlah TETAP di kartu mint (`/presets`)
+
+Selain baris `A 25/50/75/100%`, kartu mint punya baris jumlah tetap —
+`10 USDG`, `0.025 WETH` — lewat callback `amtf|<key>|<jumlah>` yang menyetel
+`ctx["amount_fixed"]`. Diatur `/presets` dan disimpan di
+`settings["amount_presets"]` (`{simbol: [angka, …]}`, maksimal 4 per simbol).
+
+**Satuannya satuan BUDGET kartu itu, bukan selalu quote.** `compute_amount()`
+mengembalikan `amount_fixed` apa adanya dan men-short-circuit sebelum
+`amount_src`, dan budget mode `upper` itu satuan MEME. `budget_sym()` yang
+menentukan labelnya — kalau salah, user mengira menyetor 10 USDG padahal 10 meme.
+
+**Token meme TIDAK pernah ditebak.** Tanpa entri eksplisit, hanya simbol quote
+(daftar `quotes` chain itu, wrapped/native, atau yang mengandung "USD") yang
+dapat tebakan default. Satuan meme bisa ribuan sampai miliaran tergantung supply,
+jadi tebakan apa pun menghasilkan tombol yang tidak pernah masuk akal
+(`0,01 microduck`). Untuk meme, baris A% memang sudah jawabannya — dan
+`/presets MICRODUCK 100000 500000` tetap bisa dipakai kalau user mau.
+
+Baris kosong tidak dikirim ke Telegram; kalau tidak ada preset, barisnya hilang.
+
 ### Range selalu dihitung di server
 
 Browser hanya mengirim *persen* lebar range; tick final tetap dari `calc_strategy_range()`
