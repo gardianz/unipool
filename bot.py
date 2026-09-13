@@ -2363,7 +2363,8 @@ async def do_mint(update: Update, ctx_data: dict):
         g = await asyncio.to_thread(gas_line, cid)
         if g:
             lines.append(g)
-        await edit(status, "\n".join(lines), NAV_KB)
+        sesudah, kb = await after_action(cid, pid)
+        await edit(status, "\n".join(lines + sesudah), kb)
         return
 
     pid = f"v4:{r['token_id']}" if ver == 4 else r["token_id"]
@@ -2414,7 +2415,8 @@ async def do_mint(update: Update, ctx_data: dict):
     g = await asyncio.to_thread(gas_line, cid)
     if g:
         lines.append(g)
-    await edit(status, "\n".join(lines), NAV_KB)
+    sesudah, kb = await after_action(cid, pid, "Nilai posisi")
+    await edit(status, "\n".join(lines + sesudah), kb)
 
 
 # ---------- /list ----------
@@ -3070,7 +3072,8 @@ async def do_add_exec(update: Update, pid: str, val: float, is_pct: bool):
         g = await asyncio.to_thread(gas_line, cid)
         if g:
             lines.append(g)
-        await edit(status, "\n".join(lines), NAV_KB)
+        sesudah, kb = await after_action(cid, pid)
+        await edit(status, "\n".join(lines + sesudah), kb)
 
 
 async def ask_reduce(update: Update, pid: str):
@@ -3155,7 +3158,8 @@ async def do_reduce_exec(update: Update, pid: str, pct: int):
         g = await asyncio.to_thread(gas_line, cid)
         if g:
             lines.append(g)
-        await edit(status, "\n".join(lines), NAV_KB)
+        sesudah, kb = await after_action(cid, pid)
+        await edit(status, "\n".join(lines + sesudah), kb)
 
 
 # ---------- Collect fee ----------
@@ -3191,7 +3195,8 @@ async def do_collect(update: Update, pid: str):
         g = await asyncio.to_thread(gas_line, cid)
         if g:
             lines.append(g)
-        await edit(status, "\n".join(lines), NAV_KB)
+        sesudah, kb = await after_action(cid, pid)
+        await edit(status, "\n".join(lines + sesudah), kb)
 
 
 # ---------- Rebalance ----------
@@ -3293,15 +3298,6 @@ async def finish_rebalance(update, status, cid: int, pid: str, pos, r: dict,
     # Range SESUDAH rebalance wajib disebut: seluruh gunanya rebalance adalah
     # memindahkan range, jadi kartu tanpa angka barunya memaksa user membuka
     # kartu posisi hanya untuk tahu apakah hasilnya sesuai harapan.
-    baru = None
-    if r["token_id"]:
-        try:
-            baru = await asyncio.to_thread(position_one, cid, new_pid)
-        except Exception as e:
-            log.warning("baca posisi baru %s: %s", new_pid, e)
-    if baru:
-        lines.append(f"Range baru: {esc(range_str(baru))} · "
-                     + ("🟢 IN range" if baru["in_range"] else "🔴 OUT of range"))
     for lbl, h in r["steps"]:
         lines.append(f"{lbl}: {ch.tx_link(cid, h)}")
     if r["token_id"]:
@@ -3309,13 +3305,8 @@ async def finish_rebalance(update, status, cid: int, pid: str, pos, r: dict,
     g = await asyncio.to_thread(gas_line, cid)
     if g:
         lines.append(g)
-    kb = NAV_KB
-    if r["token_id"]:
-        kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"📋 Buka {disp_pid(new_pid)}", callback_data=f"pos|{new_pid}")],
-            *NAV_KB.inline_keyboard,
-        ])
-    await edit(status, "\n".join(lines), kb)
+    sesudah, kb = await after_action(cid, new_pid, "Posisi baru") if r["token_id"] else ([], NAV_KB)
+    await edit(status, "\n".join(lines + sesudah), kb)
 
 
 # ---------- Close flow ----------
@@ -3414,6 +3405,9 @@ async def do_close(update: Update, pid: str, autoswap: bool):
         g = await asyncio.to_thread(gas_line, cid)
         if g:
             lines.append(g)
+        # Close: posisinya memang sudah tidak ada, jadi TIDAK ada keadaan "sesudah"
+        # untuk dibaca — memanggil after_action() di sini cuma membuang satu
+        # pembacaan RPC untuk hasil yang pasti kosong.
         await edit(status, "\n".join(lines), NAV_KB)
 
         if r["swaps"]:
@@ -4041,6 +4035,47 @@ async def _notify(app, body: str):
                                        disable_web_page_preview=True)
         except Exception:
             pass
+
+
+async def after_action(cid: int, pid: str, judul: str = "Sesudah") -> tuple[list, InlineKeyboardMarkup]:
+    """(baris keadaan posisi SESUDAH aksi, keyboard dengan tombol buka kartunya).
+
+    Kartu hasil mint/add/reduce/collect/compound/rebalance dulu berhenti di daftar
+    tx — user harus membuka /list lalu mencari posisinya lagi hanya untuk tahu
+    hasil aksinya seperti apa. Padahal itu justru pertanyaan pertamanya: nilainya
+    jadi berapa, masih in-range atau tidak, range-nya di mana.
+
+    Dibaca lewat `position_one` (langsung on-chain, BUKAN `_POS_CACHE` yang isinya
+    masih keadaan SEBELUM aksi). Gagal baca dilewati diam-diam — kartu hasil
+    transaksi tidak boleh batal cuma karena satu pembacaan tambahan."""
+    def work():
+        p = position_one(cid, pid)
+        if not p:
+            return None, ""
+        try:
+            return p, _pool_info_line(cid, p, p.get("ver", 3))
+        except Exception:
+            return p, ""
+
+    p, pool_line = None, ""
+    try:
+        p, pool_line = await asyncio.to_thread(work)
+    except Exception as e:
+        log.warning("baca posisi sesudah aksi %s: %s", pid, e)
+    if not p:
+        return [], NAV_KB
+    lines = [""]
+    if pool_line:
+        lines.append(pool_line)
+    lines.append(f"{judul}: <b>{ch.fmt_usd(p['value_usd'])}</b> · fee unclaimed "
+                 f"{ch.fmt_usd(p['unclaimed_usd'])} · "
+                 + ("🟢 IN range" if p["in_range"] else "🔴 OUT of range"))
+    lines.append(f"Range: {esc(range_str(p))}")
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"📋 Buka {disp_pid(pid)}", callback_data=f"pos|{pid}")],
+        *NAV_KB.inline_keyboard,
+    ])
+    return lines, kb
 
 
 async def _full_pos(cid: int, p: dict) -> dict:
@@ -4849,7 +4884,8 @@ async def do_compound(update: Update, pid: str):
         g = await asyncio.to_thread(gas_line, cid)
         if g:
             lines.append(g)
-        await edit(status, "\n".join(lines), NAV_KB)
+        sesudah, kb = await after_action(cid, pid)
+        await edit(status, "\n".join(lines + sesudah), kb)
 
 
 async def do_revoke(update: Update, key: str, idx: int | None):

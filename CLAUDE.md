@@ -1775,14 +1775,27 @@ bukan `go|` (kirim pesan baru — itu khusus dari kartu hasil tx supaya kartunya
 tetap ada). `cmd_rpc` dipanggil dari tombol dengan `context=None`, jadi ia membaca
 `getattr(context, "args", None)`.
 
-### Kartu hasil rebalance menyebut range BARU
+### Tiap kartu hasil menyebut keadaan SESUDAH + tombol buka posisi
 
-Seluruh guna rebalance adalah memindahkan range, jadi kartu tanpa angka barunya
-memaksa user membuka kartu posisi hanya untuk tahu hasilnya sesuai atau tidak.
-`finish_rebalance()` membaca posisi baru sekali (`position_one`) lalu menulis
-`Range baru: …` + status IN/OUT, dan menambahkan tombol `pos|<pid baru>` yang
-langsung membuka kartunya. Gagal baca dilewati diam-diam — kartu hasil tx tidak
-boleh batal cuma karena satu pembacaan tambahan.
+`after_action(cid, pid, judul)` dipakai SEMUA alur yang menyisakan posisi:
+mint (v2 dan v3/v4), add, reduce, collect, compound, rebalance. Ia menambahkan
+baris info pool, nilai + fee unclaimed, status IN/OUT, range, dan tombol
+`pos|<pid>`.
+
+Tanpa itu kartu berhenti di daftar tx dan user harus membuka `/list` lalu mencari
+posisinya lagi — padahal itu justru pertanyaan pertamanya: nilainya jadi berapa,
+masih in-range atau tidak, range-nya di mana. Untuk rebalance lebih parah lagi:
+seluruh guna aksinya memang memindahkan range.
+
+Tiga hal yang gampang salah di sini:
+
+- **Dibaca lewat `position_one`, bukan `_POS_CACHE`.** Cache masih berisi keadaan
+  SEBELUM aksi (`position_busy` baru membuangnya di `finally`, sesudah kartu
+  dirakit), jadi memakainya akan menampilkan angka lama sebagai "sesudah".
+- **`do_close` sengaja TIDAK memakainya** — posisinya memang sudah tidak ada,
+  jadi itu cuma membuang satu pembacaan RPC untuk hasil yang pasti kosong.
+- **Gagal baca dilewati diam-diam** dan kembali ke `NAV_KB` biasa. Kartu hasil
+  transaksi tidak boleh batal cuma karena satu pembacaan tambahan.
 
 ### Range selalu dihitung di server
 
