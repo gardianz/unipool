@@ -875,10 +875,39 @@ tanpa mengurus nomor urut `_2..10`. Dua detail yang sengaja ada:
   — `_chain_rpcs()` memanggilnya di jalur failover. Terukur 2.000 panggilan
   0,018 detik. Tiap key jadi **endpoint tersendiri** di `get_w3`, jadi tidak
 ada mekanisme baru yang perlu ditulis — rotasi `_RPC_BAD` yang sudah ada langsung
-bekerja: key yang kena 429 ditandai, dilewati 120 detik, dan panggilan berikutnya
-jalan lewat key berikutnya. Kuota Alchemy dihitung per-app, jadi N key = N jatah.
-Terukur: dengan key `aaa` ditandai kena limit, endpoint terpilih berikutnya adalah
-key `bbb` — bukan RPC publik yang 10x lebih lambat.
+bekerja: key yang kena 429 ditandai, dilewati, dan panggilan berikutnya jalan
+lewat key berikutnya. Terukur: dengan key `aaa` ditandai kena limit, endpoint
+terpilih berikutnya adalah key `bbb` — bukan RPC publik yang 10x lebih lambat.
+
+**Jatah TIDAK dihitung per-network.** Terukur dengan `rpc_health()`: key `…Ev8C`
+menjawab `Monthly capacity limit exceeded` di KEEMPAT chain sekaligus (Robinhood,
+Base, BSC, HyperEVM) sementara key `…ei1f` sehat di semuanya. Jadi menambah
+network tidak menambah jatah; menambah KEY hanya menolong kalau key itu milik
+app/akun lain.
+
+### `/rpc` — status endpoint, dan kenapa sisa kuota tidak bisa dibaca
+
+`rpc_health(chain_id)` menembak satu `eth_blockNumber` murah ke tiap endpoint
+(paralel, tanpa retry) dan mengklasifikasikannya: `ok` / `quota` / `burst` /
+`error`. `/rpc` menampilkannya, `/rpc all` untuk semua chain.
+
+**Sisa kuota tidak bisa dibaca dan jangan dicoba lagi.** Sudah diuji: header
+jawaban Alchemy cuma memuat `x-alchemy-trace-id` (tidak ada sisa kuota),
+`dashboard.alchemy.com/api/team-apps` dan `/api/compute-units` menjawab **404**
+baik dengan API key sebagai `X-Alchemy-Token` maupun tanpa (endpoint dashboard
+butuh token yang berbeda dari API key RPC), dan tidak ada metode JSON-RPC untuk
+itu (`alchemy_getComputeUnits` → `-32600`).
+
+Yang BISA dibaca pasti adalah key yang sudah HABIS — Alchemy menyebutnya
+eksplisit di body 429. Satu request per endpoint sudah cukup, dan itu satu-satunya
+cara mengetahuinya dari sisi bot.
+
+Terukur saat ditulis, dan gambarannya penting: **Robinhood cuma punya SATU
+endpoint sehat** (satu key Alchemy) — `rpc.mainnet.chain.robinhood.com` SSLError
+dan blockscout 403 Cloudflare — sedangkan Base/BSC/HyperEVM punya 3–5 RPC publik
+yang jalan. Jadi chain itu memang paling rapuh terhadap satu key bermasalah.
+`hyperliquid-mainnet` juga menjawab *"not enabled for this app"* untuk key yang
+sehat sekalipun: network Alchemy harus di-enable per app di dashboard.
 
 `get_w3` men-cache satu endpoint 5 menit. Failover-nya dulu cuma ada di pemilihan
 AWAL, padahal jatah habis di tengah jalan justru yang lazim — begitu endpoint itu

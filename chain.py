@@ -1254,6 +1254,47 @@ def _chain_rpcs(chain_id: int) -> list[str]:
     return rpcs
 
 
+def rpc_health(chain_id: int) -> list[dict]:
+    """Status tiap endpoint RPC chain ini: {url, short, ok, kind, why, ms}.
+
+    **Kuota tersisa TIDAK bisa dibaca.** Diuji: header jawaban Alchemy cuma memuat
+    `x-alchemy-trace-id` (tanpa sisa kuota), `dashboard.alchemy.com/api/...`
+    menjawab 404 dengan API key maupun tanpa (endpoint itu butuh token dashboard
+    yang berbeda), dan tidak ada metode JSON-RPC untuk itu.
+
+    Yang BISA dibaca pasti: apakah sebuah key sudah habis — Alchemy menyebutnya
+    eksplisit di body 429 (`Monthly capacity limit exceeded`). Satu request murah
+    per endpoint sudah cukup, dan itu yang dilakukan di sini. `kind`: `"ok"`,
+    `"quota"` (habis bulanan), `"burst"` (limit sesaat), `"error"`."""
+    urls = _chain_rpcs(chain_id)
+
+    def probe(url: str) -> dict:
+        row = {"url": url, "short": _short_rpc(url), "ok": False, "kind": "error",
+               "why": "", "ms": None}
+        t = time.time()
+        try:
+            r = _peer_session().post(url, json={"jsonrpc": "2.0", "id": 1,
+                                                "method": "eth_blockNumber", "params": []},
+                                     timeout=8)
+            row["ms"] = int((time.time() - t) * 1000)
+            r.raise_for_status()
+            body = r.json()
+            if "error" in body:
+                raise RuntimeError(str(body["error"])[:160])
+            row.update(ok=True, kind="ok", why=f"blok {int(body['result'], 16):,}")
+        except Exception as e:
+            row["ms"] = row["ms"] or int((time.time() - t) * 1000)
+            row["kind"] = _rate_limit_kind(e) or "error"
+            row["why"] = _why(e)
+        return row
+
+    ex = ThreadPoolExecutor(max_workers=min(8, max(1, len(urls))))
+    try:
+        return list(ex.map(probe, urls))
+    finally:
+        ex.shutdown(wait=False)
+
+
 def get_w3(chain_id: int, fresh: bool = False) -> Web3:
     """Failover multi-RPC: coba tiap endpoint (env override dulu), verifikasi
     chain_id, cache yang jalan 5 menit."""

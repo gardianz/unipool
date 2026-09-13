@@ -614,6 +614,41 @@ async def cmd_settings(update: Update, _):
     await reply(update, settings_text(), settings_kb())
 
 
+_RPC_ICON = {"ok": "✅", "quota": "🛑", "burst": "⏳", "error": "❌"}
+
+
+async def cmd_rpc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/rpc — status tiap endpoint RPC. /rpc all untuk semua chain.
+
+    Kuota TERSISA tidak bisa dibaca (Alchemy tidak mengeksposnya lewat API key),
+    tapi key yang SUDAH habis bisa: 429-nya menyebut "Monthly capacity limit
+    exceeded". Tanpa perintah ini gejalanya cuma "bot lambat", dan tidak ada
+    perubahan kode yang bisa memperbaikinya."""
+    if not authorized(update):
+        return
+    semua = bool(context.args) and str(context.args[0]).lower() in ("all", "semua")
+    cids = list(ch.CHAINS) if semua else [store.load_settings()["chain"]]
+    status = await reply(update, "🔌 Mengecek RPC…")
+    rows = await asyncio.to_thread(lambda: [(c, ch.rpc_health(c)) for c in cids])
+    lines, mati = [], []
+    for cid, hs in rows:
+        lines.append(f"\n<b>{esc(ch.CHAINS[cid]['name'])}</b>")
+        for h in hs:
+            ms = f"{h['ms']} ms" if h["ms"] is not None else "—"
+            lines.append(f"{_RPC_ICON.get(h['kind'], '❔')} <code>{esc(h['short'])}</code>"
+                         f"\n    {ms} · {esc(h['why'][:90])}")
+            if h["kind"] == "quota":
+                mati.append(h["short"])
+    if mati:
+        lines.append("\n🛑 <b>Key di atas habis jatah BULANAN</b> — tidak akan pulih "
+                     "sampai siklus billing berganti. Tambah key baru di "
+                     "<code>alchemy_keys.txt</code> (satu per baris) atau naikkan paket. "
+                     "Bot melewatinya 6 jam lalu mencoba lagi.")
+    lines.append("\n<i>Sisa kuota tidak bisa dibaca lewat API key — Alchemy tidak "
+                 "mengeksposnya. Yang terbaca cuma status per endpoint di atas.</i>")
+    await edit(status, "🔌 <b>Status RPC</b>\n" + "\n".join(lines))
+
+
 async def cmd_presets(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/presets — atur tombol jumlah TETAP di kartu mint, per simbol.
 
@@ -3683,6 +3718,7 @@ async def post_init(app):
             BotCommand("wallets", "Kelola wallet: impor/buat/ekspor/hapus"),
             BotCommand("settings", "Pengaturan via tombol"),
             BotCommand("presets", "Tombol jumlah tetap di kartu mint"),
+            BotCommand("rpc", "Status RPC + key Alchemy yang habis jatah"),
             BotCommand("chain", "Ganti chain aktif"),
             BotCommand("revoke", "Cabut approval token yang menganggur"),
             BotCommand("cleanup", "Burn NFT posisi kosong (mempercepat /list)"),
@@ -4306,6 +4342,7 @@ def main():
     app.add_handler(CommandHandler("settings", cmd_settings))
     app.add_handler(CommandHandler("set", cmd_set))
     app.add_handler(CommandHandler("presets", cmd_presets))
+    app.add_handler(CommandHandler("rpc", cmd_rpc))
     app.add_handler(CommandHandler("chain", cmd_chain))
     app.add_handler(CommandHandler("wallet", cmd_wallet))
     app.add_handler(CommandHandler("wallets", cmd_wallets))
