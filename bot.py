@@ -4465,6 +4465,35 @@ def _lp_cid(slug: str) -> int | None:
     return None
 
 
+def fmt_age_short(sec) -> str:
+    """Umur token dalam satuan yang masih punya arti pada skalanya.
+
+    Dulu selalu dibulatkan ke 0,1 jam — token berumur 11 menit terbaca
+    "0,2 jam", dan itu justru menghilangkan informasi yang paling penting untuk
+    token sebaru itu. Di bawah satu jam yang relevan MENIT, bukan pecahan jam."""
+    try:
+        s = int(sec)
+    except (TypeError, ValueError):
+        return "belum diketahui"
+    if s < 0:
+        return "belum diketahui"
+    if s < 60:
+        inti = f"{s} detik"
+    elif s < 3600:
+        inti = f"{s // 60} menit"
+    elif s < 86400:
+        j, m = s // 3600, (s % 3600) // 60
+        inti = f"{j} jam" + (f" {m} menit" if m else "")
+    else:
+        h, j = s // 86400, (s % 86400) // 3600
+        inti = f"{h} hari" + (f" {j} jam" if j else "")
+    if s < 1800:
+        return inti + " — sangat baru"
+    if s < 86400:
+        return inti + " — baru"
+    return inti
+
+
 def _lp_ctx_lines(e: dict) -> list[str]:
     """Konteks dari GMGN — angka MENTAH apa adanya, tanpa turunan baru.
 
@@ -4488,8 +4517,7 @@ def _lp_ctx_lines(e: dict) -> list[str]:
          + (f" · putaran {e['turnover']:.2f}×" if isinstance(e.get("turnover"), (int, float)) else ""),
          ]
     if isinstance(e.get("ageSeconds"), (int, float)):
-        jam = e["ageSeconds"] / 3600
-        L.append(f"🕐 Umur token {jam:.1f} jam" + (" — sangat baru" if jam < 1 else ""))
+        L.append(f"🕐 Umur token {esc(fmt_age_short(e['ageSeconds']))}")
     if isinstance(e.get("priceChangePercent"), (int, float)):
         L.append(f"📈 Gerak harga {esc(iv)}: {e['priceChangePercent']:+.2f}%")
     def n(v):

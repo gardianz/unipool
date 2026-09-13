@@ -2260,6 +2260,17 @@ User pernah membacanya sebagai satu hal, jadi kartunya WAJIB menjelaskan:
 `confirm`/`window` (2/3) beda lagi: token harus muncul di 2 dari 3 scan terakhir
 sebelum dikirim, untuk menyaring lonjakan satu-tick.
 
+#### Umur token: menit di bawah satu jam, bukan pecahan jam
+
+`fmt_age_short()`. Dulu selalu `{detik/3600:.1f} jam`, jadi token berumur **11
+menit** terbaca **"0,2 jam"** — dan itu justru menghilangkan informasi yang paling
+penting untuk token sebaru itu. Datanya sendiri benar (`creation_timestamp` GMGN
+terverifikasi: 22:34:34, umur 663 detik); yang salah cuma pembulatannya.
+
+Satuan mengikuti skalanya: detik → menit → jam+menit → hari+jam, dengan bagian
+nol dibuang ("1 jam", bukan "1 jam 0 menit"). Penanda "sangat baru" (<30 menit)
+dan "baru" (<24 jam) ikut, sama seperti versi Node.
+
 #### Editor filter bertombol
 
 `sf|__list` → daftar per kelompok (`gmgn.FILTER_GROUPS`) → `sf|<key>` → editor
