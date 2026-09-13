@@ -509,7 +509,9 @@ async def show_main_menu(update: Update, msg=None):
 
 
 # ---------- Settings via tombol ----------
-SET_KEYS = "width, amount, amount_pct, slippage, gap, alert, autoswap"
+SET_KEYS = "width, amount, amount_pct, slippage, impact, gap, alert, order, autoswap"
+IMPACT_STEPS = [5.0, 10.0, 15.0, 25.0, 50.0, 100.0]
+ORDER_STEPS = [60, 120, 300, 600]
 SLIP_STEPS = [0.5, 1.0, 3.0, 5.0, 10.0]
 ALERT_STEPS = [0, 30, 60, 120, 300, 600]
 AMT_STEPS = [25.0, 50.0, 75.0, 100.0]
@@ -530,8 +532,16 @@ def apply_setting(s: dict, key: str, val: str) -> str | None:
             s["slippage_pct"] = min(50.0, max(0.1, float(val)))
         elif key == "gap":
             s["gap"] = min(5, max(0, int(float(val))))
+        elif key == "impact":
+            # Batas price impact swap. 100% = penjagaannya mati — biarkan bisa,
+            # tapi kartu tetap MENAMPILKAN angkanya supaya tidak jadi diam-diam.
+            s["impact_max_pct"] = min(100.0, max(1.0, float(val)))
         elif key == "alert":
             s["alert_secs"] = 0 if val in ("off", "0", "no") else max(30, int(float(val)))
+        elif key == "order":
+            # Interval pindai order. Lantainya 30 detik: tiap pindai membaca posisi,
+            # dan itu pemakai kuota RPC terbesar.
+            s["order_secs"] = max(30, int(float(val)))
         elif key == "autoswap":
             s["autoswap"] = val in ("on", "true", "1", "yes")
         else:
@@ -539,6 +549,19 @@ def apply_setting(s: dict, key: str, val: str) -> str | None:
     except ValueError:
         return "Value tidak valid."
     return None
+
+
+def impact_limit() -> float:
+    """Batas price impact swap sebagai pecahan 0..1, dari setelan user.
+
+    `ch._SWAP_IMPACT_MAX` tetap jadi cadangan supaya mesin tetap punya batas
+    kalau setelannya belum ada — penjagaan ini tidak boleh pernah hilang cuma
+    karena settings.json lama."""
+    try:
+        v = float(store.load_settings().get("impact_max_pct") or 0) / 100
+    except (TypeError, ValueError):
+        v = 0
+    return v if 0 < v <= 1 else ch._SWAP_IMPACT_MAX
 
 
 def _next_step(steps: list, cur):
@@ -554,6 +577,11 @@ def cycle_setting(key: str):
         s["slippage_pct"] = _next_step(SLIP_STEPS, s["slippage_pct"])
     elif key == "gap":
         s["gap"] = (int(s.get("gap", 1)) + 1) % 6
+    elif key == "impact":
+        s["impact_max_pct"] = _next_step(
+            IMPACT_STEPS, float(s.get("impact_max_pct") or ch._SWAP_IMPACT_MAX * 100))
+    elif key == "order":
+        s["order_secs"] = _next_step(ORDER_STEPS, int(s.get("order_secs", 120) or 120))
     elif key == "alert":
         s["alert_secs"] = _next_step(ALERT_STEPS, int(s.get("alert_secs", 60) or 0))
     elif key == "autoswap":
@@ -566,36 +594,92 @@ def cycle_setting(key: str):
     store.save_settings(s)
 
 
+def _sec(judul: str) -> list:
+    """Baris judul seksi. `noop` = tombol yang sengaja tidak melakukan apa-apa."""
+    return [InlineKeyboardButton(f"— {judul} —", callback_data="noop")]
+
+
 def settings_text() -> str:
     s = store.load_settings()
     cfg = ch.CHAINS[s["chain"]]
+    w = wallet_address()
     return (
         "⚙️ <b>Pengaturan</b>\n"
-        f"Chain aktif: {s['chain']} ({esc(cfg['name'])})\n\n"
-        "Klik tombol untuk ganti nilai (▸ = putar preset).\n"
+        f"⛓ {esc(cfg['name'])} ({s['chain']}) · 👛 <code>{esc(w[:6])}…{esc(w[-4:])}</code>\n\n"
+        "▸ = putar preset. Angka apa pun bisa diketik lewat "
+        "<b>Set nilai manual</b>.\n\n"
         "· <b>Slippage</b> — toleransi harga saat mint/swap\n"
-        "· <b>Gap</b> — jarak range single-sided dari harga (tick-spacing; 0 = nempel)\n"
-        "· <b>Alert</b> — interval cek posisi keluar/masuk range\n"
-        "· <b>Autoswap</b> — hasil close otomatis di-swap ke wrapped native\n"
-        "· <b>Amount</b> — default besaran deposit\n"
-        "· <b>Width</b> — default lebar range %"
+        "· <b>Impact</b> — batas price impact swap; di atasnya kartu minta izin dulu\n"
+        "· <b>Gap</b> — jarak range single-sided dari harga (satuan tick-spacing)\n"
+        "· <b>Autoswap</b> — hasil close otomatis ditukar ke quote pool\n"
+        "· <b>Amount / Width</b> — default besaran deposit &amp; lebar range\n"
+        "· <b>Alert / Order</b> — interval pindai monitor. <b>Ini yang paling "
+        "menentukan pemakaian kuota RPC</b> — makin rapat makin boros."
     )
 
 
 def settings_kb() -> InlineKeyboardMarkup:
     s = store.load_settings()
+    cid = s["chain"]
+    cfg = ch.CHAINS[cid]
     alert = f"{int(s.get('alert_secs', 60))}s" if s.get("alert_secs") else "off"
+    order = f"{int(s.get('order_secs', 120))}s"
     amount = f"{s['amount_fixed']:g} fix" if s["amount_fixed"] else f"{s['amount_pct']:g}%"
+    imp = float(s.get("impact_max_pct") or ch._SWAP_IMPACT_MAX * 100)
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"Slippage: {s['slippage_pct']:g}% ▸", callback_data="cyc|slippage"),
-         InlineKeyboardButton(f"Gap: {s.get('gap', 1)} ▸", callback_data="cyc|gap")],
-        [InlineKeyboardButton(f"Alert: {alert} ▸", callback_data="cyc|alert"),
-         InlineKeyboardButton(f"Autoswap: {'✅ ON' if s['autoswap'] else '🚫 OFF'}", callback_data="cyc|autoswap")],
-        [InlineKeyboardButton(f"Amount: {amount} ▸", callback_data="cyc|amount"),
-         InlineKeyboardButton(f"Width: {s['width_pct']:g}% ▸", callback_data="cyc|width")],
-        [InlineKeyboardButton("✏️ Set nilai manual…", callback_data="askset")],
+        _sec("📈 Trading"),
+        [InlineKeyboardButton(f"📉 Slippage: {s['slippage_pct']:g}% ▸", callback_data="cyc|slippage"),
+         InlineKeyboardButton(f"💥 Impact: {imp:g}% ▸", callback_data="cyc|impact")],
+        [InlineKeyboardButton(f"🎯 Gap: {s.get('gap', 1)} ▸", callback_data="cyc|gap"),
+         InlineKeyboardButton(f"🔁 Autoswap: {'✅ ON' if s['autoswap'] else '🚫 OFF'}",
+                              callback_data="cyc|autoswap")],
+        _sec("🎛 Tombol & default"),
+        [InlineKeyboardButton(f"💰 Tombol jumlah ({esc(cfg['name'])})", callback_data="setbtn")],
+        [InlineKeyboardButton(f"🔢 Amount: {amount} ▸", callback_data="cyc|amount"),
+         InlineKeyboardButton(f"📐 Width: {s['width_pct']:g}% ▸", callback_data="cyc|width")],
+        _sec("🔔 Monitor"),
+        [InlineKeyboardButton(f"🔔 Alert: {alert} ▸", callback_data="cyc|alert"),
+         InlineKeyboardButton(f"⏱ Order TP/SL: {order} ▸", callback_data="cyc|order")],
+        _sec("⚙️ Umum"),
+        [InlineKeyboardButton(f"⛓ Chain: {esc(cfg['name'])}", callback_data="menu|chain"),
+         InlineKeyboardButton("👛 Wallet", callback_data="menu|wallets")],
+        [InlineKeyboardButton("🔌 Status RPC", callback_data="menu|rpc"),
+         InlineKeyboardButton("✏️ Set nilai manual…", callback_data="askset")],
         BACK_ROW,
     ])
+
+
+def btn_text(cid: int) -> str:
+    cfg = ch.CHAINS[cid]
+    return (f"💰 <b>Tombol jumlah</b> · {esc(cfg['name'])}\n\n"
+            "Tombol jumlah TETAP yang muncul di kartu mint, per simbol. "
+            "Angkanya jumlah token — bukan persen.\n\n"
+            "<i>Satuannya mengikuti budget kartu: quote pool, atau token meme di "
+            "mode Upper. Simbol tanpa tombol memakai tebakan default; tombol A% "
+            "tetap ada apa pun isinya.</i>\n"
+            "Simbol lain (mis. token meme) bisa ditambah lewat "
+            "<code>/presets SIMBOL 100000 500000</code>.")
+
+
+def btn_kb(cid: int) -> InlineKeyboardMarkup:
+    rows = []
+    for sym in preset_syms(cid):
+        vals = presets_get(cid, sym)
+        tampil = vals or amount_presets(sym, cid)
+        rows.append(_sec(sym if vals else f"{sym} · default"))
+        for v in tampil:
+            rows.append([
+                InlineKeyboardButton(f"💰 {v:g} {sym}", callback_data="noop"),
+                InlineKeyboardButton("❌ Hapus", callback_data=f"btndel|{sym}|{v:g}"),
+            ])
+        if len(tampil) < 4:
+            rows.append([InlineKeyboardButton(f"➕ Tambah tombol {sym}",
+                                              callback_data=f"btnadd|{sym}")])
+        if vals:
+            rows.append([InlineKeyboardButton(f"↩️ Balikkan {sym} ke default",
+                                              callback_data=f"btnrst|{sym}")])
+    rows.append([InlineKeyboardButton("⬅️ Pengaturan", callback_data="menu|settings")])
+    return InlineKeyboardMarkup(rows)
 
 
 def chain_kb() -> InlineKeyboardMarkup:
@@ -637,7 +721,8 @@ async def cmd_rpc(update: Update, context: ContextTypes.DEFAULT_TYPE):
     perubahan kode yang bisa memperbaikinya."""
     if not authorized(update):
         return
-    semua = bool(context.args) and str(context.args[0]).lower() in ("all", "semua")
+    args = getattr(context, "args", None) or []      # context None saat dipanggil dari tombol
+    semua = bool(args) and str(args[0]).lower() in ("all", "semua")
     cids = list(ch.CHAINS) if semua else [store.load_settings()["chain"]]
     status = await reply(update, "🔌 Mengecek RPC…")
     rows = await asyncio.to_thread(lambda: [(c, ch.rpc_health(c)) for c in cids])
@@ -672,24 +757,30 @@ async def cmd_presets(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorized(update):
         return
     args = context.args or []
-    s = store.load_settings()
-    tbl = dict(s.get("amount_presets") or {})
+    cid = store.load_settings()["chain"]
+    nama = ch.CHAINS[cid]["name"]
     if not args:
-        baris = [f"· <code>{esc(k)}</code>: {', '.join(f'{float(v):g}' for v in vals)}"
-                 for k, vals in sorted(tbl.items()) if vals]
-        await reply(update, "🔢 <b>Tombol jumlah tetap</b>\n"
-                    + ("\n".join(baris) if baris else "(kosong)")
+        baris = []
+        for sym in preset_syms(cid):
+            v = presets_get(cid, sym)
+            baris.append(f"· <code>{esc(sym)}</code>: "
+                         + (", ".join(f"{x:g}" for x in v) if v
+                            else "<i>tebakan default (" +
+                                 ", ".join(f"{x:g}" for x in amount_presets(sym, cid)) + ")</i>"))
+        await reply(update, f"🔢 <b>Tombol jumlah tetap</b> · {esc(nama)}\n"
+                    + "\n".join(baris)
                     + "\n\nUbah: <code>/presets USDG 10 20 30</code>"
                       "\nHapus: <code>/presets USDG -</code>"
-                      "\nSimbol tanpa entri memakai tebakan default."
                       "\n\n<i>Angka = jumlah token, bukan persen. Satuannya mengikuti "
-                      "budget kartu: quote pool, atau token meme di mode Upper.</i>")
+                      "budget kartu: quote pool, atau token meme di mode Upper. "
+                      "Setelan ini per-chain — mengubahnya di sini tidak menyentuh "
+                      "chain lain. Lewat tombol: /settings → 💰 Tombol jumlah.</i>")
         return
     sym = args[0].upper()
     if len(args) == 1 or args[1] == "-":
-        tbl.pop(sym, None)
-        store.save_settings({**s, "amount_presets": tbl})
-        await reply(update, f"🗑 Preset <b>{esc(sym)}</b> dihapus — kembali ke tebakan default.")
+        presets_set(cid, sym, [])
+        await reply(update, f"🗑 Preset <b>{esc(sym)}</b> di {esc(nama)} dihapus — "
+                            f"kembali ke tebakan default.")
         return
     vals = []
     for a in args[1:5]:
@@ -702,9 +793,8 @@ async def cmd_presets(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await reply(update, "❌ Jumlah harus lebih dari 0.")
             return
         vals.append(v)
-    tbl[sym] = vals
-    store.save_settings({**s, "amount_presets": tbl})
-    await reply(update, f"✅ Preset <b>{esc(sym)}</b>: "
+    vals = presets_set(cid, sym, vals)
+    await reply(update, f"✅ Preset <b>{esc(sym)}</b> di {esc(nama)}: "
                         + ", ".join(f"{v:g}" for v in vals)
                         + "\n<i>Maksimal 4 tombol; sisanya diabaikan.</i>")
 
@@ -1432,7 +1522,7 @@ def build_preview(ctx_data: dict) -> str:
                    if p.get("ver") == 4 and p.get("key") else None)
             ctx_data["_impact"] = imp
             if imp is not None:
-                lim = ctx_data.get("max_impact") or ch._SWAP_IMPACT_MAX
+                lim = ctx_data.get("max_impact") or impact_limit()
                 tag = "  ⚠️ TINGGI" if imp > lim else ""
                 L.append(f"   └ price impact swap: {imp * 100:.1f}%{tag}")
                 if imp > lim:
@@ -1537,8 +1627,61 @@ def budget_sym(ctx_data: dict) -> str:
     return ctx_data["pool_info"]["quote_sym"]
 
 
+def _presets_norm(vals) -> list[float]:
+    out = []
+    for x in vals or []:
+        try:
+            f = float(x)
+        except (TypeError, ValueError):
+            continue
+        if f > 0 and f not in out:
+            out.append(f)
+    return sorted(out)[:4]
+
+
+def presets_get(cid: int, sym: str) -> list[float]:
+    """Preset EKSPLISIT simbol ini di chain ini (tanpa tebakan).
+
+    Disimpan per-chain (`{"4663": {"USDG": [...]}}`) karena simbol yang sama bisa
+    ada di beberapa chain dengan besaran yang wajar berbeda — 0,01 ETH di
+    Robinhood belum tentu sama maunya dengan 0,01 ETH di Base. Bentuk LAMA yang
+    datar (`{"USDG": [...]}`) tetap dibaca sebagai default lintas-chain supaya
+    settings.json yang sudah ada tidak perlu diutak-atik."""
+    per = (store.load_settings().get("amount_presets") or {}).get(str(cid)) or {}
+    return _presets_norm(per.get(sym) or per.get(sym.upper()))
+
+
+def presets_set(cid: int, sym: str, vals) -> list[float]:
+    s = store.load_settings()
+    tbl = {k: (dict(v) if isinstance(v, dict) else v)
+           for k, v in (s.get("amount_presets") or {}).items()}
+    per = dict(tbl.get(str(cid)) or {})
+    vals = _presets_norm(vals)
+    if vals:
+        per[sym.upper()] = vals
+    else:
+        per.pop(sym.upper(), None)
+    tbl[str(cid)] = per
+    store.save_settings({**s, "amount_presets": tbl})
+    return vals
+
+
+def preset_syms(cid: int) -> list[str]:
+    """Simbol yang layak punya tombol jumlah di chain ini, urut stabil."""
+    cfg = ch.CHAINS.get(cid) or {}
+    out = list((cfg.get("quotes") or {}).keys())
+    for extra in (cfg.get("wrapped_symbol"), cfg.get("native_symbol")):
+        if extra and extra not in out:
+            out.append(extra)
+    tbl = (store.load_settings().get("amount_presets") or {}).get(str(cid)) or {}
+    for k in tbl:
+        if k not in out:
+            out.append(k)     # simbol yang ditambahkan user sendiri (mis. token meme)
+    return out
+
+
 def amount_presets(sym: str, cid: int | None = None) -> list[float]:
-    """Jumlah tetap yang ditawarkan untuk simbol ini (dari /presets).
+    """Jumlah tetap yang ditawarkan untuk simbol ini (dari /presets atau menu).
 
     Tanpa entri, hanya simbol QUOTE yang ditebak — stable pakai satuan puluhan,
     wrapped/native pakai pecahan. Token meme TIDAK pernah ditebak: satuannya bisa
@@ -1546,8 +1689,11 @@ def amount_presets(sym: str, cid: int | None = None) -> list[float]:
     tidak pernah masuk akal. Untuk meme, tombol A% memang sudah jawabannya.
     Menebak lewat harga USD akan lebih tepat tapi itu panggilan RPC di jalur render
     keyboard — tidak sepadan untuk angka yang cuma saran."""
-    tbl = store.load_settings().get("amount_presets") or {}
-    v = tbl.get(sym) or tbl.get(sym.upper())
+    v = presets_get(cid, sym) if cid is not None else []
+    if not v:
+        tbl = store.load_settings().get("amount_presets") or {}
+        legacy = tbl.get(sym) or tbl.get(sym.upper())
+        v = _presets_norm(legacy) if isinstance(legacy, list) else []
     if not v:
         known = {"USD" in sym.upper()}
         if cid in ch.CHAINS:
@@ -1557,15 +1703,7 @@ def amount_presets(sym: str, cid: int | None = None) -> list[float]:
         if not any(known):
             return []
         v = [10, 25, 50] if "USD" in sym.upper() else [0.01, 0.025, 0.05]
-    out = []
-    for x in v:
-        try:
-            f = float(x)
-        except (TypeError, ValueError):
-            continue
-        if f > 0:
-            out.append(f)
-    return out[:4]
+    return _presets_norm(v)
 
 
 def confirm_kb(key: str, ctx_data: dict) -> InlineKeyboardMarkup:
@@ -1633,7 +1771,7 @@ def confirm_kb(key: str, ctx_data: dict) -> InlineKeyboardMarkup:
     # Tombol izin impact tinggi hanya muncul kalau memang terlewati — kalau selalu
     # ada, user terbiasa menekannya dan penjagaannya jadi percuma.
     imp = ctx_data.get("_impact")
-    lim = ctx_data.get("max_impact") or ch._SWAP_IMPACT_MAX
+    lim = ctx_data.get("max_impact") or impact_limit()
     if imp is not None and imp > lim:
         rows.append([InlineKeyboardButton(
             f"⚠️ Saya paham, lanjut walau impact {imp * 100:.0f}%",
@@ -1810,6 +1948,26 @@ async def handle_awaiting(update: Update) -> bool:
                     f"<i>Pesan berisi key sudah dihapus dari chat. Key tersimpan di "
                     f"wallets.json (permission 600).</i>", wallets_kb())
         return True
+    if st["kind"] == "btnadd":
+        sym = st["key"]
+        cid = store.load_settings()["chain"]
+        try:
+            v = float((update.message.text or "").strip().replace(",", "."))
+        except ValueError:
+            await reply(update, "❌ Bukan angka. Contoh: <code>25</code> atau <code>0.05</code>.")
+            return True
+        if v <= 0:
+            await reply(update, "❌ Jumlah harus lebih dari 0.")
+            return True
+        # Menambah ke daftar yang TAMPIL: kalau simbol ini masih memakai tebakan,
+        # user mengharapkan tombol BERTAMBAH, bukan tiga tebakan hilang diganti satu.
+        vals = presets_set(cid, sym, (presets_get(cid, sym) or amount_presets(sym, cid)) + [v])
+        await reply(update, f"✅ Tombol <b>{esc(sym)}</b>: "
+                            + ", ".join(f"{x:g}" for x in vals)
+                            + ("\n<i>Maksimal 4 tombol per simbol.</i>" if len(vals) >= 4 else ""))
+        await update.effective_chat.send_message(btn_text(cid), parse_mode=ParseMode.HTML,
+                                                 reply_markup=btn_kb(cid))
+        return True
     if st["kind"] == "setval":
         parts = (update.message.text or "").strip().lower().split()
         if len(parts) != 2:
@@ -1961,7 +2119,7 @@ async def do_mint(update: Update, ctx_data: dict):
     ver = p.get("ver", 3)
     tsym = ctx_data["token"]["symbol"]
     mode = ctx_data["mode"]
-    strategy = {"max_impact": ctx_data.get("max_impact"),
+    strategy = {"max_impact": ctx_data.get("max_impact") or impact_limit(),
                 "mode": mode, "low_pct": ctx_data["low_pct"], "up_pct": ctx_data["up_pct"],
                 "gap": ctx_data.get("gap", 1)}
 
@@ -2859,14 +3017,32 @@ async def finish_rebalance(update, status, cid: int, pid: str, pos, r: dict,
              f"{ch.fmt_amount(r['closed_got1'])} {esc(r['closed_sym1'])} (termasuk fee)",
              f"Minted: ~{ch.fmt_amount(r['deposited'])} {esc(r['deposit_sym'])} "
              f"({ch.fmt_usd(r['deposited_usd'])})"]
-    for label, h in r["steps"]:
-        lines.append(f"{label}: {ch.tx_link(cid, h)}")
+    # Range SESUDAH rebalance wajib disebut: seluruh gunanya rebalance adalah
+    # memindahkan range, jadi kartu tanpa angka barunya memaksa user membuka
+    # kartu posisi hanya untuk tahu apakah hasilnya sesuai harapan.
+    baru = None
+    if r["token_id"]:
+        try:
+            baru = await asyncio.to_thread(position_one, cid, new_pid)
+        except Exception as e:
+            log.warning("baca posisi baru %s: %s", new_pid, e)
+    if baru:
+        lines.append(f"Range baru: {esc(range_str(baru))} · "
+                     + ("🟢 IN range" if baru["in_range"] else "🔴 OUT of range"))
+    for lbl, h in r["steps"]:
+        lines.append(f"{lbl}: {ch.tx_link(cid, h)}")
     if r["token_id"]:
         lines.append(ch.pos_link_any(cid, new_pid))
     g = await asyncio.to_thread(gas_line, cid)
     if g:
         lines.append(g)
-    await edit(status, "\n".join(lines), NAV_KB)
+    kb = NAV_KB
+    if r["token_id"]:
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"📋 Buka {disp_pid(new_pid)}", callback_data=f"pos|{new_pid}")],
+            *NAV_KB.inline_keyboard,
+        ])
+    await edit(status, "\n".join(lines), kb)
 
 
 # ---------- Close flow ----------
@@ -3094,6 +3270,41 @@ async def _route_callback(update: Update):
         return
     if data == "menu|chain":
         await edit(q.message, "⛓ <b>Pilih chain aktif:</b>", chain_kb())
+        return
+    if data == "menu|rpc":
+        await cmd_rpc(update, None)
+        return
+    # --- editor tombol jumlah (per chain) ---
+    if data == "setbtn":
+        cid = store.load_settings()["chain"]
+        await edit(q.message, btn_text(cid), btn_kb(cid))
+        return
+    if data.startswith("btndel|"):
+        _, sym, val = data.split("|", 2)
+        cid = store.load_settings()["chain"]
+        skrg = presets_get(cid, sym) or amount_presets(sym, cid)
+        sisa = [v for v in skrg if f"{v:g}" != val]
+        if not sisa:
+            sisa = [0]      # penanda "sengaja kosong" dibuang _presets_norm -> default lagi
+        # Daftar kosong = kembali ke tebakan default, BUKAN "tanpa tombol". Kalau
+        # user memang mau kosong, dia menghapusnya satu per satu dan tebakannya
+        # muncul lagi — itu perilaku yang sama dengan simbol yang belum pernah diatur.
+        presets_set(cid, sym, sisa)
+        await edit(q.message, btn_text(cid), btn_kb(cid))
+        return
+    if data.startswith("btnrst|"):
+        cid = store.load_settings()["chain"]
+        presets_set(cid, data.split("|", 1)[1], [])
+        await edit(q.message, btn_text(cid), btn_kb(cid))
+        return
+    if data.startswith("btnadd|"):
+        sym = data.split("|", 1)[1]
+        await update.effective_chat.send_message(
+            f"➕ <b>Balas pesan ini</b> dengan jumlah untuk tombol <b>{esc(sym)}</b>.\n"
+            f"Contoh: <code>25</code> atau <code>0.05</code> — jumlah token, bukan persen.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=ForceReply(selective=True, input_field_placeholder="25"))
+        AWAITING[update.effective_chat.id] = {"kind": "btnadd", "key": sym}
         return
     if data == "menu|revoke":
         await cmd_revoke(update, None)

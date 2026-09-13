@@ -1588,12 +1588,29 @@ Dua syarat yang gampang terlewat:
 
 Mode `lower` (100% quote) memakai nilai meme apa adanya: seluruh meme dijual.
 
-### Tombol jumlah TETAP di kartu mint (`/presets`)
+### Tombol jumlah TETAP di kartu mint (`/presets` atau menu Pengaturan)
 
 Selain baris `A 25/50/75/100%`, kartu mint punya baris jumlah tetap —
 `10 USDG`, `0.025 WETH` — lewat callback `amtf|<key>|<jumlah>` yang menyetel
-`ctx["amount_fixed"]`. Diatur `/presets` dan disimpan di
-`settings["amount_presets"]` (`{simbol: [angka, …]}`, maksimal 4 per simbol).
+`ctx["amount_fixed"]`. Diatur lewat `/presets` atau **Pengaturan → 💰 Tombol
+jumlah** (editor bertombol: tambah / hapus / balikkan ke default).
+
+**Disimpan PER CHAIN**: `{"4663": {"USDG": [10, 25, 50]}}`. Simbol yang sama ada
+di beberapa chain dengan besaran yang wajar berbeda — 0,01 ETH di Robinhood belum
+tentu sama maunya dengan 0,01 ETH di Base. Bentuk lama yang datar
+(`{"USDG": […]}`) masih dibaca sebagai default lintas-chain.
+
+**`DEFAULT_SETTINGS["amount_presets"]` WAJIB kosong.** Sempat diisi tebakan, dan
+itu merusak dua hal sekaligus: tebakan terbaca sebagai pilihan EKSPLISIT user,
+sehingga "balikkan ke default" tidak pernah benar-benar mengosongkan dan preset
+satu chain terlihat bocor ke chain lain. Tebakannya dihitung `amount_presets()`
+saat render, bukan disimpan.
+
+`presets_get()` mengembalikan yang EKSPLISIT saja (kosong = pakai tebakan);
+`amount_presets()` yang menambahkan tebakan. Editor membedakan keduanya lewat
+label seksi (`USDG` vs `USDG · default`), dan **➕ Tambah** menambah di ATAS
+daftar yang tampil — kalau tidak, satu klik "tambah" pada simbol bertebakan
+justru menghapus tiga tombol dan menyisakan satu.
 
 **Satuannya satuan BUDGET kartu itu, bukan selalu quote.** `compute_amount()`
 mengembalikan `amount_fixed` apa adanya dan men-short-circuit sebelum
@@ -1608,6 +1625,33 @@ jadi tebakan apa pun menghasilkan tombol yang tidak pernah masuk akal
 `/presets MICRODUCK 100000 500000` tetap bisa dipakai kalau user mau.
 
 Baris kosong tidak dikirim ke Telegram; kalau tidak ada preset, barisnya hilang.
+
+### Menu Pengaturan bersektor
+
+`settings_kb()` dikelompokkan pakai baris judul `_sec()` (tombol ber-callback
+`noop`): Trading / Tombol & default / Monitor / Umum. Seksi Monitor menyebut
+alert DAN order karena **dua angka itu yang paling menentukan pemakaian kuota
+RPC** — teksnya wajib menyebutkan itu, kalau tidak user merapatkan interval tanpa
+tahu ongkosnya.
+
+`impact_max_pct` (setelan baru) menggantikan konstanta mati sebagai batas price
+impact. `impact_limit()` mengembalikannya sebagai pecahan 0..1 dan **jatuh ke
+`ch._SWAP_IMPACT_MAX` kalau setelannya tidak ada** — penjagaan ini tidak boleh
+hilang cuma karena `settings.json` lama.
+
+Tombol yang membuka layar lain memakai prefiks `menu|` (edit pesan di tempat),
+bukan `go|` (kirim pesan baru — itu khusus dari kartu hasil tx supaya kartunya
+tetap ada). `cmd_rpc` dipanggil dari tombol dengan `context=None`, jadi ia membaca
+`getattr(context, "args", None)`.
+
+### Kartu hasil rebalance menyebut range BARU
+
+Seluruh guna rebalance adalah memindahkan range, jadi kartu tanpa angka barunya
+memaksa user membuka kartu posisi hanya untuk tahu hasilnya sesuai atau tidak.
+`finish_rebalance()` membaca posisi baru sekali (`position_one`) lalu menulis
+`Range baru: …` + status IN/OUT, dan menambahkan tombol `pos|<pid baru>` yang
+langsung membuka kartunya. Gagal baca dilewati diam-diam — kartu hasil tx tidak
+boleh batal cuma karena satu pembacaan tambahan.
 
 ### Range selalu dihitung di server
 

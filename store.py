@@ -25,6 +25,8 @@ DEFAULT_SETTINGS = {
     "amount_pct": 50.0,     # % saldo quote yang dipakai (kalau amount_fixed None)
     "amount_fixed": None,   # jumlah quote fix, override amount_pct
     "slippage_pct": 5.0,
+    "impact_max_pct": 25.0,  # batas price impact swap (%); di atasnya kartu minta izin
+
     "autoswap": True,       # swap hasil close → wrapped native
     "gap": 1,               # jarak pengaman range single-sided dari harga (satuan tick-spacing; 0 = nempel)
     "alert_secs": 60,       # interval cek alert in/out range (detik; 0 = off)
@@ -32,14 +34,14 @@ DEFAULT_SETTINGS = {
                             # terukur 199 request RPC, jadi ini langsung menentukan
                             # tagihan CU: 30 detik = ~30M CU/hari untuk 2 wallet
     "wallet_idx": 0,        # wallet aktif (index di daftar PRIVATE_KEY, PRIVATE_KEY_2, ...)
-    # Tombol jumlah TETAP di kartu mint, per simbol satuan budget (quote; meme untuk
-    # mode Upper). Diubah lewat /presets. Angka bukan persen — "10" berarti 10 USDG.
-    "amount_presets": {
-        "USDG": [10, 25, 50], "USDC": [10, 25, 50], "USDT": [10, 25, 50],
-        "ETH": [0.01, 0.025, 0.05], "WETH": [0.01, 0.025, 0.05],
-        "BNB": [0.02, 0.05, 0.1], "WBNB": [0.02, 0.05, 0.1],
-        "HYPE": [0.5, 1, 2], "WHYPE": [0.5, 1, 2],
-    },
+    # Tombol jumlah TETAP di kartu mint, PER CHAIN: {"4663": {"USDG": [10, 25, 50]}}.
+    # Diubah lewat /presets atau menu Pengaturan. Angka = jumlah token, bukan persen.
+    #
+    # Sengaja KOSONG. Isian default ditebak `bot.amount_presets()` saat render, jadi
+    # menyimpannya di sini justru merugikan: tebakan akan terbaca sebagai pilihan
+    # EKSPLISIT user, sehingga tombol "balikkan ke default" tidak pernah benar-benar
+    # mengosongkan dan preset satu chain terlihat bocor ke chain lain.
+    "amount_presets": {},
 }
 
 
