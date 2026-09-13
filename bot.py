@@ -331,6 +331,36 @@ async def edit(msg, text: str, kb: InlineKeyboardMarkup | None = None):
                                          reply_markup=kb, disable_web_page_preview=True)
 
 
+def swap_cost_lines(d: dict, qi: dict) -> list[str]:
+    """Uraian biaya satu swap: fee pool DAN price impact, terpisah.
+
+    Dulu satu angka berlabel "(fee pool + price impact)" — dan labelnya KELIRU:
+    pembandingnya sudah memotong fee, jadi angka itu sebenarnya impact saja.
+    Akibatnya kartu justru MENGECILKAN biaya sebenarnya, dan user membaca fee
+    pool yang wajar sebagai kegagalan routing. Terukur pada close BLAST/ETH:
+    kartu menulis 3,8% padahal biaya sesungguhnya 6,1% — fee pool 4,00% (memang
+    segitu tarif pool-nya) + price impact 2,19%.
+
+    Memisahkannya penting karena tindakannya beda: fee pool cuma bisa dihindari
+    dengan pindah pool (dan routing sudah memilih yang termurah), sedangkan
+    impact dikecilkan dengan memperkecil jumlah swap."""
+    got, ideal = d.get("got") or 0, d.get("ideal") or 0
+    exp = d.get("expect") or 0
+    dec = qi["decimals"]
+    if got <= 0 or (ideal <= 0 and exp <= 0):
+        return []
+    if ideal <= 0:                       # data lama tanpa `ideal`
+        return [f"   └ biaya swap {(1 - got / exp) * 100:.1f}% (price impact) — "
+                f"nilai wajar sebelum swap ~{ch.fmt_amount(exp / 10 ** dec)} {esc(qi['symbol'])}"]
+    fee_pct = (d.get("fee_ppm") or 0) / 1e4
+    impact = (1 - got / exp) if exp > 0 else 0
+    total = 1 - got / ideal
+    return [f"   └ biaya swap <b>{total * 100:.1f}%</b> = fee pool {fee_pct:.2f}% "
+            f"+ price impact {max(0.0, impact) * 100:.2f}%",
+            f"   └ tanpa fee &amp; impact dapat ~{ch.fmt_amount(ideal / 10 ** dec)} "
+            f"{esc(qi['symbol'])}, diterima {ch.fmt_amount(got / 10 ** dec)}"]
+
+
 def gas_line(cid: int) -> str:
     """Baris '⛽ gas' untuk kartu hasil. Kosong kalau tidak ada tx (mis. aksi batal).
 
@@ -3170,12 +3200,7 @@ async def do_close(update: Update, pid: str, autoswap: bool):
                 got = d["got"] / 10 ** qi["decimals"]
                 lines.append(f"swapped {esc(sym)} → {ch.fmt_amount(got)} {esc(qi['symbol'])}: "
                              f"{ch.tx_link(cid, h)}")
-                exp = d.get("expect") or 0
-                if exp > 0 and d["got"] > 0:
-                    cost = 1 - d["got"] / exp
-                    lines.append(f"   └ biaya swap {cost * 100:.1f}% "
-                                 f"(fee pool + price impact) — nilai wajar sebelum swap "
-                                 f"~{ch.fmt_amount(exp / 10 ** qi['decimals'])} {esc(qi['symbol'])}")
+                lines += swap_cost_lines(d, qi)
             await reply(update, "\n".join(lines), DEL_KB)
 
 

@@ -292,8 +292,45 @@ sehingga user tidak bisa tahu berapa yang termakan. `close_v4` sekarang mengemba
 `swap_info` berisi jumlah quote yang BENAR-BENAR diterima (delta saldo) plus nilai
 wajar sebelum swap (harga pool dikurangi fee), dan kartu menghitung selisihnya.
 
+**Fee pool dan price impact WAJIB dipisah, dan `expect` sudah memotong fee.**
+Kartu dulu menulis satu angka berlabel "(fee pool + price impact)" — labelnya
+KELIRU, karena `expect = ideal × (1 − fee)` sehingga angkanya impact SAJA.
+Akibatnya kartu justru MENGECILKAN biaya sebenarnya, dan user membaca fee pool
+yang memang segitu tarifnya sebagai kegagalan routing.
+
+Terukur pada close BLAST/ETH (#2602421), diverifikasi dari event `Swap` on-chain:
+
+| | ETH |
+|---|---|
+| tanpa fee & impact | 0,00948466 |
+| − fee pool **4,00%** (tarif pool itu) | −0,00037939 |
+| − price impact **2,19%** (pool bergeser 423 tick) | −0,00019946 |
+| diterima | **0,00890581** |
+
+Total **6,1%**, sedangkan kartu menulis **3,8%**. Memisahkannya penting karena
+tindakannya beda: fee pool cuma bisa dihindari dengan pindah pool (dan routing
+sudah memilih yang termurah), sedangkan impact dikecilkan dengan memperkecil
+jumlah swap.
+
+**Quote NATIVE: `got` dari delta saldo ikut terpotong GAS tx swap itu sendiri.**
+Terukur 0,0000124 ETH = 0,14% pada swap $22 — dan makin kecil swapnya makin besar
+porsinya. `close_v4` menambahkan `gasUsed × effectiveGasPrice` kembali.
+
+**Pembanding dihitung dari pool yang BENAR-BENAR dipakai.** `v4_swap(..., out=dict)`
+mengisi `out["key"]`/`out["fee_ppm"]`; routing bisa memindahkan pool dan tiap pool
+punya fee sendiri, jadi memakai `key` yang dikirim pemanggil menghasilkan angka
+yang salah begitu rute berpindah.
+
 Terukur di #1774674: 5.859,04 MEME → **261,00 USDG**, nilai wajar $269,57 → biaya
 **3,2%**, yaitu fee pool 1,51% + price impact 1,7%.
+
+**Cara memastikan routing benar-benar bekerja** (dipakai sekali dan berhasil):
+ambil `poolId` dari event `Swap` PoolManager di tx swapnya, susun PoolKey dari
+calldata UniversalRouter lalu buktikan dengan hash, terakhir panggil
+`quoteExactInputSingle(...).call(block_identifier=<blok−1>)` untuk SEMUA kandidat.
+Quote historis itu yang menyelesaikan perdebatan — untuk BLAST hasilnya pool yang
+dipakai memang terbaik (+5,04% di atas alternatif terdekat), jadi 3,8% itu tarif
+pool, bukan bug. Jangan menilai rute dengan quote SEKARANG: harga sudah bergeser.
 
 
 

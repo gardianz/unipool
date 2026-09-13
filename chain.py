@@ -6447,7 +6447,7 @@ def v4_pick_pool(chain_id: int, keys: list, token_in: str, amount_in: int) -> tu
 
 def v4_swap(chain_id: int, pk: str, key: tuple, token_in: str, amount_in: int,
             slippage_pct: float, max_impact: float | None = None,
-            route: bool = True) -> str | None:
+            route: bool = True, out: dict | None = None) -> str | None:
     """Swap exact-in single via UniversalRouter (command V4_SWAP).
     minOut dihitung dari hasil quoter − slippage.
 
@@ -6477,6 +6477,12 @@ def v4_swap(chain_id: int, pk: str, key: tuple, token_in: str, amount_in: int,
                         key = tuple(best)
         except Exception as e:      # routing tidak boleh membatalkan swap
             log.warning("rute swap v4: %s", e)
+    if out is not None:
+        # Pool yang BENAR-BENAR dipakai. Pemanggil yang menghitung "biaya swap"
+        # wajib memakai ini, bukan pool yang ia kirim: kalau routing pindah pool,
+        # fee dan harga spot pembandingnya juga ikut pindah.
+        out["key"] = tuple(key)
+        out["fee_ppm"] = key[2] if key[2] < 0x800000 else 0
     account = w3.eth.account.from_key(pk)
     ur_addr = Web3.to_checksum_address(cfg["v4_router"])
     ur = _v4c(w3, chain_id, "v4_router", V4_UR_ABI)
@@ -7445,17 +7451,34 @@ def close_v4(chain_id: int, pk: str, tid: int, slippage_pct: float, autoswap: bo
                 return erc20(w3, qcur).functions.balanceOf(account.address).call()
 
             pre_q = _qbal()
-            sq_before, _ = v4_slot0(w3, chain_id, pid)
-            raw_b = (sq_before / Q96) ** 2
-            mq = raw_b if q_is_t1 else (1 / raw_b if raw_b else 0)   # quote-wei per meme-wei
-            fee_ppm = key[2] if key[2] < 0x800000 else 0
-            expect_q = int(bal * mq * (1 - fee_ppm / 1e6))
             try:
-                sh = v4_swap(chain_id, pk, key, meme, bal, slippage_pct)
+                info: dict = {}
+                sh = v4_swap(chain_id, pk, key, meme, bal, slippage_pct, out=info)
                 if sh:
                     swaps.append((msym, sh))
-                    swap_info.append({"sym": msym, "sold": bal, "got": max(0, _qbal() - pre_q),
-                                      "expect": expect_q, "quote": qcur})
+                    # Pembanding dihitung dari pool yang BENAR-BENAR dipakai —
+                    # routing bisa memindahkannya, dan fee tiap pool beda.
+                    ukey = info.get("key") or key
+                    sq_b, _ = v4_slot0(w3, chain_id, v4_pool_id(ukey))
+                    raw_b = (sq_b / Q96) ** 2
+                    mq = raw_b if q_is_t1 else (1 / raw_b if raw_b else 0)
+                    fee_ppm = info.get("fee_ppm", ukey[2] if ukey[2] < 0x800000 else 0)
+                    ideal_q = int(bal * mq)                     # tanpa fee, tanpa impact
+                    got_q = max(0, _qbal() - pre_q)
+                    # Quote NATIVE: delta saldo ikut terpotong gas tx swap itu sendiri,
+                    # jadi "biaya swap" tampak lebih besar dari yang sebenarnya.
+                    # Terukur 0,0000124 ETH = 0,14% pada swap $22 — dan makin kecil
+                    # swapnya makin besar porsinya.
+                    if qcur.lower() == V4_NATIVE:
+                        try:
+                            rc = w3.eth.get_transaction_receipt(sh)
+                            got_q += rc["gasUsed"] * rc["effectiveGasPrice"]
+                        except Exception:
+                            pass
+                    swap_info.append({"sym": msym, "sold": bal, "got": got_q,
+                                      "ideal": ideal_q, "fee_ppm": fee_ppm,
+                                      "expect": int(ideal_q * (1 - fee_ppm / 1e6)),
+                                      "quote": qcur})
             except Exception as e:
                 swaps.append((msym, f"SWAP GAGAL: {e}"))
 
