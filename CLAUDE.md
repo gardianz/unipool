@@ -1693,6 +1693,61 @@ Tombol **Claim fee cakupannya HANYA chain aktif** dan labelnya wajib menyebut
 nama chain — angka portfolio di atas lintas-chain, jadi tanpa itu user mengira
 semua chain ikut terklaim.
 
+### Setelan berlaku PER CHAIN
+
+Slippage yang wajar di Robinhood belum tentu wajar di BSC, dan interval monitor
+pantas beda per chain karena ongkos RPC-nya beda. `store.PER_CHAIN_KEYS` =
+`slippage_pct`, `impact_max_pct`, `gap`, `autoswap`, `amount_pct`,
+`amount_fixed`, `width_pct`, `alert_secs`, `order_secs`. Sisanya global
+(`chain`, `wallet_idx`, `list_all_chains`, `amount_presets` — yang terakhir sudah
+per-chain di dalamnya).
+
+Caranya sengaja tidak menyentuh pembaca: **`load_settings(cid=None)` menumpuk
+nilai per-chain di atas nilai global**, jadi seluruh `load_settings()["slippage_pct"]`
+yang sudah ada otomatis mendapat nilai chain aktif — nol perubahan di puluhan
+tempat. `save_settings()` merutekan balik: kunci per-chain masuk ke
+`per_chain[<cid>]`, sisanya ke global. Nilai global jadi bawaan untuk chain yang
+belum pernah diatur.
+
+Tiga jebakan, semuanya sudah ditutup:
+
+- **Memindah chain aktif JANGAN lewat `save_settings()`.** Dict yang dikirim
+  pemanggil berisi nilai per-chain milik chain LAMA, dan routing akan
+  menyalinnya ke chain baru. `store.set_chain()` menulis `chain` saja; lima
+  pemanggil (`/chain`, auto-switch `on_address`, `chsel|`, `posc|`, `chtok|`)
+  sudah dipindah ke sana. `set_global()` untuk `wallet_idx`/`amount_presets`/
+  `list_all_chains`.
+- **Menyimpan setelan chain LAIN wajib `save_settings(st, cid=…)`** — tanpa cid
+  eksplisit ia mendarat di chain aktif, dan editor memang bisa mengedit chain
+  yang tidak sedang aktif.
+- **`monitor_loop` harus menghormatinya.** Dulu satu interval untuk semua chain,
+  jadi setelan "600 detik" di satu chain diam-diam tidak berlaku. Sekarang loop
+  berdetak `_MONITOR_TICK` (15 detik) dan tiap chain dipindai hanya kalau
+  intervalnya SENDIRI sudah jatuh tempo (`_LAST_SCAN`). Tick tanpa chain jatuh
+  tempo tidak menembak satu pun request, jadi tagihan RPC tetap ditentukan
+  interval tiap chain — bukan panjang tick.
+
+Reset (`setrst`) memakai `save_settings(..., raw=True)` supaya override per-chain
+ikut terbuang, tapi mempertahankan `chain` dan `wallet_idx`.
+
+### Menu Pengaturan: daftar → pilih jaringan → editor
+
+Tiga layar, dan semuanya dibangun dari satu tabel `SETTING_SPEC` — menambah
+setelan baru cukup satu entri, bukan tiga potong UI. Tiap entri membawa emoji,
+label, field, penjelasan, formatter, dan daftar pilihan.
+
+1. `menu|settings` — kategori saja, tanpa nilai (Trading / Tombol & Tampilan /
+   Otomatisasi / Umum).
+2. `setk|<key>` — pilih jaringan. **Nilai tiap chain ikut ditampilkan di
+   tombolnya** supaya user tidak perlu membuka satu per satu untuk membandingkan.
+3. `setkc|<key>|<cid>` — editor: tombol pilihan cepat (`setv|<key>|<cid>|<val>`)
+   + "Nilai lain…" (`setx|`, balasan teks). Validasinya tetap `apply_setting()`
+   yang sama dengan `/set`, jadi tidak ada aturan yang ditulis dua kali.
+
+Editor tombol jumlah mengikuti pola yang sama (`setbtn` → `setbtnc|<cid>`), dan
+seperti layar setelan lain ia **tidak memindah chain aktif**: mengatur Base
+sambil bekerja di Robinhood harus bisa.
+
 ### Menu Pengaturan bersektor
 
 `settings_kb()` dikelompokkan pakai baris judul `_sec()` (tombol ber-callback

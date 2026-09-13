@@ -139,13 +139,75 @@ def rename_wallet(pk: str, name: str) -> bool:
     return False
 
 
-def load_settings() -> dict:
+# Setelan yang berlaku PER CHAIN. Slippage yang wajar di Robinhood belum tentu
+# wajar di BSC, dan interval monitor pantas beda per chain karena ongkos RPC-nya
+# beda. Sisanya (chain aktif, wallet, amount_presets, list_all_chains) global.
+PER_CHAIN_KEYS = ("slippage_pct", "impact_max_pct", "gap", "autoswap",
+                  "amount_pct", "amount_fixed", "width_pct",
+                  "alert_secs", "order_secs")
+
+
+def _raw_settings() -> dict:
     s = dict(DEFAULT_SETTINGS)
     s.update(_read(SETTINGS_FILE, {}))
     return s
 
 
-def save_settings(s: dict):
+def load_settings(cid: int | None = None) -> dict:
+    """Setelan efektif untuk sebuah chain (default: chain aktif).
+
+    Nilai per-chain ditumpuk DI ATAS nilai global, jadi seluruh pembaca lama
+    (`load_settings()["slippage_pct"]` dst) otomatis mendapat nilai chain aktif
+    tanpa satu pun diubah. Chain yang belum pernah diatur memakai nilai global
+    sebagai bawaan."""
+    s = _raw_settings()
+    c = str(cid if cid is not None else s.get("chain"))
+    for k, v in ((s.get("per_chain") or {}).get(c) or {}).items():
+        if k in PER_CHAIN_KEYS:
+            s[k] = v
+    return s
+
+
+def save_settings(s: dict, raw: bool = False, cid: int | None = None):
+    """Simpan setelan; kunci PER_CHAIN_KEYS otomatis masuk ke chain-nya.
+
+    Pemanggil lama mengirim dict hasil `load_settings()` yang sudah ditumpuk,
+    jadi routing di sini yang membuat mereka jadi per-chain tanpa diubah.
+
+    **Jangan pakai ini untuk MEMINDAH chain aktif** — kunci per-chain di dict itu
+    masih milik chain LAMA dan akan tersalin ke chain baru. Pakai `set_chain()`.
+    `raw=True` menulis apa adanya (dipakai reset)."""
+    if raw:
+        _write(SETTINGS_FILE, s)
+        return
+    base = _raw_settings()
+    c = str(cid if cid is not None else s.get("chain", base.get("chain")))
+    per = {k: (dict(v) if isinstance(v, dict) else v)
+           for k, v in (base.get("per_chain") or {}).items()}
+    cur = dict(per.get(c) or {})
+    out = dict(base)
+    for k, v in s.items():
+        if k == "per_chain":
+            continue
+        if k in PER_CHAIN_KEYS:
+            cur[k] = v
+        else:
+            out[k] = v
+    per[c] = cur
+    out["per_chain"] = per
+    _write(SETTINGS_FILE, out)
+
+
+def set_chain(cid: int):
+    """Pindah chain aktif TANPA menyeret setelan per-chain yang sedang tampil."""
+    s = _raw_settings()
+    s["chain"] = int(cid)
+    _write(SETTINGS_FILE, s)
+
+
+def set_global(key: str, value):
+    s = _raw_settings()
+    s[key] = value
     _write(SETTINGS_FILE, s)
 
 

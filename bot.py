@@ -607,8 +607,7 @@ def _next_step(steps: list, cur):
 def cycle_setting(key: str):
     s = store.load_settings()
     if key == "allchains":
-        s["list_all_chains"] = not s.get("list_all_chains", True)
-        store.save_settings(s)
+        store.set_global("list_all_chains", not s.get("list_all_chains", True))
         return
     if key == "slippage":
         s["slippage_pct"] = _next_step(SLIP_STEPS, s["slippage_pct"])
@@ -629,6 +628,114 @@ def cycle_setting(key: str):
     elif key == "width":
         s["width_pct"] = _next_step(WIDTH_STEPS, s["width_pct"])
     store.save_settings(s)
+
+
+# Spesifikasi tiap setelan yang punya layar sendiri. Satu tabel, tiga layar
+# (daftar → pilih jaringan → editor) dibangun otomatis darinya — menambah setelan
+# baru cukup menambah satu entri, bukan tiga potong UI.
+SETTING_SPEC: dict = {
+    "slippage": {
+        "emoji": "📉", "label": "Slippage", "field": "slippage_pct", "sec": "Trading",
+        "desc": "Toleransi selisih harga saat mint & swap. Terlalu kecil = transaksi "
+                "sering ditolak; terlalu besar = rugi lebih banyak saat pasar bergerak.",
+        "fmt": lambda v: f"{v:g}%", "choices": [0.5, 1, 2, 3, 5, 10, 15, 20],
+    },
+    "impact": {
+        "emoji": "💥", "label": "Dampak Harga", "field": "impact_max_pct", "sec": "Trading",
+        "desc": "Batas price impact swap. Di atas angka ini kartu konfirmasi minta izin "
+                "dulu, bukan menolak diam-diam. minOut TIDAK melindungi dari impact — "
+                "quoter sudah memasukkannya, jadi ini penjagaan terpisah.",
+        "fmt": lambda v: f"{v:g}%", "choices": [5, 10, 15, 25, 50, 100],
+    },
+    "gap": {
+        "emoji": "🎯", "label": "Gap Range", "field": "gap", "sec": "Trading",
+        "desc": "Jarak aman range single-sided dari harga sekarang, dalam satuan "
+                "tick-spacing. 0 = menempel harga.",
+        "fmt": lambda v: f"{int(v)}", "choices": [0, 1, 2, 3, 4, 5],
+    },
+    "autoswap": {
+        "emoji": "🔁", "label": "Autoswap", "field": "autoswap", "sec": "Trading",
+        "desc": "Hasil close otomatis ditukar ke quote pool. Matikan kalau kamu mau "
+                "menahan token memenya — swap selalu kena fee pool + price impact.",
+        "fmt": lambda v: "ON" if v else "OFF", "choices": ["on", "off"],
+        "clabel": lambda v: "✅ ON" if v == "on" else "🚫 OFF",
+    },
+    "amount": {
+        "emoji": "🔢", "label": "Jumlah Default", "field": "amount_pct", "sec": "Trading",
+        "desc": "Besaran deposit default di kartu mint, sebagai persen modal. "
+                "Jumlah TETAP (mis. 10 USDG) diatur di menu Tombol Jumlah.",
+        "fmt": lambda v: f"{v:g}%", "choices": [10, 25, 50, 75, 100],
+    },
+    "width": {
+        "emoji": "📐", "label": "Lebar Range", "field": "width_pct", "sec": "Trading",
+        "desc": "Lebar range default dalam persen.",
+        "fmt": lambda v: f"{v:g}%", "choices": [10, 25, 50, 75, 100, 150, 300],
+    },
+    "alert": {
+        "emoji": "🔔", "label": "Alert Range", "field": "alert_secs", "sec": "Otomatisasi",
+        "desc": "Interval cek posisi keluar/masuk range. <b>Ini pemakai kuota RPC "
+                "terbesar</b> — makin rapat makin boros. 0 = mati.",
+        "fmt": lambda v: f"{int(v)}s" if v else "OFF",
+        "choices": ["off", 30, 60, 120, 300, 600],
+    },
+    "order": {
+        "emoji": "⏱", "label": "Order TP/SL", "field": "order_secs", "sec": "Otomatisasi",
+        "desc": "Interval cek pesanan TP/SL. Sama seperti Alert, tiap pindai membaca "
+                "posisi — jadi angka ini langsung menentukan tagihan RPC.",
+        "fmt": lambda v: f"{int(v)}s", "choices": [30, 60, 120, 300, 600],
+    },
+}
+
+
+def _sval(cid: int, key: str):
+    spec = SETTING_SPEC[key]
+    return store.load_settings(cid).get(spec["field"])
+
+
+def setkey_text(key: str, cid: int) -> str:
+    spec = SETTING_SPEC[key]
+    return (f"{spec['emoji']} <b>{esc(spec['label'])}</b> · {esc(ch.CHAINS[cid]['name'])}\n\n"
+            f"{spec['desc']}\n\n"
+            f"Nilai sekarang: <b>{esc(spec['fmt'](_sval(cid, key)))}</b>\n"
+            f"<i>Setelan ini berlaku untuk {esc(ch.CHAINS[cid]['name'])} saja.</i>")
+
+
+def setkey_kb(key: str, cid: int) -> InlineKeyboardMarkup:
+    spec = SETTING_SPEC[key]
+    now = spec["fmt"](_sval(cid, key))
+    rows, baris = [], []
+    for c in spec["choices"]:
+        lbl = spec["clabel"](c) if spec.get("clabel") else \
+            ("OFF" if c == "off" else spec["fmt"](float(c)))
+        baris.append(InlineKeyboardButton(("✓ " if lbl.lstrip("✅🚫 ") == now else "") + lbl,
+                                          callback_data=f"setv|{key}|{cid}|{c}"))
+        if len(baris) == 3:
+            rows.append(baris); baris = []
+    if baris:
+        rows.append(baris)
+    if not spec.get("clabel"):
+        rows.append([InlineKeyboardButton("✏️ Nilai lain…", callback_data=f"setx|{key}|{cid}")])
+    rows.append([InlineKeyboardButton("⬅️ Pilih Jaringan", callback_data=f"setk|{key}"),
+                 InlineKeyboardButton("⚙️ Pengaturan", callback_data="menu|settings")])
+    return InlineKeyboardMarkup(rows)
+
+
+def setnet_kb(key: str) -> InlineKeyboardMarkup:
+    """Pilih jaringan untuk sebuah setelan. Nilai tiap chain ikut ditampilkan supaya
+    user tidak perlu membuka satu per satu untuk membandingkan."""
+    aktif = store.load_settings()["chain"]
+    spec = SETTING_SPEC[key]
+    rows, baris = [], []
+    for cid, cfg in ch.CHAINS.items():
+        baris.append(InlineKeyboardButton(
+            ("✓ " if cid == aktif else "") + f"{cfg['name']} · {spec['fmt'](_sval(cid, key))}",
+            callback_data=f"setkc|{key}|{cid}"))
+        if len(baris) == 2:
+            rows.append(baris); baris = []
+    if baris:
+        rows.append(baris)
+    rows.append([InlineKeyboardButton("⬅️ Pengaturan", callback_data="menu|settings")])
+    return InlineKeyboardMarkup(rows)
 
 
 def _sec(judul: str) -> list:
@@ -664,22 +771,22 @@ def settings_kb() -> InlineKeyboardMarkup:
     amount = f"{s['amount_fixed']:g} fix" if s["amount_fixed"] else f"{s['amount_pct']:g}%"
     imp = float(s.get("impact_max_pct") or ch._SWAP_IMPACT_MAX * 100)
     allc = bool(s.get("list_all_chains", True))
-    return InlineKeyboardMarkup([
-        _sec("Trading"),
-        [InlineKeyboardButton(f"📉 Slippage · {s['slippage_pct']:g}%", callback_data="cyc|slippage"),
-         InlineKeyboardButton(f"💥 Dampak Harga · {imp:g}%", callback_data="cyc|impact")],
-        [InlineKeyboardButton(f"🎯 Gap Range · {s.get('gap', 1)}", callback_data="cyc|gap"),
-         InlineKeyboardButton(f"🔁 Autoswap · {'ON' if s['autoswap'] else 'OFF'}",
-                              callback_data="cyc|autoswap")],
-        [InlineKeyboardButton(f"🔢 Jumlah Default · {amount}", callback_data="cyc|amount"),
-         InlineKeyboardButton(f"📐 Lebar Range · {s['width_pct']:g}%", callback_data="cyc|width")],
+
+    def kbtn(key):
+        sp = SETTING_SPEC[key]
+        return InlineKeyboardButton(f"{sp['emoji']} {sp['label']}", callback_data=f"setk|{key}")
+
+    rows = [_sec("Trading")]
+    trading = ["slippage", "impact", "gap", "autoswap", "amount", "width"]
+    for i in range(0, len(trading), 2):
+        rows.append([kbtn(k) for k in trading[i:i + 2]])
+    rows += [
         _sec("Tombol & Tampilan"),
-        [InlineKeyboardButton("💰 Tombol Jumlah", callback_data="setbtn")],
-        [InlineKeyboardButton(f"🌐 Daftar Lintas Chain · {'ON' if allc else 'OFF'}",
+        [InlineKeyboardButton("💰 Tombol Jumlah", callback_data="setbtn"),
+         InlineKeyboardButton(f"🌐 Lintas Chain · {'ON' if allc else 'OFF'}",
                               callback_data="cyc|allchains")],
         _sec("Otomatisasi"),
-        [InlineKeyboardButton(f"🔔 Alert Range · {alert}", callback_data="cyc|alert"),
-         InlineKeyboardButton(f"⏱ Order TP/SL · {order}", callback_data="cyc|order")],
+        [kbtn("alert"), kbtn("order")],
         _sec("Umum"),
         [InlineKeyboardButton(f"⛓ Rantai · {esc(cfg['name'])}", callback_data="menu|chain"),
          InlineKeyboardButton("👛 Dompet", callback_data="menu|wallets")],
@@ -687,7 +794,8 @@ def settings_kb() -> InlineKeyboardMarkup:
          InlineKeyboardButton("✏️ Set Manual…", callback_data="askset")],
         [InlineKeyboardButton("🗑 Reset Pengaturan", callback_data="setrst")],
         BACK_ROW,
-    ])
+    ]
+    return InlineKeyboardMarkup(rows)
 
 
 def btnnet_kb() -> InlineKeyboardMarkup:
@@ -881,9 +989,7 @@ async def cmd_chain(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     args = context.args or []
     if args and args[0].isdigit() and int(args[0]) in ch.CHAINS:
-        s = store.load_settings()
-        s["chain"] = int(args[0])
-        store.save_settings(s)
+        store.set_chain(int(args[0]))
         await reply(update, f"✅ Chain aktif: {s['chain']} ({esc(ch.CHAINS[s['chain']]['name'])})")
         return
     await reply(update, "⛓ <b>Pilih chain aktif:</b>", chain_kb())
@@ -1085,9 +1191,7 @@ async def handle_wallets_cb(update: Update, q, data: str):
                        wallets_kb())
             return
         store.remove_wallet(pks[i])
-        s = store.load_settings()          # jangan tinggalkan wallet_idx menunjuk entah ke mana
-        s["wallet_idx"] = 0
-        store.save_settings(s)
+        store.set_global("wallet_idx", 0)   # jangan menunjuk wallet yang sudah hilang
         await edit(q.message, "✅ Wallet dihapus.", wallets_kb())
         return
     await edit(q.message, wallets_text(), wallets_kb())
@@ -1154,8 +1258,8 @@ async def on_address(update: Update, _):
     if found and cid not in found:
         if len(found) == 1:
             cid = found[0]
-            s["chain"] = cid
-            store.save_settings(s)
+            store.set_chain(cid)
+            s = store.load_settings()
             await edit(status, f"⛓ Token ini ada di <b>{esc(ch.CHAINS[cid]['name'])}</b> — "
                                f"chain aktif dipindah ke sana.")
         else:
@@ -1723,7 +1827,7 @@ def presets_set(cid: int, sym: str, vals) -> list[float]:
     else:
         per.pop(sym.upper(), None)
     tbl[str(cid)] = per
-    store.save_settings({**s, "amount_presets": tbl})
+    store.set_global("amount_presets", tbl)
     return vals
 
 
@@ -2028,6 +2132,20 @@ async def handle_awaiting(update: Update) -> bool:
                             + ("\n<i>Maksimal 4 tombol per simbol.</i>" if len(vals) >= 4 else ""))
         await update.effective_chat.send_message(btn_text(cid), parse_mode=ParseMode.HTML,
                                                  reply_markup=btn_kb(cid))
+        return True
+    if st["kind"] == "setkey":
+        key, c = st["key"].split("|", 1)
+        cid2 = int(c)
+        cur = store.load_settings(cid2)
+        err = apply_setting(cur, key, (update.message.text or "").strip().lower())
+        if err:
+            await reply(update, f"❌ {esc(err)}")
+            return True
+        store.save_settings(cur, cid=cid2)
+        AWAITING.pop(chat_id, None)
+        await update.effective_chat.send_message(
+            setkey_text(key, cid2), parse_mode=ParseMode.HTML,
+            reply_markup=setkey_kb(key, cid2))
         return True
     if st["kind"] == "setval":
         parts = (update.message.text or "").strip().lower().split()
@@ -3395,9 +3513,7 @@ async def _route_callback(update: Update):
         await show_main_menu(update, msg=q.message)
         return
     if data.startswith("wsel|"):
-        s = store.load_settings()
-        s["wallet_idx"] = int(data.split("|")[1])
-        store.save_settings(s)
+        store.set_global("wallet_idx", int(data.split("|")[1]))
         await show_main_menu(update, msg=q.message)
         return
     if data.startswith("wal|"):
@@ -3423,6 +3539,41 @@ async def _route_callback(update: Update):
         return
     if data == "menu|rpc":
         await cmd_rpc(update, None)
+        return
+    # --- setelan per-jaringan: daftar → pilih jaringan → editor ---
+    if data.startswith("setk|"):
+        key = data.split("|", 1)[1]
+        sp = SETTING_SPEC[key]
+        await edit(q.message, f"{sp['emoji']} <b>{esc(sp['label'])}</b>\n\n"
+                              f"Pilih jaringan untuk dikonfigurasi.\n"
+                              f"<i>{sp['desc']}</i>", setnet_kb(key))
+        return
+    if data.startswith("setkc|"):
+        _, key, c = data.split("|", 2)
+        await edit(q.message, setkey_text(key, int(c)), setkey_kb(key, int(c)))
+        return
+    if data.startswith("setv|"):
+        _, key, c, val = data.split("|", 3)
+        cid2 = int(c)
+        st = store.load_settings(cid2)
+        err = apply_setting(st, key, str(val).lower())
+        if err:
+            await reply(update, f"❌ {esc(err)}")
+            return
+        # cid eksplisit: setelan chain LAIN tidak boleh mendarat di chain aktif
+        store.save_settings(st, cid=cid2)
+        await edit(q.message, setkey_text(key, cid2), setkey_kb(key, cid2))
+        return
+    if data.startswith("setx|"):
+        _, key, c = data.split("|", 2)
+        sp = SETTING_SPEC[key]
+        await update.effective_chat.send_message(
+            f"✏️ <b>Balas pesan ini</b> dengan nilai {esc(sp['label'])} untuk "
+            f"{esc(ch.CHAINS[int(c)]['name'])}.\n"
+            f"Sekarang: <b>{esc(sp['fmt'](_sval(int(c), key)))}</b>",
+            parse_mode=ParseMode.HTML,
+            reply_markup=ForceReply(selective=True, input_field_placeholder="3"))
+        AWAITING[update.effective_chat.id] = {"kind": "setkey", "key": f"{key}|{c}"}
         return
     # --- editor tombol jumlah (per jaringan, TANPA memindah chain aktif) ---
     if data == "setbtn":
@@ -3479,7 +3630,7 @@ async def _route_callback(update: Update):
         # bukan preferensi — meresetnya bikin user tiba-tiba pindah chain.
         baru["chain"] = lama.get("chain", baru["chain"])
         baru["wallet_idx"] = lama.get("wallet_idx", 0)
-        store.save_settings(baru)
+        store.save_settings(baru, raw=True)   # reset: buang juga override per-chain
         await edit(q.message, settings_text(), settings_kb())
         return
     if data == "menu|revoke":
@@ -3505,9 +3656,7 @@ async def _route_callback(update: Update):
         await cmd_list(update, None)
         return
     if data.startswith("chsel|"):
-        s = store.load_settings()
-        s["chain"] = int(data.split("|")[1])
-        store.save_settings(s)
+        store.set_chain(int(data.split("|")[1]))
         await show_main_menu(update, msg=q.message)
         return
     if data.startswith("cyc|"):
@@ -3528,10 +3677,8 @@ async def _route_callback(update: Update):
         # Semua alur aksi (add/close/rebalance/order) membaca chain aktif, jadi ini
         # yang membuat daftar lintas-chain aman tanpa mengoper chain_id ke mana-mana.
         _, c, pid = data.split("|", 2)
-        s2 = store.load_settings()
-        if int(c) != s2["chain"]:
-            s2["chain"] = int(c)
-            store.save_settings(s2)
+        if int(c) != store.load_settings()["chain"]:
+            store.set_chain(int(c))
             await reply(update, f"⛓ Chain aktif dipindah ke <b>{esc(ch.CHAINS[int(c)]['name'])}</b> "
                                 f"— posisi ini ada di sana.")
         await show_position(update, q.message, pid)
@@ -3562,9 +3709,7 @@ async def _route_callback(update: Update):
         # user memilih chain untuk token yang punya pool di beberapa chain
         _, c, tok = data.split("|", 2)
         cid2 = int(c)
-        st = store.load_settings()
-        st["chain"] = cid2
-        store.save_settings(st)
+        store.set_chain(cid2)
         await q.edit_message_reply_markup(None)
         await show_pools_for(q.message, cid2, tok)
         return
@@ -4078,6 +4223,8 @@ async def _gather_positions(cid: int, only_wallets: set | None = None):
     return positions, by_wallet
 
 
+_MONITOR_TICK = 15          # detik antar pemeriksaan "chain mana yang jatuh tempo"
+_LAST_SCAN: dict = {}       # chain -> kapan terakhir dipindai monitor
 _LOOP_LAG = [0.0]   # lag event loop terakhir (detik), diisi _loop_watchdog
 
 
@@ -4107,8 +4254,7 @@ async def monitor_loop(app):
     while True:
         s = store.load_settings()
         active_cid = s["chain"]
-        interval = int(s.get("alert_secs", 60) or 0)
-        alert_on = interval > 0
+        alert_on = int(s.get("alert_secs", 60) or 0) > 0
         order_chains = [c for c in ch.CHAINS if _orders_for_chain(c, "active")]
         chains = set(order_chains)
         if alert_on:
@@ -4116,7 +4262,19 @@ async def monitor_loop(app):
         if not chains:
             await asyncio.sleep(60)
             continue
+        # Interval sekarang PER CHAIN, jadi tiap chain dipindai sesuai setelannya
+        # sendiri — kalau tidak, setelan "600 detik" di satu chain diam-diam tidak
+        # berlaku karena loop memakai angka chain aktif untuk semuanya.
+        now = time.time()
+        due = []
         for cid in chains:
+            sc = store.load_settings(cid)
+            iv = max(30, int(sc.get("order_secs", 120) or 120) if cid in order_chains else 0,
+                     int(sc.get("alert_secs", 60) or 0) if (alert_on and cid == active_cid) else 0)
+            if now - _LAST_SCAN.get(cid, 0) >= iv:
+                _LAST_SCAN[cid] = now
+                due.append(cid)
+        for cid in due:
             try:
                 # Wallet yang dipindai dibatasi: alert cuma untuk chain aktif (semua
                 # wallet), sedangkan pengecekan order cuma butuh wallet pemilik order.
@@ -4148,8 +4306,10 @@ async def monitor_loop(app):
         # 30 detik = 1,15 juta request/hari (~30M CU), yaitu seluruh kuota bulanan
         # Alchemy dalam satu hari, dan throughput-nya menembus batas sehingga muncul
         # 429 yang membuat posisi hilang dari /list.
-        gap = int(s.get("order_secs", 120) or 120) if order_chains else 0
-        await asyncio.sleep(max(30, gap, interval) if (order_chains or alert_on) else 60)
+        # Tick pendek + jatuh tempo per chain di atas: yang menentukan tagihan RPC
+        # tetap interval tiap chain, bukan panjang tidur ini. Tick yang tidak ada
+        # chain jatuh tempo tidak menembak satu pun request.
+        await asyncio.sleep(_MONITOR_TICK)
 
 
 async def post_init(app):
