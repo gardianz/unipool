@@ -539,7 +539,8 @@ async def show_main_menu(update: Update, msg=None):
 
 
 # ---------- Settings via tombol ----------
-SET_KEYS = "width, amount, amount_pct, slippage, impact, gap, alert, order, autoswap"
+SET_KEYS = ("width, amount, amount_pct, slippage, impact, gap, alert, order, "
+            "autoswap, allchains")
 IMPACT_STEPS = [5.0, 10.0, 15.0, 25.0, 50.0, 100.0]
 ORDER_STEPS = [60, 120, 300, 600]
 SLIP_STEPS = [0.5, 1.0, 3.0, 5.0, 10.0]
@@ -574,6 +575,8 @@ def apply_setting(s: dict, key: str, val: str) -> str | None:
             s["order_secs"] = max(30, int(float(val)))
         elif key == "autoswap":
             s["autoswap"] = val in ("on", "true", "1", "yes")
+        elif key == "allchains":
+            s["list_all_chains"] = val in ("on", "true", "1", "yes")
         else:
             return f"Key tidak dikenal: {key}"
     except ValueError:
@@ -603,6 +606,10 @@ def _next_step(steps: list, cur):
 
 def cycle_setting(key: str):
     s = store.load_settings()
+    if key == "allchains":
+        s["list_all_chains"] = not s.get("list_all_chains", True)
+        store.save_settings(s)
+        return
     if key == "slippage":
         s["slippage_pct"] = _next_step(SLIP_STEPS, s["slippage_pct"])
     elif key == "gap":
@@ -656,37 +663,60 @@ def settings_kb() -> InlineKeyboardMarkup:
     order = f"{int(s.get('order_secs', 120))}s"
     amount = f"{s['amount_fixed']:g} fix" if s["amount_fixed"] else f"{s['amount_pct']:g}%"
     imp = float(s.get("impact_max_pct") or ch._SWAP_IMPACT_MAX * 100)
+    allc = bool(s.get("list_all_chains", True))
     return InlineKeyboardMarkup([
-        _sec("📈 Trading"),
-        [InlineKeyboardButton(f"📉 Slippage: {s['slippage_pct']:g}% ▸", callback_data="cyc|slippage"),
-         InlineKeyboardButton(f"💥 Impact: {imp:g}% ▸", callback_data="cyc|impact")],
-        [InlineKeyboardButton(f"🎯 Gap: {s.get('gap', 1)} ▸", callback_data="cyc|gap"),
-         InlineKeyboardButton(f"🔁 Autoswap: {'✅ ON' if s['autoswap'] else '🚫 OFF'}",
+        _sec("Trading"),
+        [InlineKeyboardButton(f"📉 Slippage · {s['slippage_pct']:g}%", callback_data="cyc|slippage"),
+         InlineKeyboardButton(f"💥 Dampak Harga · {imp:g}%", callback_data="cyc|impact")],
+        [InlineKeyboardButton(f"🎯 Gap Range · {s.get('gap', 1)}", callback_data="cyc|gap"),
+         InlineKeyboardButton(f"🔁 Autoswap · {'ON' if s['autoswap'] else 'OFF'}",
                               callback_data="cyc|autoswap")],
-        _sec("🎛 Tombol & default"),
-        [InlineKeyboardButton(f"💰 Tombol jumlah ({esc(cfg['name'])})", callback_data="setbtn")],
-        [InlineKeyboardButton(f"🔢 Amount: {amount} ▸", callback_data="cyc|amount"),
-         InlineKeyboardButton(f"📐 Width: {s['width_pct']:g}% ▸", callback_data="cyc|width")],
-        _sec("🔔 Monitor"),
-        [InlineKeyboardButton(f"🔔 Alert: {alert} ▸", callback_data="cyc|alert"),
-         InlineKeyboardButton(f"⏱ Order TP/SL: {order} ▸", callback_data="cyc|order")],
-        _sec("⚙️ Umum"),
-        [InlineKeyboardButton(f"⛓ Chain: {esc(cfg['name'])}", callback_data="menu|chain"),
-         InlineKeyboardButton("👛 Wallet", callback_data="menu|wallets")],
+        [InlineKeyboardButton(f"🔢 Jumlah Default · {amount}", callback_data="cyc|amount"),
+         InlineKeyboardButton(f"📐 Lebar Range · {s['width_pct']:g}%", callback_data="cyc|width")],
+        _sec("Tombol & Tampilan"),
+        [InlineKeyboardButton("💰 Tombol Jumlah", callback_data="setbtn")],
+        [InlineKeyboardButton(f"🌐 Daftar Lintas Chain · {'ON' if allc else 'OFF'}",
+                              callback_data="cyc|allchains")],
+        _sec("Otomatisasi"),
+        [InlineKeyboardButton(f"🔔 Alert Range · {alert}", callback_data="cyc|alert"),
+         InlineKeyboardButton(f"⏱ Order TP/SL · {order}", callback_data="cyc|order")],
+        _sec("Umum"),
+        [InlineKeyboardButton(f"⛓ Rantai · {esc(cfg['name'])}", callback_data="menu|chain"),
+         InlineKeyboardButton("👛 Dompet", callback_data="menu|wallets")],
         [InlineKeyboardButton("🔌 Status RPC", callback_data="menu|rpc"),
-         InlineKeyboardButton("✏️ Set nilai manual…", callback_data="askset")],
+         InlineKeyboardButton("✏️ Set Manual…", callback_data="askset")],
+        [InlineKeyboardButton("🗑 Reset Pengaturan", callback_data="setrst")],
         BACK_ROW,
     ])
 
 
+def btnnet_kb() -> InlineKeyboardMarkup:
+    """Pilih jaringan yang mau dikonfigurasi — SENGAJA tidak memindah chain aktif.
+
+    Mengatur tombol Base sambil bekerja di Robinhood harus bisa; memindahkan chain
+    aktif hanya untuk mengedit tombol justru membatalkan tujuan 'tidak perlu ganti
+    chain'."""
+    aktif = store.load_settings()["chain"]
+    rows, baris = [], []
+    for cid, cfg in ch.CHAINS.items():
+        baris.append(InlineKeyboardButton(("✓ " if cid == aktif else "") + cfg["name"],
+                                          callback_data=f"setbtnc|{cid}"))
+        if len(baris) == 2:
+            rows.append(baris); baris = []
+    if baris:
+        rows.append(baris)
+    rows.append([InlineKeyboardButton("⬅️ Pengaturan", callback_data="menu|settings")])
+    return InlineKeyboardMarkup(rows)
+
+
 def btn_text(cid: int) -> str:
     cfg = ch.CHAINS[cid]
-    return (f"💰 <b>Tombol jumlah</b> · {esc(cfg['name'])}\n\n"
-            "Tombol jumlah TETAP yang muncul di kartu mint, per simbol. "
-            "Angkanya jumlah token — bukan persen.\n\n"
+    return (f"💰 <b>Tombol Jumlah</b> · {esc(cfg['name'])}\n\n"
+            "Atur nilai tombol jumlah tetap yang muncul di kartu mint, per simbol. "
+            "Angkanya jumlah token — <b>bukan persen</b>.\n\n"
             "<i>Satuannya mengikuti budget kartu: quote pool, atau token meme di "
             "mode Upper. Simbol tanpa tombol memakai tebakan default; tombol A% "
-            "tetap ada apa pun isinya.</i>\n"
+            "tetap ada apa pun isinya. Setelan ini per-jaringan.</i>\n"
             "Simbol lain (mis. token meme) bisa ditambah lewat "
             "<code>/presets SIMBOL 100000 500000</code>.")
 
@@ -700,15 +730,16 @@ def btn_kb(cid: int) -> InlineKeyboardMarkup:
         for v in tampil:
             rows.append([
                 InlineKeyboardButton(f"💰 {v:g} {sym}", callback_data="noop"),
-                InlineKeyboardButton("❌ Hapus", callback_data=f"btndel|{sym}|{v:g}"),
+                InlineKeyboardButton("❌ Hapus", callback_data=f"btndel|{cid}|{sym}|{v:g}"),
             ])
         if len(tampil) < 4:
-            rows.append([InlineKeyboardButton(f"➕ Tambah tombol {sym}",
-                                              callback_data=f"btnadd|{sym}")])
+            rows.append([InlineKeyboardButton(f"➕ Tambah Tombol {sym}",
+                                              callback_data=f"btnadd|{cid}|{sym}")])
         if vals:
             rows.append([InlineKeyboardButton(f"↩️ Balikkan {sym} ke default",
-                                              callback_data=f"btnrst|{sym}")])
-    rows.append([InlineKeyboardButton("⬅️ Pengaturan", callback_data="menu|settings")])
+                                              callback_data=f"btnrst|{cid}|{sym}")])
+    rows.append([InlineKeyboardButton("⬅️ Pilih Jaringan", callback_data="setbtn"),
+                 InlineKeyboardButton("⚙️ Pengaturan", callback_data="menu|settings")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -1979,8 +2010,8 @@ async def handle_awaiting(update: Update) -> bool:
                     f"wallets.json (permission 600).</i>", wallets_kb())
         return True
     if st["kind"] == "btnadd":
-        sym = st["key"]
-        cid = store.load_settings()["chain"]
+        c, sym = st["key"].split("|", 1)
+        cid = int(c)
         try:
             v = float((update.message.text or "").strip().replace(",", "."))
         except ValueError:
@@ -2269,30 +2300,101 @@ async def do_mint(update: Update, ctx_data: dict):
 
 
 # ---------- /list ----------
+_LIST_BUDGET = 5      # detik maks untuk SELURUH pemindaian lintas chain
+_SCAN_TASKS: dict = {}   # chain -> task pindai yang sedang jalan (single-flight)
+
+
+async def _chain_positions(cid: int) -> tuple[int, list, list]:
+    """(cid, posisi, error) satu chain — dipakai pemindaian lintas chain."""
+    errs: list = []
+    try:
+        pos = await asyncio.to_thread(list_positions_all, cid, None, errs)
+    except Exception as e:
+        return cid, [], [f"{ch.CHAINS[cid]['name']}: {type(e).__name__}"]
+    return cid, pos, errs
+
+
+async def _scan_chains(cids: list[int]) -> list[tuple[int, list, list]]:
+    """Pindai beberapa chain paralel dengan SATU anggaran waktu total.
+
+    Anggarannya TOTAL, bukan per-chain: batas per-chain masih bisa menumpuk kalau
+    beberapa chain sama-sama lambat, dan yang dirasakan user cuma "daftar lama
+    muncul". Terukur 4 chain dingin **13,9 detik** — hampir seluruhnya menunggu
+    HyperEVM yang jatuh ke RPC publik.
+
+    Chain yang belum selesai TIDAK dibatalkan: `asyncio.shield` membiarkan
+    task-nya jalan terus dan mengisi `_POS_CACHE`, jadi klik berikutnya sudah
+    lengkap tanpa menunggu lagi. Membatalkannya justru membuat daftar tidak pernah
+    lengkap — tiap klik memulai pembacaan dari nol lalu dibatalkan lagi."""
+    # Single-flight per chain: tanpa ini tiap klik /list memulai pembacaan BARU
+    # untuk chain yang pembacaannya masih jalan — dua kali ongkos RPC, dan
+    # daftarnya tetap tidak pernah lengkap karena yang baru sama lambatnya.
+    tasks = {}
+    for c in cids:
+        t = _SCAN_TASKS.get(c)
+        if t is None or t.done():
+            t = asyncio.ensure_future(_chain_positions(c))
+            _SCAN_TASKS[c] = t
+        tasks[c] = t
+    try:
+        await asyncio.wait(tasks.values(), timeout=_LIST_BUDGET)
+    except Exception:
+        pass
+    out = []
+    for c, t in tasks.items():
+        if t.done() and not t.cancelled():
+            try:
+                out.append(t.result())
+            except Exception as e:
+                out.append((c, [], [f"{ch.CHAINS[c]['name']}: {type(e).__name__}"]))
+            continue
+        # Belum selesai: JANGAN dibatalkan — dibiarkan mengisi `_POS_CACHE` supaya
+        # klik berikutnya langsung lengkap. Membatalkannya membuat daftar tidak
+        # pernah lengkap: tiap klik memulai dari nol lalu dibatalkan lagi.
+        out.append((c, [], [f"{ch.CHAINS[c]['name']}: masih dimuat"]))
+    return out
+
+
 async def cmd_list(update: Update, _, status_msg=None):
     if not authorized(update):
         return
     s = store.load_settings()
     cid = s["chain"]
+    # Semua chain sekaligus: user tidak perlu ganti chain hanya untuk melihat
+    # posisinya. Aksi dana TETAP per-chain, jadi mengklik posisi chain lain
+    # memindahkan chain aktif dulu (`posc|`) — dengan begitu seluruh alur di
+    # belakangnya (add/close/rebalance/order) tetap menunjuk chain yang benar
+    # tanpa perlu mengoper chain_id ke belasan tempat.
+    cids = list(ch.CHAINS) if s.get("list_all_chains", True) else [cid]
+    judul = "semua chain" if len(cids) > 1 else ch.CHAINS[cid]["name"]
     if status_msg is None:
-        status = await reply(update, f"⏳ Loading positions on {esc(ch.CHAINS[cid]['name'])}...")
+        status = await reply(update, f"⏳ Loading positions · {esc(judul)}…")
     else:
         # refresh: pakai pesan /list yang sudah ada, jangan kirim baru
         status = status_msg
-        await edit(status, f"⏳ Refreshing positions on {esc(ch.CHAINS[cid]['name'])}...")
-    read_errors: list = []
-    try:
-        positions = await asyncio.to_thread(list_positions_all, cid, None, read_errors)
-    except Exception as e:
-        await edit(status, f"❌ Gagal load posisi: {esc(e)}")
+        await edit(status, f"⏳ Refreshing positions · {esc(judul)}…")
+    hasil = await _scan_chains(cids)
+    per_chain = {c: (pos, errs) for c, pos, errs in hasil}
+    read_errors = [e for _, _, errs in hasil for e in errs]
+    positions = [p for _, pos, _ in hasil for p in pos]
+    if not positions and all(errs for _, _, errs in hasil) and read_errors:
+        await edit(status, "❌ Gagal load posisi: " + esc(" | ".join(read_errors[:3])))
         return
 
-    # klaim event riwayat lama (tanpa tag wallet) yang posisinya milik wallet ini
-    store.adopt_orphans(cid, wallet_address(), [p["token_id"] for p in positions])
-    summary = store.portfolio_summary(cid, wallet_address())
-    open_value = sum(p["value_usd"] for p in positions)
-    unclaimed = sum(p["unclaimed_usd"] for p in positions)
-    deposits = summary["deposits"]
+    open_value = unclaimed = deposits = 0.0
+    withdrawals = fees_claimed = 0.0
+    churn = 0
+    for c, (pos, _errs) in per_chain.items():
+        # klaim event riwayat lama (tanpa tag wallet) yang posisinya milik wallet ini
+        store.adopt_orphans(c, wallet_address(), [p["token_id"] for p in pos])
+        sm = store.portfolio_summary(c, wallet_address())
+        deposits += sm["deposits"]
+        withdrawals += sm["withdrawals"]
+        fees_claimed += sm["fees_claimed"]
+        churn += store.churn_count(c, wallet_address())
+        open_value += sum(p["value_usd"] for p in pos)
+        unclaimed += sum(p["unclaimed_usd"] for p in pos)
+    summary = {"deposits": deposits, "withdrawals": withdrawals, "fees_claimed": fees_claimed}
     pnl = summary["withdrawals"] + summary["fees_claimed"] + open_value + unclaimed - deposits
     # Persennya HARUS terhadap modal bersih (deposits − withdrawals), bukan deposits
     # kumulatif. Tiap rebalance/pindah pool/compound mencatat close + mint baru,
@@ -2303,7 +2405,6 @@ async def cmd_list(update: Update, _, status_msg=None):
     net_in = max(0.0, deposits - summary["withdrawals"])
     base = net_in or deposits
     pnl_pct = (pnl / base * 100) if base else 0.0
-    churn = store.churn_count(cid, wallet_address())
 
     lines = []
     if len(all_pks()) > 1:
@@ -2324,35 +2425,59 @@ async def cmd_list(update: Update, _, status_msg=None):
     # persis dengan dana yang hilang — dan nilai portfolio di atas ikut kelihatan
     # menyusut padahal posisinya utuh on-chain.
     if read_errors:
-        lines.append(f"⚠️ {len(read_errors)} posisi GAGAL dibaca (RPC sibuk) — "
-                     f"belum tentu tertutup. Klik Refresh.")
+        pending = [e for e in read_errors if e.endswith("masih dimuat")]
+        gagal = [e for e in read_errors if not e.endswith("masih dimuat")]
+        if gagal:
+            lines.append(f"⚠️ {len(gagal)} posisi GAGAL dibaca (RPC sibuk) — "
+                         f"belum tentu tertutup. Klik Refresh.")
+        if pending:
+            lines.append("⏳ " + esc(", ".join(e.split(":")[0] for e in pending))
+                         + " masih dimuat di latar — klik Refresh sebentar lagi.")
         lines.append("")
     if not positions:
         lines.append("Tidak ada posisi aktif." if not read_errors
                      else "Tidak ada posisi yang berhasil dibaca.")
     else:
         lines.append("Klik posisi untuk detail + aksi:")
-    for p in positions:
-        m = _pos_metrics(cid, p)
-        mark = "🟢" if p["in_range"] else "🔴"
-        label = f"{mark} {m['meme_sym']} {_pos_disp(p)} · {ch.fmt_usd(m['cur_total'])}"
-        if m["pnl_pct"] is not None:
-            label += f" · {m['pnl_pct']:+.0f}%"
-        label += f" · {m['age']}"
-        buttons.append([InlineKeyboardButton(label, callback_data=f"pos|{p['pid']}")])
+    banyak = len([c for c in per_chain if per_chain[c][0]]) > 1
+    for c in cids:
+        pos = per_chain.get(c, ([], []))[0]
+        if not pos:
+            continue
+        if banyak:
+            nilai = sum(p["value_usd"] + p["unclaimed_usd"] for p in pos)
+            buttons.append([InlineKeyboardButton(
+                f"— {ch.CHAINS[c]['name']} · {ch.fmt_usd(nilai)} —"
+                + ("" if c == cid else " ↗"), callback_data="noop")])
+        for p in pos:
+            m = _pos_metrics(c, p)
+            mark = "🟢" if p["in_range"] else "🔴"
+            label = f"{mark} {m['meme_sym']} {_pos_disp(p)} · {ch.fmt_usd(m['cur_total'])}"
+            if m["pnl_pct"] is not None:
+                label += f" · {m['pnl_pct']:+.0f}%"
+            label += f" · {m['age']}"
+            # posc| memindahkan chain aktif dulu; pos| tetap ada untuk chain aktif
+            cb = f"pos|{p['pid']}" if c == cid else f"posc|{c}|{p['pid']}"
+            buttons.append([InlineKeyboardButton(label, callback_data=cb)])
     # Posisi tanpa event mint (mis. hasil /recover, atau mint yang sempat dilaporkan
     # gagal) menambah open_value TANPA deposit pembanding — PnL jadi terlalu bagus.
     # Sebut jumlahnya, jangan diam-diam.
-    tanpa_deposit = [p for p in positions if store.mint_usd(cid, p["token_id"]) is None]
+    tanpa_deposit = [p for c, (pos, _e) in per_chain.items() for p in pos
+                     if store.mint_usd(c, p["token_id"]) is None]
     if tanpa_deposit:
         nilai = sum(p["value_usd"] for p in tanpa_deposit)
         lines.insert(len(lines) - 1,
                      f"<i>⚠️ {len(tanpa_deposit)} posisi ({ch.fmt_usd(nilai)}) tidak punya "
                      f"catatan deposit — PnL di atas terlalu bagus sebesar itu.</i>")
     buttons.insert(0, [InlineKeyboardButton("🔄 Refresh", callback_data="refresh")])
-    if unclaimed > 0:
+    # Claim mengirim tx, jadi cakupannya HANYA chain aktif — labelnya wajib
+    # menyebut chainnya, kalau tidak angka portfolio lintas-chain di atas bikin
+    # user mengira semua chain ikut terklaim.
+    unc_aktif = sum(p["unclaimed_usd"] for p in per_chain.get(cid, ([], []))[0])
+    if unc_aktif > 0:
         buttons.insert(1, [InlineKeyboardButton(
-            f"💰 Claim semua fee ({ch.fmt_usd(unclaimed)})", callback_data="claimall")])
+            f"💰 Claim fee {ch.CHAINS[cid]['name']} ({ch.fmt_usd(unc_aktif)})",
+            callback_data="claimall")])
     buttons.append(BACK_ROW)
     await edit(status, "\n".join(lines), InlineKeyboardMarkup(buttons))
 
@@ -3299,14 +3424,18 @@ async def _route_callback(update: Update):
     if data == "menu|rpc":
         await cmd_rpc(update, None)
         return
-    # --- editor tombol jumlah (per chain) ---
+    # --- editor tombol jumlah (per jaringan, TANPA memindah chain aktif) ---
     if data == "setbtn":
-        cid = store.load_settings()["chain"]
+        await edit(q.message, "💰 <b>Tombol Jumlah</b>\n\nPilih jaringan untuk dikonfigurasi.",
+                   btnnet_kb())
+        return
+    if data.startswith("setbtnc|"):
+        cid = int(data.split("|", 1)[1])
         await edit(q.message, btn_text(cid), btn_kb(cid))
         return
     if data.startswith("btndel|"):
-        _, sym, val = data.split("|", 2)
-        cid = store.load_settings()["chain"]
+        _, c, sym, val = data.split("|", 3)
+        cid = int(c)
         skrg = presets_get(cid, sym) or amount_presets(sym, cid)
         sisa = [v for v in skrg if f"{v:g}" != val]
         if not sisa:
@@ -3318,18 +3447,40 @@ async def _route_callback(update: Update):
         await edit(q.message, btn_text(cid), btn_kb(cid))
         return
     if data.startswith("btnrst|"):
-        cid = store.load_settings()["chain"]
-        presets_set(cid, data.split("|", 1)[1], [])
-        await edit(q.message, btn_text(cid), btn_kb(cid))
+        _, c, sym = data.split("|", 2)
+        presets_set(int(c), sym, [])
+        await edit(q.message, btn_text(int(c)), btn_kb(int(c)))
         return
     if data.startswith("btnadd|"):
-        sym = data.split("|", 1)[1]
+        _, c, sym = data.split("|", 2)
         await update.effective_chat.send_message(
-            f"➕ <b>Balas pesan ini</b> dengan jumlah untuk tombol <b>{esc(sym)}</b>.\n"
+            f"➕ <b>Balas pesan ini</b> dengan jumlah untuk tombol <b>{esc(sym)}</b> "
+            f"di {esc(ch.CHAINS[int(c)]['name'])}.\n"
             f"Contoh: <code>25</code> atau <code>0.05</code> — jumlah token, bukan persen.",
             parse_mode=ParseMode.HTML,
             reply_markup=ForceReply(selective=True, input_field_placeholder="25"))
-        AWAITING[update.effective_chat.id] = {"kind": "btnadd", "key": sym}
+        AWAITING[update.effective_chat.id] = {"kind": "btnadd", "key": f"{c}|{sym}"}
+        return
+    if data == "setrst":
+        await edit(q.message,
+                   "🗑 <b>Reset semua pengaturan?</b>\n\n"
+                   "Slippage, impact, gap, autoswap, interval monitor, lebar/jumlah "
+                   "default, dan semua tombol jumlah kembali ke bawaan.\n\n"
+                   "<i>Wallet, posisi, dan riwayat PnL TIDAK tersentuh — yang direset "
+                   "cuma settings.json.</i>",
+                   InlineKeyboardMarkup([
+                       [InlineKeyboardButton("✅ Ya, reset", callback_data="setrst2"),
+                        InlineKeyboardButton("❌ Batal", callback_data="menu|settings")]]))
+        return
+    if data == "setrst2":
+        lama = store.load_settings()
+        baru = dict(store.DEFAULT_SETTINGS)
+        # chain & wallet aktif dipertahankan: keduanya "di mana saya sekarang",
+        # bukan preferensi — meresetnya bikin user tiba-tiba pindah chain.
+        baru["chain"] = lama.get("chain", baru["chain"])
+        baru["wallet_idx"] = lama.get("wallet_idx", 0)
+        store.save_settings(baru)
+        await edit(q.message, settings_text(), settings_kb())
         return
     if data == "menu|revoke":
         await cmd_revoke(update, None)
@@ -3371,6 +3522,19 @@ async def _route_callback(update: Update):
             parse_mode=ParseMode.HTML,
             reply_markup=ForceReply(selective=True, input_field_placeholder="slippage 3"))
         AWAITING[update.effective_chat.id] = {"kind": "setval", "key": ""}
+        return
+    if data.startswith("posc|"):
+        # Posisi di chain LAIN: pindahkan chain aktif dulu, baru buka kartunya.
+        # Semua alur aksi (add/close/rebalance/order) membaca chain aktif, jadi ini
+        # yang membuat daftar lintas-chain aman tanpa mengoper chain_id ke mana-mana.
+        _, c, pid = data.split("|", 2)
+        s2 = store.load_settings()
+        if int(c) != s2["chain"]:
+            s2["chain"] = int(c)
+            store.save_settings(s2)
+            await reply(update, f"⛓ Chain aktif dipindah ke <b>{esc(ch.CHAINS[int(c)]['name'])}</b> "
+                                f"— posisi ini ada di sana.")
+        await show_position(update, q.message, pid)
         return
     if data.startswith("pos|"):
         await show_position(update, q.message, data.split("|", 1)[1])

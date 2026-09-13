@@ -1663,10 +1663,49 @@ jadi tebakan apa pun menghasilkan tombol yang tidak pernah masuk akal
 
 Baris kosong tidak dikirim ke Telegram; kalau tidak ada preset, barisnya hilang.
 
+### `/list` menampilkan SEMUA chain — user tidak perlu ganti chain
+
+`cmd_list` memindai seluruh `CHAINS` (setelan `list_all_chains`, default ON) dan
+mengelompokkan tombolnya per chain. Aksi dana TETAP per-chain, jadi mengklik
+posisi chain lain memakai `posc|<cid>|<pid>` yang **memindahkan chain aktif dulu**
+lalu membuka kartunya. Itu disengaja: seluruh alur di belakangnya
+(add/reduce/close/rebalance/order) membaca chain aktif, jadi cara ini aman tanpa
+mengoper `chain_id` ke belasan tempat — dan user tetap tidak pernah menekan
+"ganti chain" sendiri.
+
+**Satu anggaran waktu TOTAL, bukan per-chain** (`_LIST_BUDGET` = 5 detik). Batas
+per-chain masih bisa menumpuk kalau beberapa chain sama-sama lambat. Terukur
+4 chain dingin **13,9 detik**, hampir seluruhnya menunggu HyperEVM yang jatuh ke
+RPC publik; dengan anggaran total: **5,00 detik**, sisanya ditandai "masih
+dimuat".
+
+Dua hal yang membuat ini tidak jadi bumerang:
+
+- **Chain yang belum selesai JANGAN dibatalkan.** Task-nya dibiarkan jalan dan
+  mengisi `_POS_CACHE`. Membatalkannya membuat daftar tidak pernah lengkap: tiap
+  klik memulai dari nol lalu dibatalkan lagi di detik yang sama.
+- **Single-flight per chain** (`_SCAN_TASKS`). Tanpa itu tiap klik memulai
+  pembacaan BARU untuk chain yang masih jalan — dua kali ongkos RPC dan sama
+  lambatnya. Terukur: klik 1 = 5,00 detik / 41 request (HyperEVM pending), klik 2
+  = 4,40 detik / **6 request** dan sudah LENGKAP, klik 3 = 0,00 detik / 0 request.
+
+Tombol **Claim fee cakupannya HANYA chain aktif** dan labelnya wajib menyebut
+nama chain — angka portfolio di atas lintas-chain, jadi tanpa itu user mengira
+semua chain ikut terklaim.
+
 ### Menu Pengaturan bersektor
 
 `settings_kb()` dikelompokkan pakai baris judul `_sec()` (tombol ber-callback
-`noop`): Trading / Tombol & default / Monitor / Umum. Seksi Monitor menyebut
+`noop`): Trading / Tombol & Tampilan / Otomatisasi / Umum.
+
+**Editor tombol jumlah lewat pemilih JARINGAN** (`setbtn` → `setbtnc|<cid>`), dan
+layar itu **sengaja tidak memindah chain aktif**: mengatur tombol Base sambil
+bekerja di Robinhood harus bisa. Semua callback-nya membawa cid
+(`btnadd|<cid>|<sym>`, `btndel|<cid>|<sym>|<val>`, `btnrst|<cid>|<sym>`) —
+membacanya dari chain aktif akan mengedit jaringan yang salah.
+
+`setrst` mereset `settings.json` ke bawaan tapi **mempertahankan `chain` dan
+`wallet_idx`**: keduanya "di mana saya sekarang", bukan preferensi. Seksi Monitor menyebut
 alert DAN order karena **dua angka itu yang paling menentukan pemakaian kuota
 RPC** — teksnya wajib menyebutkan itu, kalau tidak user merapatkan interval tanpa
 tahu ongkosnya.

@@ -33,6 +33,7 @@ DEFAULT_SETTINGS = {
     "order_secs": 120,      # interval cek order TP/SL (detik) — tiap pindai wallet
                             # terukur 199 request RPC, jadi ini langsung menentukan
                             # tagihan CU: 30 detik = ~30M CU/hari untuk 2 wallet
+    "list_all_chains": True,  # /list menampilkan posisi SEMUA chain, bukan chain aktif saja
     "wallet_idx": 0,        # wallet aktif (index di daftar PRIVATE_KEY, PRIVATE_KEY_2, ...)
     # Tombol jumlah TETAP di kartu mint, PER CHAIN: {"4663": {"USDG": [10, 25, 50]}}.
     # Diubah lewat /presets atau menu Pengaturan. Angka = jumlah token, bukan persen.
