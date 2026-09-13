@@ -231,8 +231,8 @@ def pos_cache_drop(cid: int | None = None) -> None:
         _POS_CACHE.pop(k, None)
 
 
-def list_positions_all(cid: int, key: str | None = None,
-                       errors: list | None = None, fresh: bool = False) -> list[dict]:
+def list_positions_all(cid: int, key: str | None = None, errors: list | None = None,
+                       fresh: bool = False, light: bool = False) -> list[dict]:
     """Posisi v3 + v4 + v2 wallet (v4/v2 dari registry yang dicatat saat mint).
 
     `errors`: ref yang GAGAL dibaca ditampung di sini. WAJIB disebut ke user kalau
@@ -241,9 +241,20 @@ def list_positions_all(cid: int, key: str | None = None,
 
     `fresh=True` melewati cache — WAJIB untuk jalur yang memutuskan aksi dana
     (monitor_loop/eksekutor TP-SL, snapshot sebelum migrate). Jalur tampilan boleh
-    basi; jalur yang memindahkan uang tidak."""
+    basi; jalur yang memindahkan uang tidak.
+
+    `light=True` (monitor) membaca versi murah: `value_usd`/`unclaimed_usd`-nya
+    **0**. Hasilnya karena itu TIDAK boleh masuk `_POS_CACHE` — `/list` akan
+    menampilkan semua posisi bernilai $0. Mode ini melewati cache dua arah."""
     key = key or pk()
     w = _addr_of(key)
+    if light:
+        errs: list = []
+        pos = ch.list_all_positions(cid, key, store.refs(cid, w, "v2"),
+                                    store.refs(cid, w, "v4"), errors=errs, light=True)
+        if errors is not None:
+            errors.extend(errs)
+        return pos
     ck = (cid, w)
     hit = _POS_CACHE.get(ck)
     age = (time.time() - hit[2]) if hit else None
@@ -3487,6 +3498,30 @@ async def _notify(app, body: str):
             pass
 
 
+async def _full_pos(cid: int, p: dict) -> dict:
+    """Detail PENUH sebuah posisi hasil pindai ringan.
+
+    Pindai monitor sengaja tidak membaca fee/jumlah (`value_usd` &
+    `unclaimed_usd` = 0), jadi angka itu WAJIB dibaca ulang sebelum dipakai —
+    kartu alert dan terutama `record_event`, karena event PnL bernilai 0 merusak
+    riwayat secara permanen. Dipanggil hanya saat alert BERBUNYI atau order
+    TERPICU, dan dua-duanya jarang, jadi ongkosnya tidak masuk ke tiap putaran.
+
+    Gagal baca mengembalikan `p` apa adanya — lebih baik satu kartu tanpa angka
+    daripada alert/eksekusi yang batal."""
+    if not p.get("light"):
+        return p
+    try:
+        key = pk_for(p.get("_wallet") or "") or pk()
+        full = await asyncio.to_thread(ch.position_by_pid, cid, key, p["pid"])
+        if full:
+            full["_wallet"] = p.get("_wallet")
+            return full
+    except Exception as e:
+        log.warning("detail penuh %s: %s", p.get("pid"), e)
+    return p
+
+
 async def _emit_range_alerts(app, cid: int, positions: list[dict]):
     for p in positions:
         if p.get("ver") == 2:
@@ -3497,6 +3532,7 @@ async def _emit_range_alerts(app, cid: int, positions: list[dict]):
         RANGE_STATE[key] = now_in
         if prev is None or prev == now_in:
             continue  # baseline pertama / tidak berubah
+        p = await _full_pos(cid, p)   # transisi = jarang, di sini baru bayar penuh
         meme_sym = p["sym0"] if p["quote_is_token1"] else p["sym1"]
         if now_in:
             head = f"🟢 <b>{esc(meme_sym)} {_pos_disp(p)} MASUK range</b> — fee mulai mengalir."
@@ -3556,6 +3592,10 @@ async def _check_orders(app, cid: int, active_orders: list[dict], by_wallet: dic
 
 async def _trigger_order(app, cid: int, o: dict, p: dict, hit: tuple, mc: float):
     kind, level, op = hit
+    # Keputusan trigger memakai `mc` dari pindai ringan (rumusnya identik dengan
+    # jalur penuh), tapi `value_usd`/`unclaimed_usd` di bawah masuk ke
+    # `record_event` — dan event bernilai 0 merusak riwayat PnL permanen.
+    p = await _full_pos(cid, p)
     # KUNCI ANTI DOUBLE-TRIGGER: tandai done SEBELUM eksekusi. Kalau close lambat,
     # iterasi loop berikutnya tidak akan melihat order ini sebagai active lagi.
     store.update_order(cid, o["id"], status="done",
@@ -3621,9 +3661,14 @@ async def _gather_positions(cid: int, only_wallets: set | None = None):
         if only_wallets is not None and waddr not in only_wallets:
             continue
         try:
-            # fresh=True: monitor yang MENGISI cache, dan eksekutor TP/SL tidak
-            # boleh memutuskan close dari angka basi.
-            pk_pos = await asyncio.to_thread(list_positions_all, cid, key, None, True)
+            # Pindai RINGAN: monitor cuma butuh in_range/mc_now/mc_lower, dan
+            # versi ringan menghitungnya dengan rumus yang persis sama (terukur
+            # mc_now identik sampai desimal terakhir) dengan 11 request jadi 5.
+            # value_usd/unclaimed_usd-nya 0 — siapa pun yang butuh angka itu
+            # membaca detail penuh lewat `_full_pos()`.
+            pk_pos = await asyncio.to_thread(list_positions_all, cid, key, None, True, True)
+            for _p in pk_pos:
+                _p["_wallet"] = waddr
         except Exception as e:
             log.warning("monitor posisi %s/%s: %s", cid, waddr, e)
             by_wallet[waddr] = None  # fetch gagal → JANGAN anggap posisi hilang

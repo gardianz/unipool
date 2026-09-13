@@ -1764,11 +1764,41 @@ Pembersihan `RANGE_STATE` HANYA boleh jalan saat pindai penuh (`need is None`) �
 kalau `live` dibangun dari sebagian wallet, entri wallet lain ikut terbuang dan
 transisi range berikutnya hilang karena dianggap baseline baru.
 
-Kalau perlu memangkas lebih jauh: monitor sebenarnya cuma memakai `in_range`,
-`mc_now`, dan `mc_lower`. Itu bisa dihitung dari **satu** panggilan slot0 per pool
-(sisanya statis atau sudah di-cache: `token_supply`, `quote_usd_price`), bukan 12,4
-panggilan per posisi. Belum dikerjakan — perlu jalur "ringan" di
-`_position_detail`/`_v4_position_detail` dan sentuh jalur eksekutor TP/SL.
+#### Pindai monitor memakai jalur RINGAN
+
+Terukur per posisi v4 saat hangat, pembacaan penuh = **6 panggilan**: `ownerOf`,
+`getPoolAndPositionInfo`, `getPositionLiquidity`, `getSlot0`, plus DUA
+(`getFeeGrowthInside` + `getPositionInfo`) yang semata-mata untuk fee unclaimed.
+Monitor sendiri cuma memakai `in_range`, `mc_now`, dan `mc_lower`.
+
+`list_all_positions(..., light=True)` → `_v4_light()` memangkasnya:
+
+- `_v4_static()` men-cache `(PoolKey, tick_lower, tick_upper)` **selamanya** —
+  ketiganya imutabel untuk satu tokenId, dan tokenId v4 monoton naik jadi tidak
+  pernah dipakai ulang. Cache ini juga dipakai jalur PENUH, jadi semua pembacaan
+  ikut hemat satu panggilan.
+- `slot0` dibagi antar posisi yang sepool (`slot0_shared`).
+- `ownerOf` tidak dibaca: `getPositionLiquidity == 0` sudah cukup untuk menyatakan
+  posisi tutup/terbakar.
+- Fee unclaimed TIDAK dibaca sama sekali.
+
+Terukur pada 2 posisi hidup: **11 request → 5** (2,2×), dan `mc_now` **identik
+sampai desimal terakhir** (Δ0,000000%), begitu juga `in_range` dan `mc_lower` —
+rumusnya memang disalin persis. Jadi keputusan TP/SL tidak berubah sedikit pun.
+Penghematannya bukan 10× karena `slot0` tetap satu per POOL dan tiap posisi
+lazimnya di pool berbeda; yang hilang justru bagian termahal (fee).
+
+Tiga penjagaan, dan dua di antaranya pernah jadi bug kalau dilanggar:
+
+- **`value_usd`/`unclaimed_usd` hasil ringan bernilai 0**, ditandai `p["light"]`.
+  `_full_pos()` membacanya ulang SEBELUM dipakai — dipanggil saat alert
+  BERBUNYI dan saat order TERPICU, dua-duanya jarang. `record_event` dengan nilai
+  0 akan merusak riwayat PnL secara permanen.
+- **Hasil ringan TIDAK boleh masuk `_POS_CACHE`.** Kalau masuk, `/list` menampilkan
+  seluruh posisi bernilai $0. `list_positions_all(light=True)` karena itu melewati
+  cache dua arah.
+- **Tiap posisi ditandai `p["_wallet"]`** supaya `_full_pos()` bisa membaca ulang
+  dengan key wallet yang BENAR (`pk_for`), bukan wallet aktif.
 
 ### Daftar posisi: satu pembaca, banyak pembaca gratis
 

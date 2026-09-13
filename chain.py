@@ -6992,6 +6992,92 @@ def pool_stats(w3: Web3, chain_id: int, p: dict, _cache={}) -> dict:
     return out
 
 
+_V4_STATIC: dict[tuple, tuple] = {}   # (chain, tokenId) -> (PoolKey, tick_lo, tick_hi)
+
+
+def _v4_static(w3: Web3, chain_id: int, tid: int) -> tuple:
+    """(PoolKey, tick_lower, tick_upper) posisi v4 — IMUTABEL, jadi di-cache selamanya.
+
+    `getPoolAndPositionInfo` mengembalikan pool + tick posisi, dan keduanya tidak
+    pernah berubah selama tokenId itu hidup; tokenId v4 juga monoton naik dan tidak
+    pernah dipakai ulang. Membacanya ulang tiap pindai monitor berarti satu
+    panggilan RPC per posisi per putaran, terus-menerus, untuk angka yang sama."""
+    ck = (chain_id, int(tid))
+    hit = _V4_STATIC.get(ck)
+    if hit:
+        return hit
+    posm = _v4c(w3, chain_id, "v4_posm", V4_POSM_ABI)
+    key, info = posm.functions.getPoolAndPositionInfo(int(tid)).call()
+    lo, hi = _v4_tick_from_info(info)
+    _V4_STATIC[ck] = (tuple(key), lo, hi)
+    return _V4_STATIC[ck]
+
+
+def _v4_light(w3: Web3, chain_id: int, tid: int, slot0: dict) -> dict | None:
+    """Ringkasan MURAH satu posisi v4: cukup untuk alert range dan pemicu TP/SL.
+
+    Monitor sebenarnya hanya memakai `in_range`, `mc_now`, dan `mc_lower`. Pembacaan
+    penuh terukur **6 panggilan RPC per posisi saat hangat** — `ownerOf`,
+    `getPoolAndPositionInfo`, `getPositionLiquidity`, `getSlot0`, dan DUA lagi
+    (`getFeeGrowthInside` + `getPositionInfo`) yang semata-mata untuk fee unclaimed.
+    Di sini: statiknya dari cache, `slot0` dibagi antar posisi sepool, jadi
+    biayanya **1 panggilan per posisi**.
+
+    `mc_now` dihitung dengan rumus yang PERSIS SAMA seperti `_v4_position_detail`
+    (harga slot0 × selisih desimal × harga quote USD × supply), jadi keputusan
+    TP/SL tidak berubah sedikit pun. Yang TIDAK ada di sini `value_usd` dan
+    `unclaimed_usd` — pemanggil wajib membaca detail penuh saat order benar-benar
+    terpicu atau alert benar-benar berbunyi (dua-duanya jarang)."""
+    try:
+        key, tick_lo, tick_hi = _v4_static(w3, chain_id, tid)
+        posm = _v4c(w3, chain_id, "v4_posm", V4_POSM_ABI)
+        liq = posm.functions.getPositionLiquidity(int(tid)).call()
+        if liq <= 0:
+            return None            # sudah ditutup / dibakar — tanpa perlu ownerOf
+        pid = v4_pool_id(key)
+        sq = slot0.get(pid)
+        if sq is None:
+            sq = slot0[pid] = v4_slot0(w3, chain_id, pid)
+        sqrtp, cur_tick = sq
+        qsym, q_is_t1 = _v4_quote_side(chain_id, key[0], key[1], w3)
+        i0 = _v4_currency_info(w3, chain_id, key[0])
+        i1 = _v4_currency_info(w3, chain_id, key[1])
+        mc_now = mc_lower = mc_upper = None
+        if qsym:
+            qdec, mdec, meme_addr = ((i1["decimals"], i0["decimals"], key[0]) if q_is_t1
+                                     else (i0["decimals"], i1["decimals"], key[1]))
+            raw = (sqrtp / Q96) ** 2
+            qusd = quote_usd_price(w3, chain_id, qsym)
+            supply = token_supply(w3, meme_addr)
+
+            def meme_q_at(t):
+                r = tick_to_price(t)
+                return (r if q_is_t1 else (1 / r if r else 0)) * 10 ** (mdec - qdec)
+
+            mc_lower, mc_upper = sorted([meme_q_at(tick_lo) * qusd * supply,
+                                         meme_q_at(tick_hi) * qusd * supply])
+            meme_in_q = raw * 10 ** (mdec - qdec) if q_is_t1 else \
+                ((1 / raw) * 10 ** (mdec - qdec) if raw else 0)
+            mc_now = meme_in_q * qusd * supply
+        return {
+            "ver": 4, "pid": f"v4:{tid}", "token_id": f"v4:{tid}", "v4_tid": tid,
+            "light": True, "key": key, "pool_id": pid, "fee": key[2], "tick_spacing": key[3],
+            "pool": "0x" + pid.hex().removeprefix("0x"),
+            "token0": key[0], "token1": key[1], "sym0": i0["symbol"], "sym1": i1["symbol"],
+            "dec0": i0["decimals"], "dec1": i1["decimals"],
+            "tick_lower": tick_lo, "tick_upper": tick_hi, "cur_tick": cur_tick,
+            "liquidity": liq, "in_range": tick_lo <= cur_tick < tick_hi,
+            "quote_sym": qsym, "quote_is_token1": q_is_t1,
+            "mc_lower": mc_lower, "mc_upper": mc_upper, "mc_now": mc_now,
+            # Sengaja 0: jalur ringan tidak membaca fee/jumlah. Pemanggil yang
+            # butuh angka ini WAJIB membaca detail penuh — jangan pernah mencatat
+            # event PnL dari sini.
+            "value_usd": 0.0, "unclaimed_usd": 0.0,
+        }
+    except Exception:
+        raise
+
+
 def _v4_position_detail(w3: Web3, chain_id: int, tid: int, account_addr: str) -> dict | None:
     """None kalau posisi bukan milik wallet / sudah di-burn / kosong."""
     cfg = CHAINS[chain_id]
@@ -7002,9 +7088,7 @@ def _v4_position_detail(w3: Web3, chain_id: int, tid: int, account_addr: str) ->
     except Exception:
         return None  # burned
     try:
-        key, info = posm.functions.getPoolAndPositionInfo(tid).call()
-        key = tuple(key)
-        tick_lo, tick_hi = _v4_tick_from_info(info)
+        key, tick_lo, tick_hi = _v4_static(w3, chain_id, tid)   # imutabel, dari cache
         liq = posm.functions.getPositionLiquidity(tid).call()
         pid = v4_pool_id(key)
         sqrtp, cur_tick = v4_slot0(w3, chain_id, pid)
@@ -7464,12 +7548,18 @@ def position_by_pid(chain_id: int, pk: str, pid) -> dict | None:
 
 def list_all_positions(chain_id: int, pk: str, v2_refs: list[str] = (),
                        v4_refs: list[str] = (), full: bool = False,
-                       errors: list | None = None) -> list[dict]:
+                       errors: list | None = None, light: bool = False) -> list[dict]:
     """Posisi v3 (enumerasi NPM) + v4/v2 (dari registry bot). v3 diberi ver/pid.
 
     `errors` (opsional): daftar untuk menampung ref yang GAGAL dibaca. Posisi yang
     gagal dibaca berbeda dari posisi yang memang tidak ada — kalau tidak dibedakan,
-    RPC sibuk terlihat seperti dana hilang."""
+    RPC sibuk terlihat seperti dana hilang.
+
+    `light=True` memakai `_v4_light()` untuk sisi v4: cukup untuk alert range dan
+    pemicu TP/SL, dan **6 panggilan RPC per posisi jadi 1**. Hasilnya bertanda
+    `p["light"]` dan `value_usd`/`unclaimed_usd`-nya **0** — pemanggil WAJIB
+    membaca detail penuh sebelum memakai angka itu (mis. mencatat event PnL).
+    v3/v2 tidak terpengaruh: pembacaannya memang sudah satu panggilan."""
     w3 = get_w3(chain_id)
     account = w3.eth.account.from_key(pk)
     out = []
@@ -7503,7 +7593,12 @@ def list_all_positions(chain_id: int, pk: str, v2_refs: list[str] = (),
                 time.sleep(0.4 * (attempt + 1))
         return None, None
 
+    slot0_shared: dict = {}      # poolId -> (sqrtp, tick); dibagi antar posisi sepool
+
     def _v4_one(r):
+        if light:
+            return _read(lambda x: _v4_light(get_w3(chain_id), chain_id,
+                                             int(x), slot0_shared), r)
         return _read(lambda x: _v4_position_detail(get_w3(chain_id), chain_id,
                                                    int(x), account.address), r)
 
