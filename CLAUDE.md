@@ -2198,16 +2198,62 @@ Private key lewat chat itu permanen di riwayat Telegram, jadi: pesan impor dihap
 begitu dibaca, hasil ekspor dihapus otomatis 60 detik (`_autodelete()`), dan ekspor
 maupun hapus selalu dua langkah dengan peringatan. Jangan hilangkan penjagaan itu.
 
-### Jembatan alert token trending (lp-scanner / GMGN)
+### Scanner token trending (GMGN) — di DALAM bot ini
 
-Scanner GMGN adalah **proses dan repo TERPISAH**
-(`alert/`, github.com/gardianz/lp-scanner — di-`.gitignore` di sini, bukan
-submodule). Ia menulis kandidat yang lolos saringannya ke file JSONL; bot ini
-membacanya, mencari pool, menghitung saran posisi, lalu mengirim kartu bertombol
-yang masuk ke **alur konfirmasi mint yang sudah ada**.
+`gmgn.py` adalah port Python dari lp-scanner (dulu proses Node terpisah). Satu
+repo, satu proses, satu deploy — tanpa file jembatan dan tanpa mesin
+cooldown/Telegram kembar. Dinyalakan lewat `/scanner`, dipaksa jalan sekarang
+lewat `/scan`, butuh `GMGN_API_KEY`. Tanpa key, scanner diam dan sisa bot normal.
 
-`LP_ALERT_INBOX` di kedua sisi harus menunjuk file yang sama. Tanpa env itu,
-jembatannya mati total dan tidak ada perilaku yang berubah.
+**Lima aturan berikut ikut diport dan tidak boleh dilanggar** — semuanya lahir
+dari kejadian nyata, dan melanggarnya membuat bot memberi jawaban salah soal uang:
+
+1. **Nilai kosong BUKAN nol.** `null`, `""`, `-1` = "belum diketahui". Menyamakan
+   dengan 0 membuat "belum diuji" tampil sebagai "pajak 0% • bukan honeypot •
+   wewenang sudah dilepas". `_num()`/`_tri()` yang menjaganya.
+2. **Field keamanan beda per chain.** Solana `renounced_mint`/
+   `renounced_freeze_account`; EVM `is_renounced`/`is_open_source`. Membaca
+   silang menghasilkan vonis palsu.
+3. **Jangan mengarang angka yang tidak diberikan GMGN.** `pool.fee_ratio` terukur
+   `0.1` sementara `trade_fee / volume_24h` pada token yang sama 0,0074% — beda
+   ~13×, unitnya tidak terdokumentasi. Tidak dipakai.
+4. **Label GMGN diteruskan apa adanya.** `insider`/`bundler`/`entrapment`/`sniper`
+   metodenya tidak dipublikasi — ditampilkan dengan sumbernya, bukan jadi vonis.
+5. **Rate limit nyata dan bannya per-IP.** Tiap retry MENAMBAH ban 5 detik sampai
+   5 menit. `Client` menjaga jeda `pace` (default 1 detik) antar request — dan
+   klien-nya dibuat ULANG hanya kalau pace berubah, karena penghitung throttle
+   dan sesi HTTP-nya harus bertahan antar siklus. 429 → tunggu `reset_at`, jangan
+   retry. Kredensial ditolak → scanner DIMATIKAN + user diberi tahu; menunggu
+   tidak menyembuhkan key yang salah.
+
+Tiga hal yang gampang salah dan sudah ditutup:
+
+- **`filters` yang tersimpan TIDAK di-merge dengan default.** Kalau di-merge,
+  `/scanner set maxRugRatio off` tidak akan pernah berfungsi — kunci yang baru
+  dihapus langsung diisi ulang default di siklus berikutnya.
+- **Baris filter dibangun dari `FILTER_SPEC`,** bukan ditulis satu per satu.
+  Filter yang dimatikan tidak punya kunci, dan menuliskannya manual membuat
+  `fmt_usd(None)` meledak — pernah kejadian persis begitu.
+- **Ambang risiko menolak token yang datanya BELUM DIKETAHUI** (`passes()`).
+  Sama seperti perilaku server GMGN, supaya "belum diuji" tidak lolos
+  seolah-olah "aman".
+
+`PollState` (`.scanner_state.json`, ditulis tmp+`rename()`) menyimpan jendela
+konfirmasi dan cooldown. Tanpa itu tiap `systemctl restart` mengirim ulang semua
+kartu yang baru dikirim. Kuncinya `chain:address` — alamat yang sama bisa ada di
+beberapa chain EVM — dan `record(scope=chain)` mencegah scan chain A dihitung
+sebagai "tidak muncul" bagi token chain B yang belum discan siklus itu.
+
+**`/scan` melewati saklar on/off tapi TIDAK melewati konfirmasi + cooldown.**
+Melewatinya akan membuat perintah itu jadi tombol spam.
+
+#### Jembatan file (opsional, untuk umpan dari luar)
+
+`LP_ALERT_INBOX` masih ada dan tetap jalan: proses lain boleh menulis kandidat
+sebagai JSONL dan bot ini memprosesnya lewat jalur yang sama. Tidak diperlukan
+lagi sejak scanner-nya di dalam — dipertahankan supaya sumber lain (mis. scanner
+Node lama di `alert/`, yang di-`.gitignore` dan repo terpisah) tetap bisa dipakai
+tanpa menulis ulang apa pun.
 
 **Mint tetap manual.** Jalur ini tidak pernah mengirim transaksi — ia berhenti di
 kartu pool yang sama persis dengan hasil tempel-CA manual (`show_pools_for`,

@@ -33,6 +33,28 @@ DEFAULT_SETTINGS = {
     "order_secs": 120,      # interval cek order TP/SL (detik) — tiap pindai wallet
                             # terukur 199 request RPC, jadi ini langsung menentukan
                             # tagihan CU: 30 detik = ~30M CU/hari untuk 2 wallet
+    # Scanner token trending (GMGN). Global, bukan per-chain: satu siklus memindai
+    # beberapa chain sekaligus. Filter default = ambang yang sudah dipakai di
+    # lp-scanner; ubah lewat /scanner.
+    "scanner": {
+        "on": False,
+        "chains": ["robinhood", "base", "bsc", "hyperevm"],
+        "interval": "5m",
+        "watch": 60,          # detik antar siklus
+        "limit": 100,         # token diambil per chain (maks 100)
+        "top": 3,             # kartu per chain per siklus
+        "confirm": 2,         # harus muncul di N scan terakhir
+        "window": 3,          # panjang jendela polling
+        "cooldown": 30,       # menit, jangan kirim token sama lagi
+        "pace": 1.0,          # detik jeda antar request GMGN (ban per-IP itu nyata)
+        "include_skip": False,
+        "filters": {
+            "minVolume": 300000, "minMcap": 100000, "minLiquidity": 30000,
+            "minHolder": 200, "minSwaps": 100, "minTurnover": 2,
+            "maxRugRatio": 0.2, "maxTop10Rate": 0.35,
+            "maxSniperHold": 0.15, "maxDevHold": 0.1, "maxAge": "48h",
+        },
+    },
     "list_all_chains": True,  # /list menampilkan posisi SEMUA chain, bukan chain aktif saja
     "wallet_idx": 0,        # wallet aktif (index di daftar PRIVATE_KEY, PRIVATE_KEY_2, ...)
     # Tombol jumlah TETAP di kartu mint, PER CHAIN: {"4663": {"USDG": [10, 25, 50]}}.

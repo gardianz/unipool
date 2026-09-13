@@ -20,6 +20,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 import uuid
+from pathlib import Path
 
 from dotenv import load_dotenv
 from telegram import (BotCommand, ForceReply, InlineKeyboardButton,
@@ -29,6 +30,7 @@ from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
                           ContextTypes, MessageHandler, filters)
 
 import chain as ch
+import gmgn
 import store
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -791,8 +793,10 @@ def settings_kb() -> InlineKeyboardMarkup:
         _sec("Umum"),
         [InlineKeyboardButton(f"⛓ Rantai · {esc(cfg['name'])}", callback_data="menu|chain"),
          InlineKeyboardButton("👛 Dompet", callback_data="menu|wallets")],
-        [InlineKeyboardButton("🔌 Status RPC", callback_data="menu|rpc"),
-         InlineKeyboardButton("✏️ Set Manual…", callback_data="askset")],
+        [InlineKeyboardButton(f"🔭 Scanner · {'ON' if (store.load_settings().get('scanner') or {}).get('on') else 'OFF'}",
+                              callback_data="menu|scanner"),
+         InlineKeyboardButton("🔌 Status RPC", callback_data="menu|rpc")],
+        [InlineKeyboardButton("✏️ Set Manual…", callback_data="askset")],
         [InlineKeyboardButton("🗑 Reset Pengaturan", callback_data="setrst")],
         BACK_ROW,
     ]
@@ -880,6 +884,152 @@ async def cmd_settings(update: Update, _):
 
 
 _RPC_ICON = {"ok": "✅", "quota": "🛑", "burst": "⏳", "error": "❌"}
+
+
+async def cmd_scan(update: Update, context: ContextTypes.DEFAULT_TYPE = None):
+    """/scan — jalankan satu siklus scanner SEKARANG, tanpa menunggu giliran.
+
+    Saklar on/off dilewati, tapi konfirmasi polling dan cooldown TIDAK —
+    melewatinya akan membuat perintah ini jadi tombol spam."""
+    if not authorized(update):
+        return
+    c = scanner_cfg()
+    status = await reply(update, f"🔎 Memindai {esc(', '.join(c.get('chains') or []))} "
+                                 f"({esc(c.get('interval') or '5m')})…")
+    try:
+        app = getattr(context, "application", None) or _APP[0]
+        total, kirim, catatan = await scanner_cycle(app, force=True)
+    except gmgn.RateLimit as e:
+        await edit(status, f"⏳ {esc(e)}")
+        return
+    except Exception as e:
+        await edit(status, f"❌ Scan gagal: {esc(e)}")
+        return
+    if catatan:
+        await edit(status, f"⚠️ {esc(catatan)}")
+        return
+    await edit(status, f"✅ {total} token lolos filter · {kirim} kartu dikirim.\n"
+                       f"<i>Yang tidak dikirim: belum lolos konfirmasi "
+                       f"{c.get('confirm')}/{c.get('window')} polling, atau masih dalam "
+                       f"cooldown {c.get('cooldown')} menit.</i>")
+
+
+def scanner_filters_line(f: dict) -> str:
+    """Ringkasan filter aktif. Kunci yang TIDAK ADA berarti filternya mati."""
+    out = []
+    for key, _api, _field, cmp_, unit in gmgn.FILTER_SPEC:
+        v = (f or {}).get(key)
+        if v is None:
+            continue
+        tanda = "≥" if cmp_ == "gte" else "≤"
+        if unit == "usd":
+            nilai = ch.fmt_usd(float(v))
+        elif unit == "ratio":
+            nilai = f"{float(v) * 100:g}%"
+        elif unit == "percent":
+            nilai = f"{float(v):g}%"
+        elif unit == "duration":
+            nilai = str(v)
+        else:
+            nilai = f"{float(v):,.0f}"
+        out.append(f"{key} {tanda} {nilai}")
+    return " · ".join(out)
+
+
+def scanner_text() -> str:
+    c = scanner_cfg()
+    f = c.get("filters") or {}
+    key = "✅ ada" if gmgn.api_key() else "❌ <b>belum diisi</b> (GMGN_API_KEY)"
+    aktif = [x for x in (c.get("chains") or []) if _lp_cid(x)]
+    lain = [x for x in (c.get("chains") or []) if not _lp_cid(x)]
+    L = [f"🔭 <b>Scanner token trending</b> · {'🟢 ON' if c.get('on') else '🔴 OFF'}",
+         f"Kunci GMGN: {key}",
+         "",
+         f"⛓ Chain: {esc(', '.join(aktif) or '—')}"
+         + (f" · <i>{esc(', '.join(lain))} (kartu info saja, bot tidak bisa LP di sana)</i>" if lain else ""),
+         f"⏱ Interval {esc(c.get('interval'))} · pindai tiap {c.get('watch')}s · "
+         f"jeda antar request {c.get('pace')}s",
+         f"🎯 Kirim maks {c.get('top')}/chain · konfirmasi {c.get('confirm')}/{c.get('window')} "
+         f"polling · cooldown {c.get('cooldown')} menit",
+         "",
+         "<b>Filter</b> " + (f"({len([1 for k in f if f[k] is not None])} aktif)"
+                             if any(v is not None for v in f.values()) else "(tidak ada)"),
+         # Dibangun dari FILTER_SPEC, bukan ditulis satu per satu: filter yang
+         # DIMATIKAN tidak ada kuncinya, dan menuliskannya manual bikin
+         # fmt_usd(None) meledak — pernah kejadian persis begitu.
+         esc(scanner_filters_line(f)) or "—",
+         "",
+         "<i>Ambang risiko menolak token yang datanya BELUM DIKETAHUI — sama seperti "
+         "perilaku server GMGN, supaya 'belum diuji' tidak lolos seolah-olah 'aman'.</i>",
+         "<i>Ubah nilai: </i><code>/scanner set minVolume 500000</code><i>, "
+         "chain: </i><code>/scanner chains robinhood,base</code>"]
+    return "\n".join(L)
+
+
+def scanner_kb() -> InlineKeyboardMarkup:
+    c = scanner_cfg()
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"{'🔴 Matikan' if c.get('on') else '🟢 Nyalakan'}",
+                              callback_data="scan|toggle"),
+         InlineKeyboardButton("🔎 Pindai sekarang", callback_data="scan|now")],
+        [InlineKeyboardButton(f"⏱ Interval · {c.get('interval')}", callback_data="scan|iv"),
+         InlineKeyboardButton(f"🎯 Top · {c.get('top')}", callback_data="scan|top")],
+        [InlineKeyboardButton(f"🕐 Tiap {c.get('watch')}s", callback_data="scan|watch"),
+         InlineKeyboardButton(f"❄️ Cooldown {c.get('cooldown')}m", callback_data="scan|cool")],
+        BACK_ROW,
+    ])
+
+
+async def cmd_scanner(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/scanner — status + setelan. `set <kunci> <nilai>` / `chains <a,b>`."""
+    if not authorized(update):
+        return
+    args = getattr(context, "args", None) or []
+    if args and args[0].lower() == "chains":
+        pilih = [x.strip().lower() for x in " ".join(args[1:]).replace(",", " ").split() if x.strip()]
+        tak = [x for x in pilih if x not in gmgn.CHAINS]
+        if tak:
+            await reply(update, f"❌ Chain tidak dikenal: {esc(', '.join(tak))}\n"
+                                f"Pilihan: {esc(', '.join(gmgn.CHAINS))}")
+            return
+        scanner_save({"chains": pilih})
+        await reply(update, scanner_text(), scanner_kb())
+        return
+    if args and args[0].lower() == "set" and len(args) >= 3:
+        k, v = args[1], args[2]
+        c = scanner_cfg()
+        if k in ("on", "include_skip"):
+            scanner_save({k: v.lower() in ("on", "true", "1", "yes")})
+        elif k in ("interval",):
+            if v not in gmgn.INTERVALS:
+                await reply(update, f"❌ Interval harus salah satu: {esc(', '.join(gmgn.INTERVALS))}")
+                return
+            scanner_save({"interval": v})
+        elif k in ("watch", "top", "confirm", "window", "limit"):
+            scanner_save({k: max(1, int(float(v)))})
+        elif k in ("cooldown", "pace"):
+            scanner_save({k: max(0.2, float(v))})
+        elif k in (f[0] for f in gmgn.FILTER_SPEC):
+            fl = dict(c.get("filters") or {})
+            if v.lower() in ("off", "-", "none"):
+                fl.pop(k, None)
+            elif k in ("minAge", "maxAge"):
+                if gmgn.duration_secs(v) is None:
+                    await reply(update, "❌ Umur harus bentuk <code>30m</code>/<code>6h</code>/<code>7d</code>.")
+                    return
+                fl[k] = v
+            else:
+                fl[k] = float(v)
+            scanner_save({"filters": fl})
+        else:
+            await reply(update, f"❌ Kunci tidak dikenal: <code>{esc(k)}</code>\n"
+                                f"Filter: {esc(', '.join(f[0] for f in gmgn.FILTER_SPEC))}\n"
+                                f"Lain: on, interval, watch, top, confirm, window, limit, "
+                                f"cooldown, pace, include_skip")
+            return
+        await reply(update, scanner_text(), scanner_kb())
+        return
+    await reply(update, scanner_text(), scanner_kb())
 
 
 async def cmd_rpc(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3543,8 +3693,31 @@ async def _route_callback(update: Update):
     if data == "menu|chain":
         await edit(q.message, "⛓ <b>Pilih chain aktif:</b>", chain_kb())
         return
+    if data.startswith("scan|"):
+        act = data.split("|", 1)[1]
+        c = scanner_cfg()
+        if act == "toggle":
+            scanner_save({"on": not c.get("on")})
+        elif act == "now":
+            await q.edit_message_reply_markup(None)
+            await cmd_scan(update, None)
+            return
+        elif act == "iv":
+            iv = list(gmgn.INTERVALS)
+            scanner_save({"interval": iv[(iv.index(c.get("interval") or "5m") + 1) % len(iv)]})
+        elif act == "top":
+            scanner_save({"top": _next_step([1, 3, 5, 10], int(c.get("top") or 3))})
+        elif act == "watch":
+            scanner_save({"watch": _next_step([60, 120, 300, 600], int(c.get("watch") or 60))})
+        elif act == "cool":
+            scanner_save({"cooldown": _next_step([15, 30, 60, 180], int(c.get("cooldown") or 30))})
+        await edit(q.message, scanner_text(), scanner_kb())
+        return
     if data == "menu|rpc":
         await cmd_rpc(update, None)
+        return
+    if data == "menu|scanner":
+        await edit(q.message, scanner_text(), scanner_kb())
         return
     # --- setelan per-jaringan: daftar → pilih jaringan → editor ---
     if data.startswith("setk|"):
@@ -4127,9 +4300,17 @@ def _lp_ctx_lines(e: dict) -> list[str]:
         L.append(f"🕐 Umur token {jam:.1f} jam" + (" — sangat baru" if jam < 1 else ""))
     if isinstance(e.get("priceChangePercent"), (int, float)):
         L.append(f"📈 Gerak harga {esc(iv)}: {e['priceChangePercent']:+.2f}%")
-    L.append(f"👥 Holder {e.get('holderCount') if e.get('holderCount') is not None else '?'}"
-             f" · smart-money {e.get('smartDegenCount') if e.get('smartDegenCount') is not None else '?'}"
-             f" · KOL {e.get('renownedCount') if e.get('renownedCount') is not None else '?'}")
+    def n(v):
+        # _num() mengembalikan float, jadi jumlah wallet harus dibulatkan untuk
+        # ditampilkan — "Holder 3288.0" terbaca seperti angka pecahan yang salah.
+        return f"{v:,.0f}" if isinstance(v, (int, float)) else "?"
+
+    L.append(f"👥 Holder {n(e.get('holderCount'))} · smart-money "
+             f"{n(e.get('smartDegenCount'))} · KOL {n(e.get('renownedCount'))}")
+    if isinstance(e.get("swaps"), (int, float)):
+        L.append(f"🔁 Swap {esc(iv)}: {n(e['swaps'])}"
+                 + (f" · porsi jual {e['sellShare'] * 100:.0f}% ({esc(e.get('sellShareSource') or '')})"
+                    if isinstance(e.get("sellShare"), (int, float)) else ""))
     L.append(f"🛡 Skor rug GMGN {p(e.get('rugRatio'), 1)} · 10 holder teratas "
              f"{p(e.get('top10HolderRate'))}")
     if e.get("pollHits") and e.get("pollWindow"):
@@ -4278,6 +4459,150 @@ async def _lp_alert(app, e: dict):
     except Exception as err:
         log.warning("alert LP %s: %s", addr, err)
         await edit(status, f"❌ Gagal mencari pool: {esc(err)}")
+
+
+# ---------- Scanner token trending bawaan (GMGN) ----------
+# Dulu proses Node terpisah yang menulis file JSONL; sekarang di dalam bot ini
+# supaya satu repo, satu proses, satu deploy. Jembatan file tetap ada dan tetap
+# jalan (`LP_ALERT_INBOX`) kalau suatu saat mau memberi makan dari luar.
+_SCAN_STATE_FILE = str(Path(__file__).with_name(".scanner_state.json"))
+_SCAN = {"client": None, "pace": None, "state": None, "warned": False}
+_APP = [None]        # Application, diisi _start_background — dipakai jalur yang
+                     # dipanggil dari tombol (context-nya tidak selalu ada)
+
+
+def scanner_cfg() -> dict:
+    """Setelan scanner: default ditimpa yang tersimpan.
+
+    **`filters` TIDAK di-merge** — dipakai apa adanya kalau user pernah
+    menyimpannya. Kalau di-merge, `/scanner set maxRugRatio off` tidak akan
+    pernah berfungsi: kunci yang baru dihapus langsung diisi ulang oleh default
+    di siklus berikutnya. Konsekuensinya filter default baru tidak menyusul ke
+    user lama — itu memang yang diinginkan untuk setelan yang sudah disentuh."""
+    saved = store.load_settings().get("scanner") or {}
+    c = {**store.DEFAULT_SETTINGS["scanner"], **saved}
+    c["filters"] = dict(saved["filters"]) if isinstance(saved.get("filters"), dict) \
+        else dict(store.DEFAULT_SETTINGS["scanner"]["filters"])
+    return c
+
+
+def scanner_save(patch: dict):
+    s = store.load_settings()
+    cur = {**store.DEFAULT_SETTINGS["scanner"], **(s.get("scanner") or {})}
+    cur.update(patch)
+    store.set_global("scanner", cur)
+
+
+def _scan_client(pace: float):
+    """Klien GMGN, dibuat ulang HANYA kalau pace berubah — sesi HTTP dan
+    penghitung throttle-nya harus bertahan antar siklus, kalau tidak jeda
+    antar-request-nya hilang dan ban per-IP tinggal menunggu waktu."""
+    if _SCAN["client"] is None or _SCAN["pace"] != pace:
+        key = gmgn.api_key()
+        if not key:
+            return None
+        _SCAN["client"] = gmgn.Client(key, min_interval=pace)
+        _SCAN["pace"] = pace
+    return _SCAN["client"]
+
+
+def _scan_state() -> "gmgn.PollState":
+    if _SCAN["state"] is None:
+        _SCAN["state"] = gmgn.PollState(_SCAN_STATE_FILE)
+    return _SCAN["state"]
+
+
+async def scanner_cycle(app, force: bool = False) -> tuple[int, int, str]:
+    """Satu siklus pindai semua chain. Return (kandidat, kartu, catatan).
+
+    `force` melewati saklar on/off (dipakai /scan), tapi TIDAK melewati
+    konfirmasi polling dan cooldown — dua hal itu yang mencegah chat dibanjiri,
+    dan melewatinya berarti /scan jadi tombol spam."""
+    c = scanner_cfg()
+    if not force and not c.get("on"):
+        return 0, 0, "scanner mati"
+    client = _scan_client(float(c.get("pace") or 1.0))
+    if client is None:
+        return 0, 0, "GMGN_API_KEY belum diisi"
+    st = _scan_state()
+    total = kirim = 0
+    for chain in c.get("chains") or []:
+        if chain not in gmgn.CHAINS:
+            continue
+        tokens = await asyncio.to_thread(gmgn.scan_chain, client, chain,
+                                         c.get("interval") or "5m",
+                                         c.get("filters") or {}, c.get("limit") or 100)
+        total += len(tokens)
+        st.record([f"{chain}:{t['address']}" for t in tokens], int(c.get("window") or 3), chain)
+        rows = []
+        for t in tokens:
+            v = gmgn.classify(t)
+            if v["tier"] == "SKIP" and not c.get("include_skip"):
+                continue
+            rows.append((t, v))
+        for t, v in rows[: int(c.get("top") or 3)]:
+            k = f"{chain}:{t['address']}"
+            if not st.should_alert(k, int(c.get("confirm") or 1), float(c.get("cooldown") or 30)):
+                continue
+            entry = {**t, **v, "pollHits": st.hits(k), "pollWindow": int(c.get("window") or 3)}
+            try:
+                await _lp_alert(app, entry)
+                kirim += 1
+            except Exception as e:
+                log.warning("kartu scanner %s gagal: %s", t.get("symbol"), e)
+    await asyncio.to_thread(st.persist, float(c.get("cooldown") or 30))
+    return total, kirim, ""
+
+
+async def _scanner_loop(app):
+    """Loop scanner. Penanganan error mengikuti sifat GMGN:
+
+    - **429** → tunggu sampai `reset_at`, JANGAN retry. Bannya per-IP dan tiap
+      retry menambahnya 5 detik sampai 5 menit.
+    - **Kredensial ditolak** → matikan scanner dan beri tahu user. Menunggu tidak
+      menyembuhkan key yang salah, dan proses yang terus mencoba cuma
+      menyembunyikan masalahnya di log.
+    - **Sisanya** → backoff eksponensial."""
+    await asyncio.sleep(20)
+    gagal = 0
+    while True:
+        c = scanner_cfg()
+        jeda = max(30, int(c.get("watch") or 60))
+        if not c.get("on"):
+            await asyncio.sleep(30)
+            continue
+        try:
+            total, kirim, catatan = await scanner_cycle(app)
+            if catatan:
+                if not _SCAN["warned"]:
+                    _SCAN["warned"] = True
+                    log.warning("scanner: %s", catatan)
+                await asyncio.sleep(120)
+                continue
+            _SCAN["warned"] = False
+            gagal = 0
+            log.info("scanner: %d token lolos filter, %d kartu dikirim", total, kirim)
+        except gmgn.RateLimit as e:
+            tunggu = max(0, (e.reset_at or 0) - time.time()) + 1 if e.reset_at else jeda
+            log.warning("scanner kena rate limit GMGN — menunggu %.0f detik tanpa retry", tunggu)
+            await asyncio.sleep(tunggu)
+            continue
+        except gmgn.ApiError as e:
+            if e.fatal:
+                scanner_save({"on": False})
+                log.error("scanner dimatikan: kredensial GMGN ditolak (%s)", e)
+                await _notify(app, f"🛑 <b>Scanner dimatikan</b> — GMGN menolak kredensial: "
+                                   f"{esc(e)}\nPerbaiki <code>GMGN_API_KEY</code> lalu "
+                                   f"nyalakan lagi lewat /scanner.")
+                continue
+            gagal += 1
+        except Exception as e:
+            gagal += 1
+            log.warning("siklus scanner gagal (%dx): %s", gagal, e)
+        if gagal:
+            await asyncio.sleep(min(jeda * 2 ** min(gagal, 5), 900))
+            continue
+        await asyncio.sleep(jeda)
 
 
 async def _lp_inbox_loop(app):
@@ -4629,6 +4954,8 @@ async def post_init(app):
             BotCommand("settings", "Pengaturan via tombol"),
             BotCommand("presets", "Tombol jumlah tetap di kartu mint"),
             BotCommand("rpc", "Status RPC + key Alchemy yang habis jatah"),
+            BotCommand("scan", "Pindai token trending sekarang"),
+            BotCommand("scanner", "Setelan scanner token trending"),
             BotCommand("chain", "Ganti chain aktif"),
             BotCommand("revoke", "Cabut approval token yang menganggur"),
             BotCommand("cleanup", "Burn NFT posisi kosong (mempercepat /list)"),
@@ -4671,7 +4998,9 @@ async def _start_background(app):
             break
         await asyncio.sleep(0.1)
     app.create_task(monitor_loop(app))
+    _APP[0] = app
     app.create_task(_lp_inbox_loop(app))
+    app.create_task(_scanner_loop(app))
     app.create_task(_loop_watchdog())
 
 
@@ -5255,6 +5584,8 @@ def main():
     app.add_handler(CommandHandler("set", cmd_set))
     app.add_handler(CommandHandler("presets", cmd_presets))
     app.add_handler(CommandHandler("rpc", cmd_rpc))
+    app.add_handler(CommandHandler("scan", cmd_scan))
+    app.add_handler(CommandHandler("scanner", cmd_scanner))
     app.add_handler(CommandHandler("chain", cmd_chain))
     app.add_handler(CommandHandler("wallet", cmd_wallet))
     app.add_handler(CommandHandler("wallets", cmd_wallets))

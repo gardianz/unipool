@@ -34,3 +34,7 @@ alchemy_keys.txt
 alert/
 lp-inbox.jsonl
 lp-inbox.jsonl.taking
+
+# State scanner token trending (dibangun ulang otomatis)
+.scanner_state.json
+.scanner_state.json.tmp
