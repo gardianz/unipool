@@ -2247,6 +2247,36 @@ sebagai "tidak muncul" bagi token chain B yang belum discan siklus itu.
 **`/scan` melewati saklar on/off tapi TIDAK melewati konfirmasi + cooldown.**
 Melewatinya akan membuat perintah itu jadi tombol spam.
 
+#### Tiga angka waktu yang berbeda — jangan tertukar
+
+User pernah membacanya sebagai satu hal, jadi kartunya WAJIB menjelaskan:
+
+| | arti |
+|---|---|
+| `interval` (5m) | jendela data GMGN — "volume 5 menit terakhir". Bukan jadwal. |
+| `watch` (60s) | seberapa sering bot memindai. |
+| `cooldown` (30m) | **per TOKEN**, bukan per scan. Token yang sudah dikirim tidak dikirim lagi selama itu; scan tetap jalan dan token LAIN tetap masuk. |
+
+`confirm`/`window` (2/3) beda lagi: token harus muncul di 2 dari 3 scan terakhir
+sebelum dikirim, untuk menyaring lonjakan satu-tick.
+
+#### Editor filter bertombol
+
+`sf|__list` → daftar per kelompok (`gmgn.FILTER_GROUPS`) → `sf|<key>` → editor
+nilai (`sfv|<key>|<val>`, `sfx|` untuk ketik bebas, `off` untuk mematikan).
+Pilihan cepat per satuan ada di `gmgn.FILTER_CHOICES` — angka bulat yang lazim,
+bukan hasil ukur apa pun.
+
+**Validasi hidup di SATU tempat**, `scanfilt_set()`: tombol dan `/scanner set`
+memakainya berdua, jadi aturannya tidak bisa berbeda. Rasio ditolak di luar 0–1
+(user mengetik "5" untuk 5% itu wajar, dan tanpa cek ini filternya jadi mati
+total karena tidak ada rasio yang melebihi 5), umur wajib bentuk `30m`/`6h`/`7d`,
+dan nilai negatif ditolak untuk USD/count.
+
+Daftar filter dirender dari `FILTER_SPEC` + `FILTER_DESC`, bukan ditulis satu per
+satu — filter yang dimatikan tidak punya kunci, dan menulisnya manual membuat
+`fmt_usd(None)` meledak (pernah kejadian).
+
 #### Jembatan file (opsional, untuk umpan dari luar)
 
 `LP_ALERT_INBOX` masih ada dan tetap jalan: proses lain boleh menulis kandidat

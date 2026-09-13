@@ -936,6 +936,123 @@ def scanner_filters_line(f: dict) -> str:
     return " · ".join(out)
 
 
+def _filt_fmt(unit: str, v) -> str:
+    """Tampilan satu nilai filter menurut satuannya."""
+    if v is None:
+        return "—"
+    if unit == "usd":
+        return ch.fmt_usd(float(v))
+    if unit == "ratio":
+        return f"{float(v) * 100:g}%"
+    if unit == "percent":
+        return f"{float(v):+g}%"
+    if unit == "duration":
+        return str(v)
+    return f"{float(v):,.0f}"
+
+
+def scanfilt_text() -> str:
+    f = scanner_cfg().get("filters") or {}
+    aktif = sum(1 for v in f.values() if v is not None)
+    return ("🎚 <b>Filter scanner</b>\n\n"
+            f"{aktif} filter aktif. Klik untuk mengubah atau mematikan.\n\n"
+            "<i>Filter yang MATI tidak menyaring apa pun. Yang hidup menolak token "
+            "yang datanya BELUM DIKETAHUI — sama seperti perilaku server GMGN, "
+            "supaya 'belum diuji' tidak lolos seolah-olah 'aman'.</i>\n"
+            "<i>Filter ber-awalan min/max dikirim ke server GMGN sebagai saringan "
+            "kasar lalu DICEK ULANG di sini; beberapa (turnover, rug, perubahan "
+            "harga) memang cuma bisa dihitung lokal.</i>")
+
+
+def scanfilt_kb() -> InlineKeyboardMarkup:
+    f = scanner_cfg().get("filters") or {}
+    rows = []
+    for judul, keys in gmgn.FILTER_GROUPS:
+        rows.append(_sec(judul))
+        baris = []
+        for k in keys:
+            spec = gmgn.filter_spec(k)
+            if not spec:
+                continue
+            nilai = _filt_fmt(spec[4], f.get(k))
+            tanda = "≥" if spec[3] == "gte" else "≤"
+            aktif = "" if f.get(k) is None else "✓ "
+            baris.append(InlineKeyboardButton(f"{aktif}{k} {tanda} {nilai}",
+                                              callback_data=f"sf|{k}"))
+            if len(baris) == 2:
+                rows.append(baris); baris = []
+        if baris:
+            rows.append(baris)
+    rows.append([InlineKeyboardButton("↩️ Balikkan semua ke default", callback_data="sf|__reset"),
+                 InlineKeyboardButton("⬅️ Scanner", callback_data="menu|scanner")])
+    return InlineKeyboardMarkup(rows)
+
+
+def scanfilt_one_text(key: str) -> str:
+    spec = gmgn.filter_spec(key)
+    f = scanner_cfg().get("filters") or {}
+    tanda = "minimum" if spec[3] == "gte" else "maksimum"
+    lokal = "" if spec[1] else ("\n<i>Hanya dihitung lokal — GMGN tidak punya "
+                                "parameter server untuk filter ini.</i>")
+    return (f"🎚 <b>{esc(key)}</b>\n"
+            f"{esc(gmgn.FILTER_DESC.get(key, key))} — ambang <b>{tanda}</b>.\n\n"
+            f"Sekarang: <b>{esc(_filt_fmt(spec[4], f.get(key)))}</b>"
+            f"{lokal}\n\n"
+            f"<i>Token yang nilainya belum diketahui TIDAK lolos selama filter ini "
+            f"hidup.</i>")
+
+
+def scanfilt_one_kb(key: str) -> InlineKeyboardMarkup:
+    spec = gmgn.filter_spec(key)
+    f = scanner_cfg().get("filters") or {}
+    now = f.get(key)
+    rows, baris = [], []
+    for c in gmgn.FILTER_CHOICES.get(spec[4], []):
+        sama = str(now) == str(c) or (isinstance(now, (int, float))
+                                      and isinstance(c, (int, float)) and float(now) == float(c))
+        baris.append(InlineKeyboardButton(("✓ " if sama else "") + _filt_fmt(spec[4], c),
+                                          callback_data=f"sfv|{key}|{c}"))
+        if len(baris) == 3:
+            rows.append(baris); baris = []
+    if baris:
+        rows.append(baris)
+    rows.append([InlineKeyboardButton("✏️ Nilai lain…", callback_data=f"sfx|{key}"),
+                 InlineKeyboardButton("🚫 Matikan filter", callback_data=f"sfv|{key}|off")])
+    rows.append([InlineKeyboardButton("⬅️ Daftar filter", callback_data="sf|__list"),
+                 InlineKeyboardButton("🔭 Scanner", callback_data="menu|scanner")])
+    return InlineKeyboardMarkup(rows)
+
+
+def scanfilt_set(key: str, raw) -> str | None:
+    """Setel satu filter. Return pesan error, atau None kalau sukses.
+
+    Validasinya sama dengan `/scanner set` — satu tempat, supaya tombol dan
+    perintah teks tidak bisa berbeda aturan."""
+    spec = gmgn.filter_spec(key)
+    if not spec:
+        return f"Filter tidak dikenal: {key}"
+    f = dict(scanner_cfg().get("filters") or {})
+    v = str(raw).strip()
+    if v.lower() in ("off", "-", "none", "mati"):
+        f.pop(key, None)
+    elif spec[4] == "duration":
+        if gmgn.duration_secs(v) is None:
+            return "Umur harus bentuk 30m / 6h / 7d."
+        f[key] = v
+    else:
+        try:
+            num = float(v.replace(",", "."))
+        except ValueError:
+            return f"'{v}' bukan angka."
+        if spec[4] == "ratio" and not (0 <= num <= 1):
+            return "Rasio harus 0–1 (mis. 0.2 untuk 20%)."
+        if spec[4] in ("usd", "count") and num < 0:
+            return "Nilai tidak boleh negatif."
+        f[key] = num
+    scanner_save({"filters": f})
+    return None
+
+
 def scanner_text() -> str:
     c = scanner_cfg()
     f = c.get("filters") or {}
@@ -947,10 +1064,15 @@ def scanner_text() -> str:
          "",
          f"⛓ Chain: {esc(', '.join(aktif) or '—')}"
          + (f" · <i>{esc(', '.join(lain))} (kartu info saja, bot tidak bisa LP di sana)</i>" if lain else ""),
-         f"⏱ Interval {esc(c.get('interval'))} · pindai tiap {c.get('watch')}s · "
+         f"⏱ Interval data {esc(c.get('interval'))} · pindai tiap {c.get('watch')} detik · "
          f"jeda antar request {c.get('pace')}s",
-         f"🎯 Kirim maks {c.get('top')}/chain · konfirmasi {c.get('confirm')}/{c.get('window')} "
-         f"polling · cooldown {c.get('cooldown')} menit",
+         f"🎯 Kirim maks {c.get('top')} kartu per chain tiap siklus",
+         f"🔁 Konfirmasi {c.get('confirm')}/{c.get('window')}: token harus muncul di "
+         f"{c.get('confirm')} dari {c.get('window')} scan terakhir sebelum dikirim — "
+         f"menyaring lonjakan satu-tick.",
+         f"❄️ Cooldown {c.get('cooldown')} menit: <b>per TOKEN</b>, bukan per scan. "
+         f"Token yang sudah dikirim tidak dikirim lagi selama itu; scan tetap jalan "
+         f"tiap {c.get('watch')} detik dan token LAIN tetap masuk.",
          "",
          "<b>Filter</b> " + (f"({len([1 for k in f if f[k] is not None])} aktif)"
                              if any(v is not None for v in f.values()) else "(tidak ada)"),
@@ -976,6 +1098,9 @@ def scanner_kb() -> InlineKeyboardMarkup:
          InlineKeyboardButton(f"🎯 Top · {c.get('top')}", callback_data="scan|top")],
         [InlineKeyboardButton(f"🕐 Tiap {c.get('watch')}s", callback_data="scan|watch"),
          InlineKeyboardButton(f"❄️ Cooldown {c.get('cooldown')}m", callback_data="scan|cool")],
+        [InlineKeyboardButton(f"🎚 Filter ({sum(1 for v in (c.get('filters') or {}).values() if v is not None)} aktif)",
+                              callback_data="sf|__list"),
+         InlineKeyboardButton("⛓ Chain", callback_data="scan|chains")],
         BACK_ROW,
     ])
 
@@ -1009,18 +1134,13 @@ async def cmd_scanner(update: Update, context: ContextTypes.DEFAULT_TYPE):
             scanner_save({k: max(1, int(float(v)))})
         elif k in ("cooldown", "pace"):
             scanner_save({k: max(0.2, float(v))})
-        elif k in (f[0] for f in gmgn.FILTER_SPEC):
-            fl = dict(c.get("filters") or {})
-            if v.lower() in ("off", "-", "none"):
-                fl.pop(k, None)
-            elif k in ("minAge", "maxAge"):
-                if gmgn.duration_secs(v) is None:
-                    await reply(update, "❌ Umur harus bentuk <code>30m</code>/<code>6h</code>/<code>7d</code>.")
-                    return
-                fl[k] = v
-            else:
-                fl[k] = float(v)
-            scanner_save({"filters": fl})
+        elif gmgn.filter_spec(k):
+            # Validasi filter hidup di SATU tempat (`scanfilt_set`) supaya tombol
+            # dan perintah teks tidak bisa punya aturan yang berbeda.
+            err = scanfilt_set(k, v)
+            if err:
+                await reply(update, f"❌ {esc(err)}")
+                return
         else:
             await reply(update, f"❌ Kunci tidak dikenal: <code>{esc(k)}</code>\n"
                                 f"Filter: {esc(', '.join(f[0] for f in gmgn.FILTER_SPEC))}\n"
@@ -2294,6 +2414,29 @@ async def handle_awaiting(update: Update) -> bool:
                             + ("\n<i>Maksimal 4 tombol per simbol.</i>" if len(vals) >= 4 else ""))
         await update.effective_chat.send_message(btn_text(cid), parse_mode=ParseMode.HTML,
                                                  reply_markup=btn_kb(cid))
+        return True
+    if st["kind"] == "scanfilt":
+        AWAITING.pop(chat_id, None)
+        err = scanfilt_set(st["key"], (update.message.text or "").strip())
+        if err:
+            await reply(update, f"❌ {esc(err)}")
+            return True
+        await update.effective_chat.send_message(
+            scanfilt_one_text(st["key"]), parse_mode=ParseMode.HTML,
+            reply_markup=scanfilt_one_kb(st["key"]))
+        return True
+    if st["kind"] == "scanchains":
+        pilih = [x.strip().lower() for x in
+                 (update.message.text or "").replace(",", " ").split() if x.strip()]
+        tak = [x for x in pilih if x not in gmgn.CHAINS]
+        if tak:
+            await reply(update, f"❌ Chain tidak dikenal: {esc(', '.join(tak))}\n"
+                                f"Pilihan: {esc(', '.join(gmgn.CHAINS))}")
+            return True
+        AWAITING.pop(chat_id, None)
+        scanner_save({"chains": pilih})
+        await update.effective_chat.send_message(scanner_text(), parse_mode=ParseMode.HTML,
+                                                 reply_markup=scanner_kb())
         return True
     if st["kind"] == "setkey":
         key, c = st["key"].split("|", 1)
@@ -3693,6 +3836,43 @@ async def _route_callback(update: Update):
     if data == "menu|chain":
         await edit(q.message, "⛓ <b>Pilih chain aktif:</b>", chain_kb())
         return
+    # --- editor filter scanner ---
+    if data.startswith("sf|"):
+        key = data.split("|", 1)[1]
+        if key == "__list":
+            await edit(q.message, scanfilt_text(), scanfilt_kb())
+            return
+        if key == "__reset":
+            scanner_save({"filters": dict(store.DEFAULT_SETTINGS["scanner"]["filters"])})
+            await edit(q.message, scanfilt_text(), scanfilt_kb())
+            return
+        if not gmgn.filter_spec(key):
+            return
+        await edit(q.message, scanfilt_one_text(key), scanfilt_one_kb(key))
+        return
+    if data.startswith("sfv|"):
+        _, key, val = data.split("|", 2)
+        err = scanfilt_set(key, val)
+        if err:
+            await reply(update, f"❌ {esc(err)}")
+            return
+        await edit(q.message, scanfilt_one_text(key), scanfilt_one_kb(key))
+        return
+    if data.startswith("sfx|"):
+        key = data.split("|", 1)[1]
+        spec = gmgn.filter_spec(key)
+        contoh = {"usd": "250000", "count": "150", "ratio": "0.25",
+                  "percent": "30", "duration": "12h"}.get(spec[4], "1")
+        await update.effective_chat.send_message(
+            f"✏️ <b>Balas pesan ini</b> dengan nilai untuk <b>{esc(key)}</b>.\n"
+            f"{esc(gmgn.FILTER_DESC.get(key, key))} · satuan <b>{esc(spec[4])}</b>"
+            + ("\n<i>Rasio ditulis 0–1, mis. 0.25 untuk 25%.</i>" if spec[4] == "ratio" else "")
+            + ("\n<i>Umur ditulis 30m / 6h / 7d.</i>" if spec[4] == "duration" else "")
+            + f"\nContoh: <code>{esc(contoh)}</code> · <code>off</code> untuk mematikan",
+            parse_mode=ParseMode.HTML,
+            reply_markup=ForceReply(selective=True, input_field_placeholder=contoh))
+        AWAITING[update.effective_chat.id] = {"kind": "scanfilt", "key": key}
+        return
     if data.startswith("scan|"):
         act = data.split("|", 1)[1]
         c = scanner_cfg()
@@ -3711,6 +3891,18 @@ async def _route_callback(update: Update):
             scanner_save({"watch": _next_step([60, 120, 300, 600], int(c.get("watch") or 60))})
         elif act == "cool":
             scanner_save({"cooldown": _next_step([15, 30, 60, 180], int(c.get("cooldown") or 30))})
+        elif act == "chains":
+            await update.effective_chat.send_message(
+                "⛓ <b>Balas pesan ini</b> dengan daftar chain, dipisah koma.\n"
+                f"Pilihan: <code>{esc(', '.join(gmgn.CHAINS))}</code>\n"
+                f"Sekarang: <code>{esc(', '.join(c.get('chains') or []))}</code>\n"
+                "<i>Chain di luar bsc/base/hyperevm/robinhood tetap dapat kartu info, "
+                "tapi bot tidak bisa membuka LP di sana.</i>",
+                parse_mode=ParseMode.HTML,
+                reply_markup=ForceReply(selective=True,
+                                        input_field_placeholder="robinhood, base"))
+            AWAITING[update.effective_chat.id] = {"kind": "scanchains", "key": ""}
+            return
         await edit(q.message, scanner_text(), scanner_kb())
         return
     if data == "menu|rpc":

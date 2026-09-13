@@ -276,6 +276,56 @@ FILTER_SPEC = [
     ("maxAge", "max_created", "ageSeconds", "lte", "duration"),
 ]
 _BY_KEY = {f[0]: f for f in FILTER_SPEC}
+
+# Penjelasan + pengelompokan untuk UI. Dipisah dari FILTER_SPEC supaya menambah
+# filter tetap cukup satu baris di sana; yang belum punya deskripsi tetap tampil
+# memakai nama kuncinya.
+FILTER_DESC = {
+    "minVolume": "Volume pada interval", "maxVolume": "Volume pada interval",
+    "minMcap": "Market cap", "maxMcap": "Market cap",
+    "minLiquidity": "Likuiditas (dua sisi)", "maxLiquidity": "Likuiditas (dua sisi)",
+    "minHolder": "Jumlah holder", "maxHolder": "Jumlah holder",
+    "minSwaps": "Jumlah swap pada interval", "maxSwaps": "Jumlah swap pada interval",
+    "minSmartDegen": "Wallet smart-money", "minRenowned": "Wallet KOL/ternama",
+    "maxBotDegen": "Wallet bot/degen",
+    "minTurnover": "Putaran = volume ÷ likuiditas", "maxTurnover": "Putaran = volume ÷ likuiditas",
+    "maxRugRatio": "Skor indikasi rug GMGN",
+    "maxTop10Rate": "Porsi 10 holder terbesar",
+    "maxInsiderRate": "Aktivitas berlabel insider",
+    "maxBundlerRate": "Aktivitas berlabel bundler",
+    "maxEntrapment": "Rasio entrapment/phishing",
+    "maxSniperHold": "Porsi sniper top-70",
+    "maxDevHold": "Porsi tim dev",
+    "minPriceChange": "Perubahan harga pada interval",
+    "maxPriceChange": "Perubahan harga pada interval",
+    "minAge": "Umur token minimum", "maxAge": "Umur token maksimum",
+}
+
+FILTER_GROUPS = [
+    ("Ukuran pasar", ["minVolume", "maxVolume", "minMcap", "maxMcap",
+                      "minLiquidity", "maxLiquidity"]),
+    ("Aktivitas", ["minSwaps", "maxSwaps", "minHolder", "maxHolder",
+                   "minTurnover", "maxTurnover", "minPriceChange", "maxPriceChange"]),
+    ("Wallet", ["minSmartDegen", "minRenowned", "maxBotDegen"]),
+    ("Risiko", ["maxRugRatio", "maxTop10Rate", "maxInsiderRate", "maxBundlerRate",
+                "maxEntrapment", "maxSniperHold", "maxDevHold"]),
+    ("Umur token", ["minAge", "maxAge"]),
+]
+
+# Pilihan cepat per satuan. Angka bulat yang lazim, bukan hasil ukur apa pun —
+# nilai bebas tetap bisa diketik lewat "Nilai lain".
+FILTER_CHOICES = {
+    "usd": [10_000, 30_000, 50_000, 100_000, 300_000, 500_000, 1_000_000],
+    "count": [0, 1, 3, 5, 10, 50, 100, 200, 500],
+    "ratio": [0.05, 0.1, 0.15, 0.2, 0.3, 0.5],
+    "percent": [-50, -20, 0, 20, 50, 100],
+    "duration": ["1h", "6h", "24h", "48h", "7d", "30d"],
+}
+
+
+def filter_spec(key: str):
+    """(key, api, field, cmp, unit) atau None."""
+    return _BY_KEY.get(key)
 _AGE_UNIT = {"m": 60, "h": 3600, "d": 86400}
 
 
