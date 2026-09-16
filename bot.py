@@ -2155,7 +2155,30 @@ TIGHT_PCT = 0.01
 NEWPOOL: dict[str, dict] = {}
 
 NP_FEES = [500, 3000, 10000, 20000, 30000, 50000]        # 0,05% … 5%
-NP_SPACINGS = [1, 10, 50, 60, 100, 200, 500, 1000]
+
+# Preset kisi IKUT fee, bukan daftar tetap. Diukur dari 188 pool v4 vanilla
+# (Robinhood + Arc, indexer Uniswap): pembagi yang dipakai pembuat pool
+# didominasi fee/100 (132 pool) lalu fee/50 (48 pool), dan bobot TVL-nya justru
+# terbalik — fee/50 memegang 57,3% TVL, fee/100 41,2%. Yang lebih rapat dari
+# fee/200 ada tapi semuanya debu (fee 2% kisi 10 = TVL $458; fee 3,5% kisi 10 =
+# $3.290; fee 4,5% kisi 60 = $0), sedangkan fee/200 masih hidup (fee 4% kisi 200
+# = $109k + $86k di Arc). Jadi rentang yang terbukti dipakai: fee/200 … fee/50.
+NP_SPACING_DIVS = [(200, "rapat"), (100, "standar"), (50, "longgar")]
+
+
+def np_spacing_presets(fee: int) -> list[tuple[int, str]]:
+    """[(spacing, label)] untuk fee ini — plus beberapa nilai mutlak yang lazim."""
+    out, seen = [], set()
+    for d, lbl in NP_SPACING_DIVS:
+        v = max(ch.V4_SPACING_MIN, min(ch.V4_SPACING_MAX, int(fee) // d or 1))
+        if v not in seen:
+            seen.add(v)
+            out.append((v, lbl))
+    for v in (1, 10, 60, 200):
+        if v not in seen and ch.V4_SPACING_MIN <= v <= ch.V4_SPACING_MAX:
+            seen.add(v)
+            out.append((v, ""))
+    return out
 
 
 def np_spacing(ctx: dict) -> int:
@@ -2252,10 +2275,13 @@ def np_kb(key: str, ctx: dict, p: dict, bad: str | None, ada: bool) -> InlineKey
                                       callback_data=f"npf|{key}|{f}") for f in NP_FEES[:3]])
     rows.append([InlineKeyboardButton(("✓ " if f == fee else "") + f"{f / 1e4:g}%",
                                       callback_data=f"npf|{key}|{f}") for f in NP_FEES[3:]])
-    rows.append([InlineKeyboardButton(("✓ " if v == sp else "") + f"kisi {v}",
-                                      callback_data=f"nps|{key}|{v}") for v in NP_SPACINGS[:4]])
-    rows.append([InlineKeyboardButton(("✓ " if v == sp else "") + f"kisi {v}",
-                                      callback_data=f"nps|{key}|{v}") for v in NP_SPACINGS[4:]])
+    pres = np_spacing_presets(fee)
+    for i in (0, 3):
+        chunk = pres[i:i + 3]
+        if chunk:
+            rows.append([InlineKeyboardButton(
+                ("✓ " if v == sp else "") + (f"{lbl} {v}" if lbl else f"kisi {v}"),
+                callback_data=f"nps|{key}|{v}") for v, lbl in chunk])
     rows.append([InlineKeyboardButton("✏️ Fee lain…", callback_data=f"npxf|{key}"),
                  InlineKeyboardButton("✏️ Kisi lain…", callback_data=f"npxs|{key}")])
     rows.append([InlineKeyboardButton("⬅️ Pool lain", callback_data=f"npback|{key}"),

@@ -2026,6 +2026,30 @@ sama sekali — swap pertama menyapu seluruh range itu sekaligus di harga tepi,
 persis seperti limit order yang langsung tersapu. Dua sisi di sekitar harga awal
 juga satu-satunya bentuk yang menghasilkan fee dari kedua arah.
 
+**Preset tick spacing IKUT fee, bukan daftar tetap.** Daftar mutlak (1…1000)
+tidak masuk akal untuk pool ber-fee besar. Diukur dari **188 pool v4 vanilla**
+(Robinhood + Arc, indexer Uniswap yang mengirim fee DAN tickSpacing eksak),
+pembagi yang dipakai pembuat pool:
+
+| pola | jumlah pool | TVL | |
+|---|---|---|---|
+| `fee/100` — kotak ≈ **1× fee** | **132** | $40,9jt (41,2%) | terbanyak per jumlah |
+| `fee/50` — kotak ≈ **2× fee** (kanon Uniswap) | 48 | **$56,8jt (57,3%)** | terbanyak per TVL |
+| lain-lain | 8 | $1,5jt | |
+
+Jadi dua-duanya sah, dan yang besar justru memakai kisi lebih longgar. Yang lebih
+rapat dari `fee/200` ada tapi di sampel ini **semuanya debu** — fee 2% kisi 10 =
+TVL $458, fee 3,5% kisi 10 = $3.290, fee 4,5% kisi 60 = $0 — sedangkan `fee/200`
+masih hidup (fee 4% kisi 200 = $109k dan $86k di Arc). Rentang yang terbukti
+dipakai karena itu **`fee/200` … `fee/50`**, dan itulah tiga preset
+`np_spacing_presets()`: rapat / standar / longgar.
+
+Kenapa ini penting dan bukan detail kosmetik: **kotak = range tersempit yang bisa
+disetel selamanya**. Tombol 🎯 Rapat memakai SATU kotak, jadi di fee 5% kisi 1000
+posisi "rapat" itu lebarnya 10,5%. Tepi range juga selalu dibulatkan ke kisi, jadi
+range ±25% di kisi 1000 cuma muat 2 kotak — galat pembulatannya sebesar setengah
+targetnya sendiri.
+
 **Pool yang SUDAH ada bukan kegagalan.** Simulasi `initialize` untuknya revert
 `PoolAlreadyInitialized` (0x7983c051); `do_newpool` memeriksa `v4_pool_exists()`
 lebih dulu dan mengarahkan ke kartu mint, bukan menolak.
