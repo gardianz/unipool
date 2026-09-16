@@ -496,8 +496,16 @@ def build_main_menu() -> str:
     eth_usd = ch.quote_usd_price(w3, cid, cfg["wrapped_symbol"])
     native = w3.eth.get_balance(addr) / 1e18
     total = native * eth_usd
-    bal_lines = [f"· {esc(cfg['native_symbol'])}: {ch.fmt_amount(native)} ({ch.fmt_usd(native * eth_usd)})"]
+    # Di chain ber-native_erc20 (Arc), saldo native DAN saldo ERC20-nya itu kantong
+    # yang sama — menampilkan keduanya membuat dashboard menulis USDC dua kali dan
+    # Total-nya dua kali lipat dari uang yang benar-benar ada.
+    ne = ch.native_erc20(cid)
+    ne_note = " (native = ERC20)" if ne else ""
+    bal_lines = [f"· {esc(cfg['native_symbol'])}{ne_note}: {ch.fmt_amount(native)} "
+                 f"({ch.fmt_usd(native * eth_usd)})"]
     for sym, a in cfg["quotes"].items():
+        if ne and str(a).lower() == ne:
+            continue
         c = ch.erc20(w3, a)
         bal = c.functions.balanceOf(addr).call() / 10 ** c.functions.decimals().call()
         usd = bal * (1.0 if sym in cfg["stable_syms"] else eth_usd)
@@ -1282,8 +1290,13 @@ def wallet_text(page: int = 0) -> tuple[str, int, int]:
     total = 0.0
     native = w3.eth.get_balance(addr) / 1e18
     total += native * eth_usd
-    lines.append(f"{esc(cfg['native_symbol'])}: {ch.fmt_amount(native)} ({ch.fmt_usd(native * eth_usd)})")
+    # native_erc20 (Arc): saldo native dan ERC20-nya satu kantong — sekali saja
+    ne = ch.native_erc20(cid)
+    lines.append(f"{esc(cfg['native_symbol'])}{' (= ERC20)' if ne else ''}: "
+                 f"{ch.fmt_amount(native)} ({ch.fmt_usd(native * eth_usd)})")
     for sym, a in cfg["quotes"].items():
+        if ne and str(a).lower() == ne:
+            continue
         c = ch.erc20(w3, a)
         bal = c.functions.balanceOf(addr).call() / 10 ** c.functions.decimals().call()
         usd = bal * (1.0 if sym in cfg["stable_syms"] else eth_usd)

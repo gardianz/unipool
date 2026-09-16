@@ -49,7 +49,22 @@ DEMO_KEY = "gmgn_solbscbaseethmonadtron"
 
 CHAINS = ("sol", "bsc", "eth", "base", "arbitrum", "hyperevm", "robinhood", "arc", "stable")
 INTERVALS = ("1m", "5m", "1h", "6h", "24h")
-EVM_CHAINS = frozenset({"bsc", "eth", "base", "arbitrum", "hyperevm"})
+# Semua chain GMGN SELAIN Solana memakai field keamanan gaya EVM. Didaftar sebagai
+# "semua kecuali sol" — bukan daftar putih manual — karena daftar manualnya sempat
+# ketinggalan `robinhood`, `arc`, dan `stable`, dan akibatnya BUKAN cuma kosmetik:
+# `normalize()` menyaring lewat set ini sedangkan `classify()` menyaring lewat
+# `chain == "sol"`, jadi untuk ketiga chain itu `isRenounced`/`isOpenSource`
+# dipaksa None lalu cabang peringatannya tidak pernah berbunyi — token yang
+# ownership-nya BELUM di-renounce lolos tanpa peringatan apa pun.
+#
+# Diverifikasi langsung ke API: arc, robinhood, base, dan stable sama-sama
+# mengirim `is_renounced`/`is_open_source` dengan `renounced_mint`/
+# `renounced_freeze_account` null; hanya `sol` yang sebaliknya.
+#
+# Chain baru otomatis ikut. Kalau suatu hari GMGN menambah chain non-EVM lain,
+# field EVM-nya akan terbaca None = "belum diketahui" — arah yang aman, dan
+# `passes()` memang menolak yang belum diketahui.
+EVM_CHAINS = frozenset(c for c in CHAINS if c != "sol")
 
 
 class RateLimit(RuntimeError):

@@ -197,8 +197,16 @@ ikut punya field ekstra `minHopPriceX36`.
 **Sumber data luar di Arc tipis.** Krystal tidak melayani chain ini dan
 DexScreener menjawab `pairs: null` (belum diindeks), jadi yang tersisa indexer
 Uniswap (mendukung 5042, terukur 121 entri untuk satu token) + GeckoTerminal
-(`gecko: "arc"`). GMGN belum melayani Arc sama sekali → kunci `gmgn` sengaja
-tidak ada dan scanner melewatinya.
+(`gecko: "arc"`). **GMGN sudah melayani Arc** (`gmgn: "arc"`, diverifikasi:
+`rank("arc")` menjawab dan field keamanannya bentuk EVM sama seperti Base) —
+sebelumnya belum, jadi kunci itu sempat sengaja dikosongkan.
+
+**Dashboard sempat menghitung USDC DUA KALI.** `build_main_menu()` dan
+`wallet_text()` menulis baris native lalu satu baris per entri `quotes`; di Arc
+keduanya USDC yang sama, jadi dashboard menampilkan dua baris identik dan
+**Total-nya dua kali lipat** dari uang yang benar-benar ada (terukur: 226,765
+USDC dilaporkan $453,53). Keduanya sekarang melewati entri quote yang alamatnya
+== `native_erc20` dan menandai barisnya "(native = ERC20)".
 
 Konsekuensi yang perlu diingat: pembanding harga independen untuk
 `assert_pool_price_sane` jadi lebih lemah di sini. Jangan simpulkan bot salah baca
@@ -2398,6 +2406,23 @@ sebagai "tidak muncul" bagi token chain B yang belum discan siklus itu.
 
 **`/scan` melewati saklar on/off tapi TIDAK melewati konfirmasi + cooldown.**
 Melewatinya akan membuat perintah itu jadi tombol spam.
+
+#### `EVM_CHAINS` = semua chain GMGN KECUALI `sol`
+
+Daftar putih manualnya sempat ketinggalan `robinhood`, `arc`, dan `stable`, dan
+akibatnya bukan kosmetik: `normalize()` menyaring lewat `EVM_CHAINS` sedangkan
+`classify()` menyaring lewat `chain == "sol"`. Untuk ketiga chain itu keduanya
+tidak sepakat — `isRenounced`/`isOpenSource` dipaksa `None` di normalize, lalu
+cabang peringatan di classify tidak pernah berbunyi. Token yang ownership-nya
+**belum di-renounce** dan kontraknya **tidak open source** lolos tanpa satu pun
+peringatan (diuji: sesudah diperbaiki keduanya muncul, sebelumnya nol).
+
+Diverifikasi langsung ke API GMGN: `arc`, `robinhood`, `base`, dan `stable`
+sama-sama mengirim `is_renounced`/`is_open_source` dengan `renounced_mint`/
+`renounced_freeze_account` null; hanya `sol` yang sebaliknya. Karena itu
+daftarnya diturunkan dari `CHAINS` (`c != "sol"`), bukan ditulis tangan — chain
+baru otomatis ikut, dan kalau suatu hari ada chain non-EVM lain, field EVM-nya
+terbaca None = "belum diketahui" yang memang arah amannya.
 
 #### Tiga angka waktu yang berbeda — jangan tertukar
 

@@ -169,7 +169,9 @@ CHAINS = {
         "slug": "arc",
         "dexscreener": "arc",   # belum diindeks dexscreener saat ditulis (pairs null)
         "gecko": "arc",
-        # GMGN belum melayani Arc → kunci "gmgn" sengaja tidak ada, scanner melewatinya.
+        # GMGN sudah melayani Arc (diverifikasi: rank("arc") menjawab, dan field
+        # keamanannya bentuk EVM sama seperti Base).
+        "gmgn": "arc",
         "rpcs": [
             "https://rpc.mainnet.arc.io",
             "https://arc.drpc.org",
