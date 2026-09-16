@@ -1844,6 +1844,45 @@ def pool_warnings(cid: int, p: dict) -> str:
     return ("\n\n" + "\n".join(lines)) if lines else ""
 
 
+def no_funds_msg(ctx_data: dict, dep_sym: str) -> str:
+    """Pesan "saldo kosong" yang MENYEBUTKAN apa yang dibaca dan di mana.
+
+    "Saldo USDC kosong." saja tidak bisa dipakai mendiagnosis apa pun: user tidak
+    tahu bot sedang di chain mana, memakai wallet yang mana, dan berapa yang
+    sebenarnya terbaca. Kejadian nyata — wallet berisi 59,997116 USDC di Arc
+    (diverifikasi dari arsip di blok jam kejadian) tapi bot melapor kosong, dan
+    dugaannya bisa jatuh ke belasan tempat karena pesannya bisu. Tiga angka di
+    bawah langsung menunjuk sebabnya: chain salah, wallet salah, atau memang habis.
+
+    Teks POLOS tanpa tag HTML: jalur `build_preview` melemparnya sebagai
+    RuntimeError dan pemanggilnya menulis `f"❌ {esc(e)}"`, jadi tag apa pun akan
+    tampil mentah. Prefiks ❌ juga tidak ditaruh di sini, pemanggil yang menambah.
+
+    Pembacaan tambahan ini HANYA jalan di jalur gagal, jadi tidak menambah ongkos
+    RPC di jalur normal."""
+    cid = ctx_data["chain"]
+    cfg = ch.CHAINS[cid]
+    p = ctx_data["pool_info"]
+    addr = wallet_address()
+    out = [f"Saldo {dep_sym} kosong di {cfg['name']}.",
+           f"Wallet {wallet_label()} {addr}"]
+    try:
+        w3 = ch.get_w3(cid)
+        qaddr = p.get("quote_addr")
+        if qaddr and str(qaddr).lower() != ch.V4_NATIVE:
+            qbal = ch.erc20(w3, qaddr).functions.balanceOf(addr).call()
+            out.append(f"{p.get('quote_sym', '?')}: "
+                       f"{qbal / 10 ** int(p.get('quote_decimals') or 18):.6f}")
+        nat = w3.eth.get_balance(addr)
+        out.append(f"{cfg['native_symbol']} (native): {nat / 1e18:.6f} "
+                   f"— cadangan gas {ch.gas_reserve_wei(cid, w3) / 1e18:.6f}")
+    except Exception as e:
+        out.append(f"(saldo gagal dibaca: {e})")
+    out.append("Kalau angkanya tidak nol, chain atau wallet aktifnya yang salah "
+               "— cek /wallet dan /chain.")
+    return "\n".join(out)
+
+
 def build_preview_v2(ctx_data: dict) -> str:
     """Kartu konfirmasi add liquidity V2 (full-range 50/50, tanpa strategi range)."""
     cid = ctx_data["chain"]
@@ -1855,7 +1894,7 @@ def build_preview_v2(ctx_data: dict) -> str:
 
     amount = compute_amount(ctx_data)
     if amount <= 0:
-        raise RuntimeError(f"Saldo {p['quote_sym']} kosong.")
+        raise RuntimeError(no_funds_msg(ctx_data, p["quote_sym"]))
     rq, rm = ch._v2_pair_reserves(w3, p["pool"], p["quote_addr"])
     price_q = (rq / rm) * 10 ** (tdec - p["quote_decimals"]) if rm else 0
     usd = amount * p["quote_usd"]
@@ -1926,8 +1965,8 @@ def build_preview(ctx_data: dict) -> str:
     dep_sym = tsym if mode == "upper" else p["quote_sym"]
     if amount <= 0:
         raise RuntimeError(
-            f"Saldo {tsym if (src_meme or mode == 'upper') else dep_sym} kosong."
-            + (" Upper butuh pegang token meme." if mode == "upper" else ""))
+            no_funds_msg(ctx_data, tsym if (src_meme or mode == "upper") else dep_sym)
+            + ("\n<i>Mode Upper butuh pegang token meme.</i>" if mode == "upper" else ""))
     lo, hi = sorted([_meme_price(p, tdec, lo_t), _meme_price(p, tdec, hi_t)])
     now = _meme_price(p, tdec, cur_tick)
     try:
@@ -2640,7 +2679,7 @@ async def do_mint(update: Update, ctx_data: dict):
     amount = await asyncio.to_thread(_amt)
     dep_sym = tsym if mode == "upper" else p["quote_sym"]
     if amount <= 0:
-        await reply(update, f"❌ Saldo {esc(dep_sym)} kosong.")
+        await reply(update, "❌ " + esc(await asyncio.to_thread(no_funds_msg, ctx_data, dep_sym)))
         return
 
     mode_label = "V2 50/50" if ver == 2 else STRAT_LABEL[mode]

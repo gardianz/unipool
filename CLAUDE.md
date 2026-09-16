@@ -346,6 +346,31 @@ pengambilannya harus ikut:
   kurang persis sebesar gas itu (terukur: "punya 0.130946, butuh 0.130789 + gas").
   Sisa kekurangan selalu dihitung ulang dari saldo NYATA, bukan dikurangi angka rencana.
 
+### "Saldo X kosong" WAJIB menyebut chain, wallet, dan angkanya
+
+`no_funds_msg()` dipakai ketiga tempat yang menolak karena `compute_amount() <= 0`
+(`build_preview`, `build_preview_v2`, `do_mint`).
+
+Pesan lamanya cuma "Saldo USDC kosong." dan itu tidak bisa dipakai mendiagnosis
+apa pun — user tidak tahu bot sedang di chain mana, memakai wallet yang mana, dan
+berapa yang benar-benar terbaca. Kejadian nyata: wallet berisi **59,997116 USDC
+di Arc** (dibuktikan dari arsip Alchemy pada blok 21081086, jam kejadian persis)
+sementara bot melapor kosong. Tanpa angka di pesannya, dugaan bisa jatuh ke
+belasan tempat — padahal tiga baris sudah cukup memisahkan chain salah / wallet
+salah / memang habis.
+
+Dua hal yang gampang salah kalau ditulis ulang:
+
+- **Teksnya POLOS, tanpa tag HTML.** `build_preview` melemparnya sebagai
+  `RuntimeError` dan pemanggilnya menulis `f"❌ {esc(e)}"`, jadi tag apa pun
+  tampil mentah. Prefiks ❌ juga ditambahkan pemanggil, bukan di dalam.
+- **Pembacaan saldonya HANYA di jalur gagal**, jadi tidak menambah ongkos RPC di
+  jalur normal.
+
+Ingat juga `.env` ada di `.gitignore`: VPS punya `.env` DAN `settings.json`
+sendiri, jadi wallet + chain aktif di sana bisa berbeda dari mesin tempat
+diagnosis dijalankan. Jangan menyimpulkan dari saldo yang dibaca di mesin lain.
+
 ### 'STF' pada swap = jumlah melebihi saldo, bukan pool bermasalah
 
 `TransferHelper.safeTransferFrom` di router v3 balas `'STF'` — revert yang tidak
