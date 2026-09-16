@@ -1624,6 +1624,15 @@ async def show_pools_for(status, cid: int, token: str, extra: dict | None = None
             f"{i}. [{esc(p.get('dex') or '')} v{ver}] {p['quote_sym']} "
             f"{p['fee'] / 10000:.2f}% · {ch.fmt_usd(p['tvl_usd'])}",
             callback_data=f"pool|{key}")])
+    # Buat pool v4 ber-fee/spacing custom. Cuma muncul kalau chain ini punya v4 DAN
+    # sudah ada pool rujukan — harga awal pool baru disalin dari pool terdalam yang
+    # pasangan currency-nya sama, tidak pernah ditebak (lihat v4_ref_sqrt_price).
+    if ch.has_v4(cid) and pools:
+        nk = uuid.uuid4().hex[:10]
+        NEWPOOL[nk] = {"chain": cid, "token": res["token"], "pools": pools,
+                       "quote_addr": None, "fee": 10000, "spacing": None}
+        buttons.append([InlineKeyboardButton("➕ Buat pool baru (fee/kisi custom)",
+                                             callback_data=f"np|{nk}")])
     buttons.append([InlineKeyboardButton("✖ Cancel", callback_data="cancel")])
     # pool yang disaring — sebutkan, jangan hilang diam-diam
     hooks_n = res.get("hook_pools") or 0
@@ -2140,6 +2149,191 @@ def build_preview(ctx_data: dict) -> str:
 TIGHT_PCT = 0.01
 
 
+# ---------- Buat pool v4 baru (fee & tick spacing custom) ----------
+# v4 tidak punya whitelist fee tier seperti v3: PoolKey membawa fee dan tickSpacing
+# apa adanya. Batasnya DIUKUR ke PoolManager (chain.V4_FEE_MAX / V4_SPACING_*).
+NEWPOOL: dict[str, dict] = {}
+
+NP_FEES = [500, 3000, 10000, 20000, 30000, 50000]        # 0,05% … 5%
+NP_SPACINGS = [1, 10, 50, 60, 100, 200, 500, 1000]
+
+
+def np_spacing(ctx: dict) -> int:
+    """Tick spacing efektif. Default mengikuti pola fee/100 yang dominan terukur di
+    pool v4 chain ini (fee 50000 → 500, 86000 → 860); dibatasi ke rentang yang sah."""
+    sp = ctx.get("spacing")
+    if sp:
+        return int(sp)
+    return max(ch.V4_SPACING_MIN, min(ch.V4_SPACING_MAX, int(ctx["fee"]) // 100 or 1))
+
+
+def np_quote(ctx: dict) -> str:
+    """Quote yang dipakai. Default = quote pool TERDALAM token ini, karena dari
+    pasangan itulah harga awal bisa disalin."""
+    if ctx.get("quote_addr"):
+        return ctx["quote_addr"]
+    best = max(ctx["pools"], key=lambda p: float(p.get("tvl_usd") or 0), default=None)
+    return best["quote_addr"] if best else ""
+
+
+def np_quotes(ctx: dict) -> list[tuple[str, str]]:
+    """[(simbol, alamat)] quote yang PUNYA pool rujukan — hanya itu yang harga
+    awalnya bisa ditentukan tanpa menebak."""
+    out, seen = [], set()
+    for p in sorted(ctx["pools"], key=lambda x: -float(x.get("tvl_usd") or 0)):
+        a = str(p.get("quote_addr") or "").lower()
+        if not a or a in seen:
+            continue
+        seen.add(a)
+        out.append((p.get("quote_sym") or "?", p["quote_addr"]))
+    return out
+
+
+def np_build(ctx: dict) -> tuple[dict, int, dict | None, str | None]:
+    """(pool_info, sqrtPriceX96 rujukan, pool rujukan, alasan ditolak). Dipanggil di thread."""
+    cid = ctx["chain"]
+    w3 = ch.get_w3(cid)
+    fee, sp = int(ctx["fee"]), np_spacing(ctx)
+    p = ch.v4_new_pool_info(w3, cid, ctx["token"]["address"], np_quote(ctx), fee, sp)
+    sq, ref = ch.v4_ref_sqrt_price(w3, cid, p["key"][0], p["key"][1], ctx["pools"])
+    bad = ch.v4_check_new_pool(w3, cid, p["key"], sq)
+    return p, sq, ref, bad
+
+
+def np_text(ctx: dict, p: dict, sq: int, ref: dict | None, bad: str | None) -> str:
+    cid = ctx["chain"]
+    tsym = ctx["token"]["symbol"]
+    fee, sp = int(ctx["fee"]), np_spacing(ctx)
+    ada = ch.v4_pool_exists(ch.get_w3(cid), cid, p["pool_id"])
+    L = [f"<b>➕ Buat pool v4 baru · {esc(ch.CHAINS[cid]['name'])}</b>",
+         f"{esc(tsym)}/{esc(p['quote_sym'])} · fee <b>{fee / 1e4:g}%</b> · "
+         f"tick spacing <b>{sp}</b> (kisi {box_pct(p):.4f}%)",
+         f"poolId: <code>{esc(p['pool'])}</code>"]
+    if ref is not None and sq > 0:
+        raw = (sq / ch.Q96) ** 2
+        qd = int(p["quote_decimals"])
+        td = int(ctx["token"].get("decimals") or 18)
+        harga = raw * 10 ** (td - qd) if p["quote_is_token1"] else (
+            10 ** (qd - td) / raw if raw else 0)
+        L.append(f"\nHarga awal: <b>{ch.fmt_price(harga)} {esc(p['quote_sym'])}</b>/{esc(tsym)}\n"
+                 f"<i>disalin dari pool v{ref.get('ver')} fee {ref.get('fee', 0) / 1e4:g}% "
+                 f"(TVL {ch.fmt_usd(ref.get('tvl_usd'))}) — bukan tebakan.</i>")
+    if ada:
+        L.append("\n✅ Pool ini <b>sudah ada</b> — tombol di bawah langsung ke kartu mint, "
+                 "tidak ada tx pembuatan.")
+    elif bad:
+        L.append(f"\n❌ {esc(bad)}")
+    else:
+        L.append("\n⚠️ <b>Anda yang menentukan harga pool ini.</b> Pool baru kosong: tidak ada "
+                 "LP lain, tidak ada volume, dan harga awal di atas jadi harga pool. Kalau "
+                 "meleset dari pasar, arbitraser mengambil selisihnya dari deposit pertama — "
+                 "yaitu milik Anda.")
+        L.append("<i>Setor DUA SISI di sekitar harga itu (Wide/Stable/Rapat). Satu sisi "
+                 "(Lower/Upper) di pool kosong berarti tick aktif tanpa likuiditas: swap "
+                 "pertama menyapu seluruh range Anda sekaligus di harga tepi.</i>")
+        L.append(f"<i>Tick spacing menentukan lebar kotak minimum — {sp} = {box_pct(p):.4f}% "
+                 f"per kotak. Itu knop yang menentukan serapat apa range bisa disetel.</i>")
+    return "\n".join(L)
+
+
+def np_kb(key: str, ctx: dict, p: dict, bad: str | None, ada: bool) -> InlineKeyboardMarkup:
+    fee, sp = int(ctx["fee"]), np_spacing(ctx)
+    rows = []
+    if ada:
+        rows.append([InlineKeyboardButton("➡️ Ke kartu mint", callback_data=f"npgo|{key}")])
+    elif not bad:
+        rows.append([InlineKeyboardButton("✅ Buat pool + lanjut mint", callback_data=f"npok|{key}")])
+    qs = np_quotes(ctx)
+    if len(qs) > 1:
+        cur = str(np_quote(ctx)).lower()
+        rows.append([InlineKeyboardButton(("✓ " if a.lower() == cur else "") + sym,
+                                          callback_data=f"npq|{key}|{a}") for sym, a in qs[:4]])
+    rows.append([InlineKeyboardButton(("✓ " if f == fee else "") + f"{f / 1e4:g}%",
+                                      callback_data=f"npf|{key}|{f}") for f in NP_FEES[:3]])
+    rows.append([InlineKeyboardButton(("✓ " if f == fee else "") + f"{f / 1e4:g}%",
+                                      callback_data=f"npf|{key}|{f}") for f in NP_FEES[3:]])
+    rows.append([InlineKeyboardButton(("✓ " if v == sp else "") + f"kisi {v}",
+                                      callback_data=f"nps|{key}|{v}") for v in NP_SPACINGS[:4]])
+    rows.append([InlineKeyboardButton(("✓ " if v == sp else "") + f"kisi {v}",
+                                      callback_data=f"nps|{key}|{v}") for v in NP_SPACINGS[4:]])
+    rows.append([InlineKeyboardButton("✏️ Fee lain…", callback_data=f"npxf|{key}"),
+                 InlineKeyboardButton("✏️ Kisi lain…", callback_data=f"npxs|{key}")])
+    rows.append([InlineKeyboardButton("⬅️ Pool lain", callback_data=f"npback|{key}"),
+                 InlineKeyboardButton("✖ Cancel", callback_data="cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def do_newpool(update: Update, key: str, create: bool):
+    """Buat pool v4 (kalau perlu) lalu buka kartu konfirmasi mint untuk pool itu.
+
+    Pembuatan pool dan mint SENGAJA dua tx terpisah. Menggabungnya lewat
+    `posm.multicall` memang mungkin, tapi itu berarti menyentuh isi `mint_v4` —
+    jalur yang memindahkan dana sungguhan dan tidak bisa diuji ulang tanpa biaya.
+    Ongkos tambahannya satu tx murah."""
+    ctx = NEWPOOL.get(key)
+    if not ctx:
+        await reply(update, "⚠️ Tombol kadaluarsa (bot sempat restart). Paste alamat lagi.")
+        return
+    cid = ctx["chain"]
+    try:
+        p, sq, ref, bad = await asyncio.to_thread(np_build, ctx)
+    except Exception as e:
+        await reply(update, f"❌ {esc(e)}")
+        return
+    # Pool yang SUDAH ada membuat simulasi initialize revert PoolAlreadyInitialized
+    # (0x7983c051) — itu bukan alasan menolak, justru jalur "langsung ke mint".
+    ada = await asyncio.to_thread(ch.v4_pool_exists, ch.get_w3(cid), cid, p["pool_id"])
+    if bad and not ada:
+        await reply(update, f"❌ {esc(bad)}")
+        return
+    if create and not ada:
+        status = await reply(update, "⏳ Membuat pool v4 baru…")
+        async with TX_LOCK:
+            try:
+                txs = await with_progress(
+                    status, "⏳ Membuat pool v4 baru…",
+                    lambda: ch.v4_init_pool(cid, pk(), p["key"], sq))
+            except Exception as e:
+                await edit(status, f"❌ Gagal membuat pool: {esc(e)}")
+                return
+        gas = await asyncio.to_thread(gas_line, cid)
+        head = ("✅ <b>Pool sudah ada sebelumnya</b> — tidak ada tx." if not txs else
+                "✅ <b>Pool v4 dibuat.</b>\n" + "\n".join(f"· {esc(l)}: <code>{esc(h)}</code>"
+                                                          for l, h in txs))
+        await edit(status, head + (f"\n{gas}" if gas else ""))
+    # Kartu mint memakai pool_info yang dibangun LOKAL — pool baru belum diindeks
+    # sumber mana pun, jadi jalur discovery tidak akan menemukannya.
+    s_set = store.load_settings(cid)
+    mk = uuid.uuid4().hex[:10]
+    PENDING[mk] = {"chain": cid, "token": ctx["token"], "pool_info": p,
+                   # DUA SISI untuk pool baru: di pool kosong, posisi satu sisi
+                   # meninggalkan tick aktif tanpa likuiditas sama sekali.
+                   "mode": "wide",
+                   "low_pct": s_set["width_pct"], "up_pct": 100.0,
+                   "amount_pct": s_set["amount_pct"], "amount_fixed": s_set["amount_fixed"],
+                   "amount_src": "quote", "gap": int(s_set.get("gap", 1)),
+                   "vol": None, "rec": None}
+    msg = await reply(update, "⏳ Menyiapkan kartu mint…")
+    await show_confirm(msg, mk)
+
+
+async def show_newpool(msg, key: str):
+    ctx = NEWPOOL.get(key)
+    if not ctx:
+        await edit(msg, "⚠️ Tombol kadaluarsa (bot sempat restart). Paste alamat lagi.")
+        return
+    try:
+        p, sq, ref, bad = await asyncio.to_thread(np_build, ctx)
+        ada = await asyncio.to_thread(ch.v4_pool_exists, ch.get_w3(ctx["chain"]),
+                                      ctx["chain"], p["pool_id"])
+        text = await asyncio.to_thread(np_text, ctx, p, sq, ref, bad)
+    except Exception as e:
+        await edit(msg, f"❌ {esc(e)}")
+        return
+    ctx["_pool"], ctx["_sq"] = p, sq
+    await edit(msg, text, np_kb(key, ctx, p, bad, ada))
+
+
 def box_pct(pool_info: dict) -> float:
     """Lebar satu kotak tick-spacing dalam persen — presisi terbaik pool ini.
     Pool fee 5% biasanya spacing 1000 (≈10,5%), fee 0,05% spacing 10 (≈0,1%)."""
@@ -2442,6 +2636,34 @@ async def handle_awaiting(update: Update) -> bool:
     st = AWAITING.get(chat_id)
     if not st:
         return False
+    if st["kind"] in ("npfee", "npspacing"):
+        ctx = NEWPOOL.get(st["key"])
+        if not ctx:
+            AWAITING.pop(chat_id, None)
+            await reply(update, "⚠️ Tombol kadaluarsa. Paste alamat lagi.")
+            return True
+        raw = (update.message.text or "").strip().replace("%", "").replace(",", ".")
+        try:
+            if st["kind"] == "npfee":
+                # diketik dalam PERSEN (yang dilihat user), disimpan ppm
+                v = int(round(float(raw) * 10_000))
+                if not 0 <= v <= ch.V4_FEE_MAX:
+                    raise ValueError
+                ctx["fee"], ctx["spacing"] = v, None
+            else:
+                v = int(float(raw))
+                if not ch.V4_SPACING_MIN <= v <= ch.V4_SPACING_MAX:
+                    raise ValueError
+                ctx["spacing"] = v
+        except ValueError:
+            lim = (f"0–{ch.V4_FEE_MAX / 1e4:g}%" if st["kind"] == "npfee"
+                   else f"{ch.V4_SPACING_MIN}–{ch.V4_SPACING_MAX}")
+            await reply(update, f"❌ Di luar rentang yang diterima PoolManager ({lim}).")
+            return True
+        AWAITING.pop(chat_id, None)
+        msg = await reply(update, "⏳ Menghitung…")
+        await show_newpool(msg, st["key"])
+        return True
     if st["kind"] == "reducepct":
         raw = (update.message.text or "").strip().replace("%", "").replace(",", ".")
         try:
@@ -4184,6 +4406,50 @@ async def _route_callback(update: Update):
         else:
             # pilih pool → kartu konfirmasi (belum mint)
             await show_confirm(q.message, key)
+        return
+    if data.startswith("np|"):
+        await show_newpool(q.message, data.split("|", 1)[1])
+        return
+    if data.startswith(("npq|", "npf|", "nps|")):
+        pre, k, val = data.split("|", 2)
+        ctx = NEWPOOL.get(k)
+        if not ctx:
+            await edit(q.message, "⚠️ Tombol kadaluarsa (bot sempat restart). Paste alamat lagi.")
+            return
+        ctx["quote_addr" if pre == "npq" else "fee" if pre == "npf" else "spacing"] = (
+            val if pre == "npq" else int(val))
+        if pre == "npf":
+            ctx["spacing"] = None        # kisi ikut fee kecuali user memilih sendiri
+        await show_newpool(q.message, k)
+        return
+    if data.startswith(("npxf|", "npxs|")):
+        k = data.split("|", 1)[1]
+        fee = data.startswith("npxf|")
+        # prompt sendiri, bukan ask_custom(): fungsi itu membaca PENDING sedangkan
+        # konteks pembuatan pool ada di NEWPOOL.
+        txt = (f"✏️ <b>Balas pesan ini</b> dengan fee dalam PERSEN "
+               f"(0–{ch.V4_FEE_MAX / 1e4:g}). Contoh: <code>0.75</code>"
+               if fee else
+               f"✏️ <b>Balas pesan ini</b> dengan tick spacing "
+               f"({ch.V4_SPACING_MIN}–{ch.V4_SPACING_MAX}). Contoh: <code>25</code>\n"
+               f"<i>Makin kecil = range bisa makin rapat.</i>")
+        await update.effective_chat.send_message(
+            txt, parse_mode=ParseMode.HTML,
+            reply_markup=ForceReply(selective=True,
+                                    input_field_placeholder="0.75" if fee else "25"))
+        AWAITING[update.effective_chat.id] = {"kind": "npfee" if fee else "npspacing", "key": k}
+        return
+    if data.startswith("npback|"):
+        ctx = NEWPOOL.get(data.split("|", 1)[1])
+        if not ctx:
+            await edit(q.message, "⚠️ Tombol kadaluarsa. Paste alamat lagi.")
+            return
+        await show_pools_for(q.message, ctx["chain"], ctx["token"]["address"])
+        return
+    if data.startswith(("npok|", "npgo|")):
+        k = data.split("|", 1)[1]
+        await q.edit_message_reply_markup(None)
+        await do_newpool(update, k, create=data.startswith("npok|"))
         return
     if data.startswith("pools|"):
         # Balik ke daftar pool token yang sama, di pesan yang SAMA. ctx lama

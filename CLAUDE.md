@@ -1967,6 +1967,69 @@ bukan `go|` (kirim pesan baru — itu khusus dari kartu hasil tx supaya kartunya
 tetap ada). `cmd_rpc` dipanggil dari tombol dengan `context=None`, jadi ia membaca
 `getattr(context, "args", None)`.
 
+### Buat pool v4 baru: fee & tick spacing CUSTOM
+
+Tombol **➕ Buat pool baru** di daftar pool → `np|` → layar pemilih fee/kisi →
+`npok|` (buat + mint) atau `npgo|` (pool sudah ada → langsung mint).
+
+**Cuma v4.** Di v3 `feeAmountTickSpacing` adalah whitelist yang hanya bisa ditambah
+`enableFeeAmount` oleh owner factory, dan owner-nya bukan kita (terukur: Arc
+`0xbCA30b54…`, Robinhood `0x05C420bC…`, Base `0xaBEA7665…`, tier aktif ketiganya
+100/500/3000/10000). v4 tidak punya whitelist — fee dan tickSpacing ada di PoolKey.
+
+**Batasnya DIUKUR ke PoolManager, bukan dibaca dari dokumentasi** (`V4_FEE_MAX`,
+`V4_SPACING_MIN/MAX`):
+
+| | hasil |
+|---|---|
+| tickSpacing 0 | `TickSpacingTooSmall` (0xe9e90588) |
+| tickSpacing 1 … 32767 | OK |
+| tickSpacing 32768 | `TickSpacingTooLarge` (0xb70024f8) |
+| fee 0 … 1.000.000 (100%) | OK |
+| fee 1.000.001 | `LPFeeTooLarge` (0x14002113) |
+| fee 0x800000 (dinamis) | `HookAddressNotValid` (0xe65af6a0) — wajib hook |
+
+**`posm.initializePool` MENELAN kegagalan — jangan pakai untuk validasi.**
+Implementasinya membungkus `poolManager.initialize` dalam try/catch dan
+mengembalikan `type(int24).max` (8388607) kalau gagal. Jadi `eth_call` ke posm
+TIDAK PERNAH revert: percobaan pertama yang memvalidasi lewat posm melaporkan
+tickSpacing 100.000 **dan** fee 100,0001% sama-sama lolos, padahal dua-duanya
+ditolak. `v4_check_new_pool()` karena itu menyimulasikan ke **PoolManager**
+langsung (`V4_PM_INIT_ABI`), dan `v4_init_pool()` memeriksa `v4_pool_exists()`
+SESUDAH tx masuk blok — receipt sukses bukan bukti pool-nya jadi.
+
+**Harga awal disalin, tidak pernah ditebak.** `initialize()` menerima
+`sqrtPriceX96` apa adanya, dan yang membuat pool menentukan harganya; kalau
+meleset, arbitraser mengambil selisihnya dari deposit pertama — milik si pembuat.
+`v4_ref_sqrt_price()` mengambil sqrtPrice pool TERDALAM yang pasangan currency-nya
+PERSIS sama (v3 maupun v4) dan memakainya apa adanya: sqrtPriceX96 itu rasio
+token1-per-token0 dalam WEI, tidak bergantung fee maupun spacing. Tanpa pool
+rujukan, UI **menolak** — jadi pasangan yang sama sekali belum punya pool memang
+tidak bisa dibuat dari bot ini, dan itu disengaja.
+
+**Jalur ini TIDAK lewat discovery.** Pool yang baru lahir belum diindeks
+Krystal/indexer/GeckoTerminal, dan `_drop_dead_pools()` juga akan membuangnya
+(belum punya volume). `v4_new_pool_info()` membangun dict pool_info lengkap dari
+PoolKey secara LOKAL — poolId-nya keccak, tanpa satu pun sumber luar — dengan
+bentuk yang sama persis dengan `_uni_v4_pool()` supaya seluruh alur mint
+memakainya tanpa cabang khusus. Diuji: kartu mint, `assert_pool_orientation`, dan
+`assert_pool_price_sane` semuanya lolos dengan dict buatan lokal itu.
+
+**Dua tx, bukan satu.** `posm.multicall(initializePool, modifyLiquidities)` memang
+mungkin (selectornya ada di ketiga chain v4), tapi menggabungnya berarti menyentuh
+isi `mint_v4` — jalur yang memindahkan dana sungguhan dan tidak bisa diuji ulang
+tanpa biaya. Ongkos tambahannya satu tx murah; `mint_v4` tidak disentuh sama sekali.
+
+**Default mode pool baru = `wide` (DUA SISI), dan itu bukan selera.** Di pool
+kosong, posisi satu sisi (Lower/Upper) meninggalkan tick aktif tanpa likuiditas
+sama sekali — swap pertama menyapu seluruh range itu sekaligus di harga tepi,
+persis seperti limit order yang langsung tersapu. Dua sisi di sekitar harga awal
+juga satu-satunya bentuk yang menghasilkan fee dari kedua arah.
+
+**Pool yang SUDAH ada bukan kegagalan.** Simulasi `initialize` untuknya revert
+`PoolAlreadyInitialized` (0x7983c051); `do_newpool` memeriksa `v4_pool_exists()`
+lebih dulu dan mengarahkan ke kartu mint, bukan menolak.
+
 ### Kartu konfirmasi mint punya tombol balik ke DAFTAR pool
 
 `⬅️ Pool lain` (`pools|<key>`) merender ulang `show_pools_for()` di pesan yang

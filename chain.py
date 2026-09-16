@@ -594,6 +594,22 @@ V4_POSM_ABI = [
                  {"name": "info", "type": "uint256"}], "type": "function", "stateMutability": "view"},
     {"inputs": [{"name": "unlockData", "type": "bytes"}, {"name": "deadline", "type": "uint256"}],
      "name": "modifyLiquidities", "outputs": [], "type": "function", "stateMutability": "payable"},
+    # Membuat pool v4 BARU. Perhatian: implementasinya membungkus
+    # `poolManager.initialize` dalam try/catch dan mengembalikan `type(int24).max`
+    # (8388607) kalau gagal — jadi eth_call ke sini TIDAK PERNAH revert dan
+    # "sukses" bukan bukti apa pun. Validasi lewat PoolManager langsung.
+    {"inputs": [{"components": _POOLKEY_COMPONENTS, "name": "key", "type": "tuple"},
+                {"name": "sqrtPriceX96", "type": "uint160"}],
+     "name": "initializePool", "outputs": [{"name": "tick", "type": "int24"}],
+     "type": "function", "stateMutability": "payable"},
+]
+
+# PoolManager: dipakai HANYA untuk memvalidasi fee/tickSpacing sebelum tx dikirim.
+V4_PM_INIT_ABI = [
+    {"inputs": [{"components": _POOLKEY_COMPONENTS, "name": "key", "type": "tuple"},
+                {"name": "sqrtPriceX96", "type": "uint160"}],
+     "name": "initialize", "outputs": [{"name": "tick", "type": "int24"}],
+     "type": "function", "stateMutability": "nonpayable"},
 ]
 
 V4_STATEVIEW_ABI = [
@@ -6324,6 +6340,151 @@ def v4_pool_key(a: str, b: str, fee: int, spacing: int) -> tuple:
 
 def v4_pool_id(key: tuple) -> bytes:
     return Web3.keccak(abi_encode(["address", "address", "uint24", "int24", "address"], list(key)))
+
+
+# Batas yang DIUKUR langsung ke PoolManager Arc, bukan dibaca dari dokumentasi:
+#   tickSpacing 0      -> TickSpacingTooSmall (0xe9e90588)
+#   tickSpacing 1      -> OK          (batas bawah)
+#   tickSpacing 32767  -> OK          (batas atas)
+#   tickSpacing 32768  -> TickSpacingTooLarge (0xb70024f8)
+#   fee 1_000_000      -> OK          (100%, batas atas)
+#   fee 1_000_001      -> LPFeeTooLarge (0x14002113)
+#   fee 0x800000       -> HookAddressNotValid (0xe65af6a0) — fee dinamis WAJIB hook,
+#                         dan bot tidak memakai pool ber-hook sama sekali.
+V4_FEE_MAX = 1_000_000          # 100%
+V4_SPACING_MIN, V4_SPACING_MAX = 1, 32767
+
+
+def v4_pool_exists(w3: Web3, chain_id: int, pool_id: bytes) -> bool:
+    """True kalau pool itu SUDAH di-initialize. sqrtPriceX96 == 0 berarti belum ada."""
+    try:
+        return v4_slot0(w3, chain_id, pool_id)[0] > 0
+    except Exception:
+        return False
+
+
+def v4_ref_sqrt_price(w3: Web3, chain_id: int, c0: str, c1: str,
+                      pools: list | None = None) -> tuple[int, dict | None]:
+    """(sqrtPriceX96, pool rujukan) untuk pasangan currency (c0, c1) — diambil dari
+    pool TERDALAM yang currency-nya PERSIS sama.
+
+    Yang membuat pool menentukan harganya: `initialize()` menerima sqrtPriceX96 apa
+    adanya, dan kalau salah, arbitraser mengambil selisihnya dari deposit pertama —
+    yaitu milik si pembuat. Karena itu harga awal TIDAK PERNAH diketik atau ditebak
+    dari harga USD; ia disalin dari pool yang sudah diperdagangkan.
+
+    Aman disalin apa adanya karena sqrtPriceX96 itu rasio token1-per-token0 dalam
+    satuan WEI dan tidak bergantung fee maupun tick spacing — jadi selama pasangan
+    currency-nya identik (termasuk sisi native vs wrapped), angkanya berlaku.
+
+    (0, None) kalau tidak ada rujukan. Pemanggil WAJIB menolak, bukan menebak."""
+    a, b = str(c0).lower(), str(c1).lower()
+    best, best_tvl = None, -1.0
+    for p in (pools or []):
+        try:
+            if p.get("ver") == 4:
+                q0, q1 = str(p["key"][0]).lower(), str(p["key"][1]).lower()
+            else:
+                q0, q1 = str(p["token0"]).lower(), str(p["token1"]).lower()
+            if {q0, q1} != {a, b}:
+                continue
+            tvl = float(p.get("tvl_usd") or 0)
+            if tvl <= best_tvl:
+                continue
+            if p.get("ver") == 4:
+                sq = v4_slot0(w3, chain_id, p["pool_id"])[0]
+            else:
+                sq = w3.eth.contract(address=Web3.to_checksum_address(p["pool"]),
+                                     abi=POOL_ABI).functions.slot0().call()[0]
+            if sq > 0:
+                best, best_tvl = (sq, p), tvl
+        except Exception:
+            continue
+    return (best[0], best[1]) if best else (0, None)
+
+
+def v4_check_new_pool(w3: Web3, chain_id: int, key: tuple, sqrt_price: int) -> str | None:
+    """None kalau PoolKey itu bisa di-initialize; kalau tidak, alasannya.
+
+    Disimulasikan ke **PoolManager**, bukan ke posm: `posm.initializePool`
+    membungkus panggilannya dalam try/catch dan mengembalikan `type(int24).max`
+    saat gagal, jadi eth_call ke posm tidak pernah revert dan selalu terlihat
+    berhasil — percobaan pertama yang memakai posm melaporkan tickSpacing 100.000
+    dan fee 100,0001% sama-sama lolos padahal dua-duanya ditolak."""
+    fee, sp = int(key[2]), int(key[3])
+    if not 0 <= fee <= V4_FEE_MAX:
+        return f"Fee harus 0–{V4_FEE_MAX / 1e4:g}% (diminta {fee / 1e4:g}%)."
+    if not V4_SPACING_MIN <= sp <= V4_SPACING_MAX:
+        return f"Tick spacing harus {V4_SPACING_MIN}–{V4_SPACING_MAX} (diminta {sp})."
+    if sqrt_price <= 0:
+        return "Harga awal tidak diketahui — tidak ada pool rujukan untuk pasangan ini."
+    try:
+        pm = w3.eth.contract(address=Web3.to_checksum_address(v4_cfg(chain_id)["v4_pm"]),
+                             abi=V4_PM_INIT_ABI)
+        pm.functions.initialize(key, sqrt_price).call()
+        return None
+    except Exception as e:
+        # Selector 4-byte-nya yang informatif (0xb70024f8 TickSpacingTooLarge,
+        # 0x14002113 LPFeeTooLarge, 0xe65af6a0 HookAddressNotValid), bukan teks
+        # panjang web3 — jadi ambil potongan terakhir yang memuatnya.
+        msg = str(e).strip().replace("\n", " ")
+        return f"PoolManager menolak PoolKey ini: {msg[-160:]}"
+
+
+def v4_new_pool_info(w3: Web3, chain_id: int, token: str, quote_addr: str,
+                     fee: int, spacing: int) -> dict:
+    """dict pool_info untuk pool v4 yang BELUM ada — bentuknya sama persis dengan
+    yang dihasilkan jalur discovery (`_uni_v4_pool`), supaya seluruh alur mint
+    memakainya tanpa cabang khusus.
+
+    poolId-nya keccak LOKAL dari PoolKey, jadi tidak butuh satu pun sumber luar —
+    dan itu memang perlu: pool yang baru dibuat belum diindeks Krystal/indexer/
+    GeckoTerminal, dan `_drop_dead_pools()` juga akan membuangnya karena belum
+    punya volume. Jalur "buat pool" karena itu TIDAK boleh lewat discovery."""
+    key = v4_pool_key(token, quote_addr, int(fee), int(spacing))
+    pid = v4_pool_id(key)
+    c0, c1 = key[0], key[1]
+    qsym, q_is_c1 = _v4_quote_side(chain_id, c0, c1, w3)
+    if qsym is None:
+        raise RuntimeError("Pair tanpa quote yang dikenal bot.")
+    qaddr = c1 if q_is_c1 else c0
+    return {
+        "ver": 4, "dex": v4_dex(chain_id), "pool": "0x" + pid.hex(), "pool_id": pid,
+        "key": key, "fee": int(fee), "tick_spacing": int(spacing),
+        "quote_sym": qsym, "quote_addr": qaddr,
+        "quote_decimals": _v4_currency_info(w3, chain_id, qaddr)["decimals"],
+        "quote_usd": quote_usd_price(w3, chain_id, qsym), "quote_is_token1": q_is_c1,
+        "token0": c0, "token1": c1, "basis": "baru",
+        "tvl_usd": 0.0, "vol24_usd": None, "apr_pct": None, "thin": True,
+    }
+
+
+def v4_init_pool(chain_id: int, pk: str, key: tuple, sqrt_price: int) -> list[tuple[str, str]]:
+    """Buat pool v4 baru (initialize). Return [(label, txhash)] — kosong kalau
+    pool-nya memang SUDAH ada.
+
+    Sengaja tx TERPISAH dari mint, bukan digabung lewat `posm.multicall`: jalur
+    mint v4 memindahkan dana sungguhan dan tidak bisa diuji ulang tanpa biaya,
+    jadi ia tidak disentuh sama sekali. Ongkos tambahannya satu tx murah."""
+    w3 = get_w3(chain_id)
+    if not verify_v4(w3, chain_id):
+        raise RuntimeError("Kontrak v4 gagal diverifikasi — pembuatan pool dibatalkan.")
+    pid = v4_pool_id(key)
+    if v4_pool_exists(w3, chain_id, pid):
+        return []
+    bad = v4_check_new_pool(w3, chain_id, key, sqrt_price)
+    if bad:
+        raise RuntimeError(bad)
+    posm = _v4c(w3, chain_id, "v4_posm", V4_POSM_ABI)
+    h = send_tx(w3, pk, {"to": posm.address,
+                         "data": calldata(posm.functions.initializePool(key, sqrt_price))})
+    wait_ok(w3, h, "buat pool v4")
+    # initializePool menelan kegagalan (try/catch), jadi receipt sukses BUKAN bukti
+    # pool-nya jadi — keadaan on-chain yang menentukan.
+    if not v4_pool_exists(w3, chain_id, pid):
+        raise RuntimeError("Tx buat pool masuk blok tapi pool tetap belum ter-initialize "
+                           "— PoolKey ditolak PoolManager.")
+    return [("buat pool v4", h)]
 
 
 def v4_slot0(w3: Web3, chain_id: int, pool_id: bytes) -> tuple[int, int]:
