@@ -2657,10 +2657,57 @@ def token_chains(token: str, _cache={}, ttl: int = 180) -> list[tuple[int, float
                 tot[cid] = tot.get(cid, 0.0) + float(p.get("tvlUsd") or 0)
     except Exception:
         return hit[0] if hit else []
+    if not tot:
+        # Krystal tidak melayani semua chain yang didukung bot (Arc, misalnya),
+        # dan kosong di sini berarti chain aktif TIDAK dipindah — user menempel CA
+        # Arc lalu bot memindai Robinhood. GeckoTerminal punya pencarian LINTAS
+        # network, jadi dipakai sebagai lapis kedua sebelum menyerah.
+        tot = _token_chains_gecko(key)
     out = sorted(tot.items(), key=lambda kv: -kv[1])
     if out:
         _cache[key] = (out, time.time())
     return out
+
+
+_GECKO_SEARCH = "https://api.geckoterminal.com/api/v2/search/pools"
+
+
+def _token_chains_gecko(token_lc: str) -> dict[int, float]:
+    """{chain_id: TVL total} dari pencarian pool GeckoTerminal LINTAS network.
+
+    `search/pools?query=<alamat>` mengembalikan pool dari semua network sekaligus;
+    slug chain-nya ada di depan `id` ("arc_0x…") dan dipetakan balik lewat
+    `CHAINS[cid]["gecko"]`. Hanya pool yang token ini benar-benar salah satu
+    sisinya yang dihitung — query alamat juga mencocokkan pool lain yang namanya
+    mirip (terukur: 20 hasil untuk LONG, 11 di antaranya pasangan token LAIN
+    seperti LONGCAT/LONG yang memang memuat token ini, tapi penyaringan ini yang
+    menjamin pool token bernama serupa tidak ikut).
+
+    Angkanya cuma untuk MENGURUTKAN pilihan chain; pool-nya sendiri tetap dicari
+    ulang dan diverifikasi on-chain oleh `discover_any` sesudah chain dipindah."""
+    by_slug = {str(c.get("gecko")).lower(): cid for cid, c in CHAINS.items() if c.get("gecko")}
+    tot: dict[int, float] = {}
+    try:
+        r = _cf_get(_GECKO_SEARCH, params={"query": token_lc}, timeout=12,
+                    headers={"accept": "application/json"})
+        rows = (r.json() or {}).get("data") or []
+    except Exception:
+        return tot
+    for x in rows:
+        try:
+            slug = str(x.get("id") or "").split("_", 1)[0].lower()
+            cid = by_slug.get(slug)
+            if not cid:
+                continue
+            rel = x.get("relationships") or {}
+            sides = {str(((rel.get(k) or {}).get("data") or {}).get("id") or "").lower()
+                     for k in ("base_token", "quote_token")}
+            if f"{slug}_{token_lc}" not in sides:
+                continue
+            tot[cid] = tot.get(cid, 0.0) + float((x.get("attributes") or {}).get("reserve_in_usd") or 0)
+        except Exception:
+            continue
+    return tot
 
 
 def token_chains_onchain(token: str) -> list[int]:

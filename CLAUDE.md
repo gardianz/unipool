@@ -1442,9 +1442,29 @@ Chain aktif memang ikut dipindah — bukan cuma dipakai untuk flow itu — supay
 `/list`, `/wallet`, dan monitor tidak menunjuk chain lain daripada posisi yang baru
 dibuat.
 
-Kalau Krystal tidak kenal tokennya, `token_chains_onchain()` mengecek `eth_getCode`
-per chain sebagai petunjuk terakhir. Itu satu request per chain, jadi HANYA dipakai
-di jalur "tidak ada pool", tidak pernah di jalur normal.
+**Krystal tidak melayani semua chain yang didukung bot**, dan kosong di sini
+berarti chain aktif TIDAK dipindah — user menempel CA Arc lalu bot memindai
+Robinhood ("Fetching Uniswap v2/v3/v4 pools on Robinhood…"), tidak menemukan apa
+pun, dan baru di pesan gagal menyebut chain yang benar. Gejalanya terlihat seperti
+salah deteksi, padahal jalur deteksinya memang cuma punya satu sumber.
+
+Lapis kedua `_token_chains_gecko()`: `api.geckoterminal.com/api/v2/search/pools
+?query=<alamat>` mencari LINTAS network dalam satu request, dan slug chain-nya ada
+di depan `id` (`"arc_0x…"`) sehingga bisa dipetakan balik lewat `CHAINS[cid]["gecko"]`.
+Dipakai HANYA kalau Krystal kosong, jadi chain yang Krystal kenal tidak berubah
+perilakunya sama sekali (terukur: Krystal menjawab 43 entri untuk CAKE, jalur gecko
+tidak tersentuh). Sesudahnya: LONG → Arc $951.488, CRCL → Arc $1.049.045, USDC →
+Base, CAKE → BSC, alamat ngawur → kosong.
+
+Hasil search **wajib disaring** ke pool yang token itu benar-benar salah satu
+sisinya (`base_token`/`quote_token` == `<slug>_<alamat>`) — query alamat juga
+mengembalikan pool token bernama serupa. TVL-nya cuma untuk MENGURUTKAN pilihan
+chain; pool-nya sendiri tetap dicari ulang dan diverifikasi on-chain oleh
+`discover_any` sesudah chain dipindah.
+
+Kalau dua-duanya tidak kenal tokennya, `token_chains_onchain()` mengecek
+`eth_getCode` per chain sebagai petunjuk terakhir. Itu satu request per chain, jadi
+HANYA dipakai di jalur "tidak ada pool", tidak pernah di jalur normal.
 
 ### `PROXY_LIST`: proxy untuk API data pasar, JANGAN untuk RPC
 
