@@ -2252,6 +2252,7 @@ def confirm_kb(key: str, ctx_data: dict) -> InlineKeyboardMarkup:
         return InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ Confirm add", callback_data=f"mint|{key}"),
              InlineKeyboardButton("❌ Cancel", callback_data=f"cancelp|{key}")],
+            [InlineKeyboardButton("⬅️ Pool lain", callback_data=f"pools|{key}")],
             [abtn2(a) for a in (25, 50, 75, 100)],
             *([[fbtn2(v) for v in amount_presets(bsym2, ctx_data["chain"])]]
               if amount_presets(bsym2, ctx_data["chain"]) else []),
@@ -2291,6 +2292,9 @@ def confirm_kb(key: str, ctx_data: dict) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("✅ Confirm mint", callback_data=f"mint|{key}"),
          InlineKeyboardButton("❌ Cancel", callback_data=f"cancelp|{key}")],
+        # Kembali ke DAFTAR POOL token yang sama. Tanpa ini satu-satunya jalan
+        # membandingkan pool lain adalah Cancel lalu menempel ulang CA-nya.
+        [InlineKeyboardButton("⬅️ Pool lain", callback_data=f"pools|{key}")],
         [sbtn(m) for m in ("stable", "wide", "lower", "upper")],
         [wbtn(lo, up) for lo, up in STRAT_PRESETS[mode]],
         [InlineKeyboardButton("🎯 Rapat — langsung aktif (2 sisi)", callback_data=f"tight|{key}")],
@@ -4180,6 +4184,16 @@ async def _route_callback(update: Update):
         else:
             # pilih pool → kartu konfirmasi (belum mint)
             await show_confirm(q.message, key)
+        return
+    if data.startswith("pools|"):
+        # Balik ke daftar pool token yang sama, di pesan yang SAMA. ctx lama
+        # dibiarkan: show_pools_for membuat key baru untuk tiap pool, dan
+        # discovery-nya sudah di-cache jadi klik ini murah.
+        ctx = PENDING.get(data.split("|", 1)[1])
+        if not ctx:
+            await edit(q.message, "⚠️ Tombol kadaluarsa (bot sempat restart). Paste alamat lagi.")
+            return
+        await show_pools_for(q.message, ctx["chain"], ctx["token"]["address"])
         return
     if data.startswith("migok|"):
         _, key, mode = data.split("|")

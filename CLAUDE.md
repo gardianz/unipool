@@ -1967,6 +1967,20 @@ bukan `go|` (kirim pesan baru — itu khusus dari kartu hasil tx supaya kartunya
 tetap ada). `cmd_rpc` dipanggil dari tombol dengan `context=None`, jadi ia membaca
 `getattr(context, "args", None)`.
 
+### Kartu konfirmasi mint punya tombol balik ke DAFTAR pool
+
+`⬅️ Pool lain` (`pools|<key>`) merender ulang `show_pools_for()` di pesan yang
+SAMA. Tanpa itu satu-satunya jalan membandingkan pool lain dari token yang sama
+adalah Cancel lalu menempel ulang CA-nya — padahal memilih fee tier justru
+keputusan yang paling sering diulang.
+
+`ctx` lama sengaja tidak dibuang: `show_pools_for` membuat key `PENDING` baru
+untuk tiap pool, dan discovery-nya sudah di-cache jadi klik ini murah.
+
+Prefiksnya `pools|`, dan handler `pool|` yang lebih dulu di router TIDAK
+menangkapnya (`"pools|…".startswith("pool|")` False) — tapi kalau menambah
+callback baru di sekitar sini, periksa hal itu lagi.
+
 ### Tiap kartu hasil menyebut keadaan SESUDAH + tombol buka posisi
 
 `after_action(cid, pid, judul)` dipakai SEMUA alur yang menyisakan posisi:
