@@ -346,6 +346,20 @@ pengambilannya harus ikut:
   kurang persis sebesar gas itu (terukur: "punya 0.130946, butuh 0.130789 + gas").
   Sisa kekurangan selalu dihitung ulang dari saldo NYATA, bukan dikurangi angka rencana.
 
+### Slug sumber luar itu OPSIONAL — baca dengan `.get()`
+
+`gmgn`, dan pada dasarnya `dexscreener`/`gecko`/`slug` juga, tidak ada di semua
+chain: Arc tidak punya `gmgn` sama sekali karena GMGN memang belum melayaninya.
+Tiga tempat di `bot.py` dulu menulis `cfg['gmgn']` langsung, dan akibatnya
+**seluruh kartu konfirmasi mint di Arc mati** — user cuma melihat `❌ 'gmgn'`,
+pesan KeyError yang tidak menunjuk apa pun.
+
+`ext_links_html(cid, token_ca, pool)` dan `chart_buttons()` sekarang melewati link
+yang slug-nya tidak ada. Aturannya untuk kunci chain baru: kalau tidak semua chain
+punya, pembacanya WAJIB `.get()` — daftar kunci yang hilang per chain gampang
+dicek (`set(gabungan) - set(cfg)`), dan saat ditulis yang hilang di Arc cuma
+`gmgn` + `dexes`.
+
 ### "Saldo X kosong" WAJIB menyebut chain, wallet, dan angkanya
 
 `no_funds_msg()` dipakai ketiga tempat yang menolak karena `compute_amount() <= 0`

@@ -1844,6 +1844,26 @@ def pool_warnings(cid: int, p: dict) -> str:
     return ("\n\n" + "\n".join(lines)) if lines else ""
 
 
+def ext_links_html(cid: int, token_ca: str, pool) -> str:
+    """Baris link luar (GMGN · DexScreener) untuk kartu konfirmasi.
+
+    Slug-nya OPSIONAL per chain dan harus dibaca dengan `.get()`: Arc tidak punya
+    `gmgn` sama sekali karena GMGN memang belum melayaninya. Dulu ketiga tempat
+    menulis `cfg['gmgn']` langsung, dan akibatnya seluruh kartu konfirmasi mint di
+    Arc mati dengan KeyError yang sampai ke user cuma sebagai `❌ 'gmgn'` —
+    pesan yang tidak menunjuk apa pun.
+
+    Link yang slug-nya tidak ada dilewati; kalau semuanya tidak ada, baris ini
+    hilang (dan pemanggil tidak perlu tahu)."""
+    cfg = ch.CHAINS[cid]
+    parts = []
+    if cfg.get("gmgn"):
+        parts.append(f'📈 <a href="https://gmgn.ai/{cfg["gmgn"]}/token/{token_ca}">GMGN</a>')
+    if cfg.get("dexscreener") and pool:
+        parts.append(f'<a href="https://dexscreener.com/{cfg["dexscreener"]}/{pool}">DexScreener</a>')
+    return (" · ".join(parts) + "\n") if parts else ""
+
+
 def no_funds_msg(ctx_data: dict, dep_sym: str) -> str:
     """Pesan "saldo kosong" yang MENYEBUTKAN apa yang dibaca dan di mana.
 
@@ -1916,8 +1936,7 @@ def build_preview_v2(ctx_data: dict) -> str:
         f"CA: <code>{esc(ctx_data['token']['address'])}</code>\n"
         f"{esc(p.get('dex') or ch.dex_name(cid))} · {esc(tsym)}/{esc(p['quote_sym'])} "
         f"{p['fee'] / 10000:.2f}% · TVL {ch.fmt_usd(p['tvl_usd'])} · {vol_txt}\n"
-        f"📈 <a href=\"https://gmgn.ai/{cfg['gmgn']}/token/{ctx_data['token']['address']}\">GMGN</a> · "
-        f"<a href=\"https://dexscreener.com/{cfg['dexscreener']}/{p['pool']}\">DexScreener</a>\n\n"
+        + ext_links_html(cid, ctx_data["token"]["address"], p["pool"]) + "\n"
         f"Value deposited: {ch.fmt_amount(amount)} {esc(p['quote_sym'])} ({ch.fmt_usd(usd)} · {esc(amount_desc)})\n"
         f"Current price: {ch.fmt_price(price_q)} {esc(p['quote_sym'])}/{esc(tsym)}"
         + (f" · MC {ch.fmt_usd(price_q * p['quote_usd'] * supply)}" if supply else "") + "\n\n"
@@ -2081,8 +2100,7 @@ def build_preview(ctx_data: dict) -> str:
         f"<b>Confirm mint · {esc(cfg['name'])} · v{p.get('ver', 3)}</b>\n"
         f"CA: <code>{esc(ctx_data['token']['address'])}</code>\n"
         f"{esc(tsym)}/{esc(p['quote_sym'])} {p['fee'] / 10000:.2f}% · TVL {ch.fmt_usd(p['tvl_usd'])} · {vol_txt}\n"
-        f"📈 <a href=\"https://gmgn.ai/{cfg['gmgn']}/token/{ctx_data['token']['address']}\">GMGN</a> · "
-        f"<a href=\"https://dexscreener.com/{cfg['dexscreener']}/{p['pool']}\">DexScreener</a>\n\n"
+        + ext_links_html(cid, ctx_data["token"]["address"], p["pool"]) + "\n"
         f"<b>Strategi: {STRAT_LABEL[mode]} {strat_desc}</b>"
         f"{' ⭐' if mode == rec else f' (rekomendasi: ⭐ {STRAT_LABEL[rec]})'}\n"
         f"Value deposited: {ch.fmt_amount(amount)} {esc(dep_sym)} ({ch.fmt_usd(usd)} · {esc(amount_desc)})\n"
@@ -3233,10 +3251,15 @@ async def show_position(update: Update, msg, pid: str):
 # ---------- Chart (link eksternal) ----------
 def chart_buttons(cid: int, pool: str, meme_ca: str) -> list[InlineKeyboardButton]:
     cfg = ch.CHAINS[cid]
-    return [
-        InlineKeyboardButton("📈 GMGN", url=f"https://gmgn.ai/{cfg['gmgn']}/token/{meme_ca}"),
-        InlineKeyboardButton("📊 DexScreener", url=f"https://dexscreener.com/{cfg['dexscreener']}/{pool}"),
-    ]
+    out = []
+    # Slug opsional per chain — Arc tidak punya `gmgn`. Tombol yang slug-nya tidak
+    # ada dilewati, bukan dibuat dengan URL rusak.
+    if cfg.get("gmgn"):
+        out.append(InlineKeyboardButton("📈 GMGN", url=f"https://gmgn.ai/{cfg['gmgn']}/token/{meme_ca}"))
+    if cfg.get("dexscreener") and pool:
+        out.append(InlineKeyboardButton(
+            "📊 DexScreener", url=f"https://dexscreener.com/{cfg['dexscreener']}/{pool}"))
+    return out
 
 
 # ---------- Add / Reduce flow ----------
