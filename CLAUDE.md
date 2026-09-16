@@ -94,12 +94,13 @@ Verifikasi alamat baru **on-chain** sebelum dipakai (semua alamat di dict itu su
 
 ### Chain yang didukung
 
-| chain | DEX | v4 | indexer Uniswap | quote |
-|---|---|---|---|---|
-| Robinhood 4663 | Uniswap | ya | ya | WETH, USDG |
-| BSC 56 | PancakeSwap + Uniswap | tidak | tidak | WBNB, USDT, USDC |
-| Base 8453 | Uniswap | ya | ya | WETH, USDC |
-| HyperEVM 999 | HyperSwap | tidak | tidak | WHYPE, USDC |
+| chain | DEX | v4 | indexer Uniswap | quote | gas |
+|---|---|---|---|---|---|
+| Robinhood 4663 | Uniswap | ya | ya | WETH, USDG | ETH |
+| BSC 56 | PancakeSwap + Uniswap | tidak | tidak | WBNB, USDT, USDC | BNB |
+| Base 8453 | Uniswap | ya | ya | WETH, USDC | ETH |
+| HyperEVM 999 | HyperSwap | tidak | tidak | WHYPE, USDC | HYPE |
+| Arc 5042 | Uniswap | ya | ya | USDC | **USDC** |
 
 Semua alamat di dua entri baru diverifikasi on-chain sebelum dipakai:
 `npm.factory()`, `npm.WETH9()`, `router.factory()`, `router.WETH9()`,
@@ -115,9 +116,101 @@ didukung dan pool-nya otomatis terbuang oleh verifikasi factory di
 layak jadi DEX kedua di `CHAINS[999]["dexes"]`, tapi alamat NPM/router-nya belum
 diverifikasi on-chain jadi sengaja belum dimasukkan.
 
-Alchemy mendukung kedua chain (`base-mainnet`, `hyperliquid-mainnet`) tapi tiap
-network harus **di-enable per app** di dashboard — kalau tidak, jawabannya 403
-"not enabled for this app" dan `get_w3` jatuh ke RPC publik.
+Alchemy mendukung ketiganya (`base-mainnet`, `hyperliquid-mainnet`, `arc-mainnet`)
+tapi tiap network harus **di-enable per app** di dashboard — kalau tidak, jawabannya
+403 "not enabled for this app" dan `get_w3` jatuh ke RPC publik. Terukur saat Arc
+ditambahkan: dari dua key user, `…ei1f` sehat di Arc dan `…Ev8C` menjawab 403.
+`/rpc all` memperlihatkannya per endpoint.
+
+### Arc 5042: gas token-nya USDC, dan USDC itu ERC20 yang SAMA
+
+Ini satu-satunya chain di repo yang native-nya bukan coin terpisah, dan salah
+paham di sini langsung berarti salah hitung uang.
+
+- **Native = USDC, 18 desimal** di level EVM, sekaligus punya wajah **ERC20 6
+  desimal** di `0x3600…0000`. Satu kantong, dua tampilan — terverifikasi di blok
+  terpin: `eth_getBalance(addr) // 1e12 == USDC.balanceOf(addr)` PERSIS, untuk
+  EOA maupun kontrak. (Awalnya terlihat meleset 42,6 USDC di PoolManager; itu cuma
+  karena dua panggilan mengenai blok berbeda — chain-nya 0,52 detik per blok.)
+- **`native_erc20` di CHAINS menyatakannya**, dan `native_family()` mengelompokkan
+  `address(0)` + wrapped + native_erc20 jadi satu kantong. Aturannya: **saldo
+  native TIDAK PERNAH dihitung lagi sebagai modal terpisah** — ia selalu masuk
+  lewat wajah ERC20-nya.
+
+  Tanpa itu `compute_amount` menghitung uang yang sama dua kali: untuk pool
+  ber-quote USDC, `balanceOf` memberi 11,83 lalu cabang wrapped menambah saldo
+  native yang sama lagi lewat `wrapped_per_quote_wei` (WUSDC $1 ÷ USDC $1 ×
+  10^12) — "50% saldo" jadi ~99% dan mint gagal di tengah. Sesudah diperbaiki,
+  terukur di wallet berisi 11,827631 USDC: 100% → **11,767631** (= saldo −
+  cadangan gas 0,06) dan 50% → **5,883815**. Cadangan gas WAJIB dipotong di sini:
+  gas dibayar dari kantong yang sama.
+
+  Tiga jalur lain ikut disadarkan, dan semuanya soal tx bukan tampilan:
+  `other_quote_capital` (jangan jumlahkan sesama keluarga native),
+  `ensure_native_balance` (menjual USDC untuk "menambah native" itu menjual native
+  itu sendiri — nol hasilnya, gasnya tetap terbakar), dan `ensure_quote_balance`
+  (quote == native_erc20 → tidak ada yang bisa di-unwrap/ditukar, jadi menolak
+  dengan pesan jelas, bukan membeli WUSDC dari uang yang sama lalu gagal).
+- **WETH9 yang tertanam di periphery Uniswap Arc SELALU REVERT.**
+  `npm.WETH9()`, `router.WETH9()`, `v2_router.WETH()` dan immutable UniversalRouter
+  semuanya menunjuk `0x8bceaa40…` — kontrak **53 byte** yang isinya cuma
+  `revert(0xea3559ef)`. Jadi seluruh jalur ETH-native periphery mati di chain ini.
+  Alamat itu tetap ditulis di CHAINS sebagai `v2_weth` supaya
+  `verify_v2_router` tetap **fail-closed** (ia membandingkan
+  `cfg.get("v2_weth", cfg["wrapped"])`), bukan dilonggarkan.
+- **`wrapped` = WUSDC `0xe6b0a06c…`** — wrapped native yang benar-benar jalan
+  (`deposit`/`withdraw` ada; saldo native kontraknya == totalSupply persis).
+  Praktis tidak terpakai (supply terukur 0,267) karena native sudah punya wajah
+  ERC20 sendiri. `wrapped_symbol` "WUSDC" dimasukkan ke `stable_syms` supaya
+  harganya $1 tanpa perlu pool — dan karena itu `quote_usd_price` sekarang memakai
+  `cfg["quotes"].get(sym)`: stable_syms boleh memuat simbol yang BUKAN quote, dan
+  tanpa `.get()` loop-nya KeyError lalu menjatuhkan seluruh pembacaan harga.
+
+**Cara alamat Uniswap Arc ditemukan** (docs.uniswap.org & sdk-core belum memuat
+chain 5042; docs.arc.io masih testnet-only) — dipakai sekali dan berhasil:
+
+1. Alamat dari GeckoTerminal (`networks/arc/pools`) → `pool.factory()` on-chain
+   memberi factory v3.
+2. `alchemy_getAssetTransfers` kategori `erc721` di SELURUH rentang blok (satu
+   panggilan; `eth_getLogs` free tier cuma 10 blok) memberi daftar kontrak NFT →
+   yang `name()`-nya "Uniswap V3 Positions NFT-V1" dan "Uniswap v4 Positions NFT"
+   adalah NPM dan posm. `posm.poolManager()` memberi v4_pm.
+3. Deployer ditemukan dengan **bisect `eth_getCode` per blok** (archive Alchemy)
+   untuk mencari blok pembuatan, lalu membaca tx di blok itu. Alamat CREATE
+   diturunkan dari `keccak(rlp([deployer, nonce]))`: nonce 1 = v2 factory,
+   2 = v2 router, 3 = v3 factory, 12 = NPM, 19 = SwapRouter02.
+4. Kontrak v4 lahir lewat **CREATE2 deployer kanonik `0x4e59b448…`**, jadi
+   alamatnya dihitung langsung dari calldata tx: `keccak(0xff ++ deployer ++ salt
+   ++ keccak(initcode))`. Karena argumen konstruktor StateView/V4Quoter cuma
+   PoolManager, **alamatnya IDENTIK dengan Robinhood** — dan memang terbukti punya
+   code di Arc dengan `poolManager()` yang benar.
+5. UniversalRouter tidak lahir dari deployer itu; ia ditemukan dengan mendaftar
+   `to` dari tx yang menyentuh PoolManager, lalu menyaring yang `poolManager()`-nya
+   cocok DAN ukurannya 24.546 byte.
+
+**UR Arc = build yang SAMA dengan UR Robinhood.** Bytecode-nya dibandingkan
+byte-per-byte: 24.546 byte di kedua chain, beda cuma 19 rentang — seluruhnya
+immutable (WETH9, NPM, posm, v3/v2 factory, alamat diri) plus chainId
+(`0x13b2` vs `0x1237`). Karena itu `v4_swap_hop_field: True`: struct swap-nya
+ikut punya field ekstra `minHopPriceX36`.
+
+**Sumber data luar di Arc tipis.** Krystal tidak melayani chain ini dan
+DexScreener menjawab `pairs: null` (belum diindeks), jadi yang tersisa indexer
+Uniswap (mendukung 5042, terukur 121 entri untuk satu token) + GeckoTerminal
+(`gecko: "arc"`). GMGN belum melayani Arc sama sekali → kunci `gmgn` sengaja
+tidak ada dan scanner melewatinya.
+
+Konsekuensi yang perlu diingat: pembanding harga independen untuk
+`assert_pool_price_sane` jadi lebih lemah di sini. Jangan simpulkan bot salah baca
+dari selisih terhadap GeckoTerminal — terukur GT melaporkan CRCL $67,77 sementara
+pool v4 terdalam on-chain $202,56, dan lima menit kemudian pool yang sama $116,09.
+Tokennya memang bergerak sebesar itu; GT-nya yang telat. Patokan yang benar
+`quoteExactInputSingle` (terukur 1 USDC → 0,00775229 CRCL, cocok dengan spot +
+fee 10%).
+
+**Explorer `arc-scan.org`** (pihak ketiga). `arcscan.app` hanya melayani testnet —
+apex-nya tidak punya A record — dan `explorer.arc.io` ada di balik Cloudflare
+Access milik Circle.
 
 ### Dispatch versi pool
 

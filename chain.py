@@ -154,6 +154,72 @@ CHAINS = {
         },
         "stable_syms": {"USDC"},
     },
+    5042: {
+        "name": "Arc",
+        "dex": "Uniswap",
+        # feeAmountTickSpacing() dibaca dari factory: 100→1, 500→10, 3000→60,
+        # 10000→200 (tier standar Uniswap).
+        "fee_tiers": (100, 500, 3000, 10000),
+        "uni_api": True,        # indexer resmi Uniswap SUDAH mengindeks chainId 5042
+        "v2_fee": 3000,
+        "v2_swap_num": 997, "v2_swap_den": 1000,
+        # Gas dibayar USDC. Terukur 20 gwei (base fee rata) × 18 desimal, jadi satu
+        # alur mint penuh cuma ~0,01 USDC — cadangan 0,05 sudah sangat longgar.
+        "gas_reserve": 0.05,
+        "slug": "arc",
+        "dexscreener": "arc",   # belum diindeks dexscreener saat ditulis (pairs null)
+        "gecko": "arc",
+        # GMGN belum melayani Arc → kunci "gmgn" sengaja tidak ada, scanner melewatinya.
+        "rpcs": [
+            "https://rpc.mainnet.arc.io",
+            "https://arc.drpc.org",
+        ],
+        "alchemy": "arc-mainnet",
+        "rpc_env": "RPC_5042",
+        # arcscan.app hanya melayani testnet (apex-nya tanpa A record); explorer.arc.io
+        # ada di balik Cloudflare Access milik Circle. arc-scan.org explorer pihak
+        # ketiga untuk chainId 5042 — terverifikasi menyajikan halaman /address.
+        "explorer": "https://arc-scan.org",
+        # Semua diverifikasi on-chain: npm.factory()==factory, router.factory()==factory,
+        # v2_router.factory()==v2_factory, posm/stateview/quoter/UR .poolManager()==v4_pm,
+        # posm.permit2()==permit2 canonical.
+        "factory": "0xf0db7b58379503491d857dB50AC9ece64c653918",
+        "npm": "0x39654A85A4C05127f5Fd6ED22CAeC077A0fB1377",
+        "router": "0x53BF6B0684Ec7eF91e1387Da3D1a1769bC5A6F77",
+        "v2_factory": "0x89e5DB8B5aA49aA85AC63f691524311AEB649eba",
+        "v2_router": "0x1f7d7550B1b028f7571E69A784071F0205FD2EfA",
+        "v4_pm": "0x8366a39CC670B4001A1121B8F6A443A643e40951",
+        "v4_posm": "0x6049c9a0e26405C0985f9E3685C87d0aE917f82B",
+        "v4_stateview": "0xF3334192D15450CdD385c8B70e03f9A6bD9E673b",
+        "v4_quoter": "0x8Dc178eFB8111BB0973Dd9d722ebeFF267c98F94",
+        "v4_router": "0x4fCA4a51AB4F23a7447B3284FBD7d73289A89fB1",
+        # UR Arc bytecode-nya IDENTIK dengan UR Robinhood (24.546 byte, beda hanya di
+        # immutable + chainId 0x13b2 vs 0x1237) → build yang sama, jadi
+        # ExactInputSingleParams-nya juga punya field ekstra minHopPriceX36.
+        "v4_swap_hop_field": True,
+        "permit2": "0x000000000022D473030F116dDEE9F6B43aC78BA3",
+        # WETH9 yang TERTANAM di periphery Uniswap Arc (npm/router/v2_router/UR)
+        # adalah 0x8bceaa40… — kontrak 53 byte yang SELALU revert (0xea3559ef).
+        # Jadi semua jalur ETH-native periphery mati di chain ini; dipakai hanya
+        # untuk verifikasi router v2 supaya cek fail-closed tetap berlaku.
+        "v2_weth": "0x8bcEaA40B9AcdfAedF85AdF4FF01F5Ad6517937f",
+        # Wrapped native yang BENAR-BENAR jalan (deposit/withdraw ada, saldo native
+        # kontraknya == totalSupply persis). Praktis tidak dipakai: native sudah
+        # punya wajah ERC20 sendiri (lihat native_erc20).
+        "wrapped": "0xe6b0a06c87A1422f966E8a31B5D1f3B3Fa348c5a",
+        "wrapped_symbol": "WUSDC",
+        "native_symbol": "USDC",
+        # Gas token Arc adalah USDC (18 desimal di level EVM) DAN punya wajah ERC20
+        # 6 desimal di 0x3600…0000 — satu kantong uang, dua tampilan. Terverifikasi
+        # di blok terpin: eth_getBalance(addr)//1e12 == USDC.balanceOf(addr) persis.
+        # Lihat native_erc20()/native_family(): saldo native TIDAK PERNAH boleh
+        # dihitung lagi sebagai modal terpisah, nanti dobel.
+        "native_erc20": "0x3600000000000000000000000000000000000000",
+        "quotes": {
+            "USDC": "0x3600000000000000000000000000000000000000",
+        },
+        "stable_syms": {"USDC", "WUSDC"},
+    },
     999: {
         "name": "HyperEVM",
         # DEX utama HyperSwap — fork Uniswap v3 lurus (fee tier standar). HyperEVM
@@ -589,6 +655,35 @@ V4_CLOSE_CURRENCY = 0x12
 UR_CMD_V4_SWAP = 0x10
 V4_NATIVE = "0x0000000000000000000000000000000000000000"
 V4_FEE_SPACINGS = ((100, 1), (500, 10), (3000, 60), (10000, 200))
+
+
+def native_erc20(chain_id: int) -> str | None:
+    """Alamat ERC20 yang SALDONYA ADALAH saldo native — bukan wrapped, bukan 1:1.
+
+    Di Arc, gas token-nya USDC: `eth_getBalance` (18 desimal) dan
+    `USDC.balanceOf` (6 desimal) membaca KANTONG YANG SAMA, cuma beda tampilan
+    (terverifikasi di blok terpin: `saldo_native // 1e12 == balanceOf` persis).
+    Konsekuensinya keras: menjumlahkan native + saldo ERC20 itu sebagai modal
+    berarti menghitung uang yang sama DUA KALI, dan "50% saldo" jadi ~99%.
+
+    None untuk chain normal (ETH/BNB/HYPE) — di sana native dan ERC20 memang
+    dua hal berbeda dan penjumlahannya benar."""
+    a = CHAINS.get(chain_id, {}).get("native_erc20")
+    return str(a).lower() if a else None
+
+
+def native_family(chain_id: int) -> set[str]:
+    """Alamat yang mewakili uang YANG SAMA dengan native: sentinel v4 (address(0)),
+    wrapped (1:1 lewat deposit/withdraw), dan native_erc20 kalau chain punya.
+
+    Dipakai penghitung modal supaya satu kantong tidak dihitung berkali-kali."""
+    cfg = CHAINS[chain_id]
+    fam = {V4_NATIVE, str(cfg["wrapped"]).lower()}
+    ne = native_erc20(chain_id)
+    if ne:
+        fam.add(ne)
+    return fam
+
 
 # SwapRouter02: exactInputSingle TANPA field deadline (beda dari SwapRouter v1)
 ROUTER_ABI = [
@@ -1852,7 +1947,13 @@ def quote_usd_price(w3: Web3, chain_id: int, quote_sym: str, _cache={}) -> float
         return hit[0]
     wrapped = Web3.to_checksum_address(cfg["wrapped"])
     for stable_sym in cfg["stable_syms"]:
-        stable = Web3.to_checksum_address(cfg["quotes"][stable_sym])
+        # stable_syms boleh memuat simbol yang BUKAN quote (Arc: WUSDC — wrapped
+        # native yang nilainya $1 tapi tidak dipakai sebagai quote). Tanpa .get()
+        # loop ini KeyError dan menjatuhkan seluruh pembacaan harga.
+        sa = cfg["quotes"].get(stable_sym)
+        if not sa:
+            continue
+        stable = Web3.to_checksum_address(sa)
         # Pool TERDALAM lintas DEX, bukan tier pertama yang kebetulan ada.
         # Dulu di sini ada loop `for fee in fee_tiers(...)` yang mengembalikan pool
         # pertama apa pun kedalamannya — pool debu ber-fee 0,01% menang atas pool
@@ -3943,6 +4044,17 @@ def ensure_quote_balance(w3: Web3, chain_id: int, pk: str, quote_addr: str, need
     deficit = need_wei - bal
     gas_reserve = gas_reserve_wei(chain_id, w3)
 
+    ne = native_erc20(chain_id)
+    if ne and quote.lower() == ne:
+        # Quote-nya ADALAH native (Arc: USDC). Tidak ada yang bisa di-unwrap atau
+        # ditukar — saldo native dan saldo ERC20 ini satu kantong, jadi kalau kurang
+        # ya memang kurang. Jalur wrapped di bawah malah akan membeli WUSDC dari
+        # uang yang sama lalu gagal, setelah membakar gas.
+        raise RuntimeError(
+            f"Saldo {cfg['native_symbol']} kurang: punya {bal}, butuh {need_wei} "
+            f"(di chain ini {cfg['native_symbol']} sekaligus token gas — tidak ada "
+            f"saldo lain yang bisa ditukar jadi ini)")
+
     if quote == wrapped:
         native = w3.eth.get_balance(account.address)
         if native < deficit + gas_reserve:
@@ -3965,7 +4077,8 @@ def ensure_quote_balance(w3: Web3, chain_id: int, pk: str, quote_addr: str, need
         if deficit <= 0:
             break
         oc = Web3.to_checksum_address(oaddr)
-        if oc == quote or oc == wrapped:
+        # native_erc20 dilewati: menjualnya berarti menjual saldo native itu sendiri
+        if oc == quote or oc == wrapped or (ne and oc.lower() == ne):
             continue
         try:
             obal = erc20(w3, oc).functions.balanceOf(account.address).call()
@@ -5692,8 +5805,12 @@ def verify_v2_router(w3: Web3, chain_id: int, dex: str | None = None, _cache={})
     cfg = dex_cfg(chain_id, dex)
     try:
         r = w3.eth.contract(address=Web3.to_checksum_address(cfg["v2_router"]), abi=V2_ROUTER_ABI)
+        # Router v2 Arc menunjuk WETH9 periphery (kontrak yang selalu revert), BUKAN
+        # wrapped yang dipakai bot. Nilainya tetap dideklarasikan di CHAINS lewat
+        # "v2_weth" supaya cek ini tetap fail-closed, bukan dilonggarkan.
+        want_weth = str(cfg.get("v2_weth", cfg["wrapped"])).lower()
         ok = (r.functions.factory().call().lower() == cfg["v2_factory"].lower()
-              and r.functions.WETH().call().lower() == cfg["wrapped"].lower())
+              and r.functions.WETH().call().lower() == want_weth)
     except Exception:
         ok = False
     _cache[key] = ok
@@ -6617,10 +6734,13 @@ def other_quote_capital(w3: Web3, chain_id: int, addr: str, quote_addr: str,
     if qusd <= 0:
         return 0
     total = 0
+    fam = native_family(chain_id)
     for sym, addr_o in cfg["quotes"].items():
         ol = str(addr_o).lower()
-        # native & wrapped diurus terpisah (1:1, tinggal wrap/unwrap)
-        if ol == q or ol == wrapped:
+        # native & wrapped diurus terpisah (1:1, tinggal wrap/unwrap). native_erc20
+        # ikut dilewati kalau quote-nya masih satu keluarga native — di Arc, USDC
+        # ERC20 dan saldo native itu kantong yang sama.
+        if ol == q or ol == wrapped or (q in fam and ol in fam):
             continue
         try:
             c = erc20(w3, addr_o)
@@ -6673,10 +6793,14 @@ def ensure_native_balance(w3: Web3, chain_id: int, pk: str, need_wei: int,
     # Hanya sebanyak kekurangannya, bukan seluruh saldo.
     cfg = CHAINS[chain_id]
     w_usd = quote_usd_price(w3, chain_id, cfg["wrapped_symbol"])
+    ne = native_erc20(chain_id)
     for sym, oaddr in cfg["quotes"].items():
         if deficit <= 0:
             break
-        if str(oaddr).lower() == wrapped.lower():   # wrapped di-checksum, oaddr belum tentu
+        # wrapped di-checksum, oaddr belum tentu. native_erc20 juga dilewati: di Arc
+        # menjual USDC untuk "menambah native" itu menjual native itu sendiri — nol
+        # hasilnya dan gasnya tetap terbakar.
+        if str(oaddr).lower() == wrapped.lower() or (ne and str(oaddr).lower() == ne):
             continue
         try:
             c = erc20(w3, oaddr)

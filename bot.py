@@ -4,7 +4,7 @@ bot.py — Telegram LP bot: paste alamat token → pilih pool → mint LP single
 /list untuk posisi + PnL + close (dengan auto-swap hasil close → WETH/WBNB).
 
 Jalankan:  python3 bot.py
-Env (.env): TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, PRIVATE_KEY, [RPC_4663, RPC_56, RPC_8453, RPC_999]
+Env (.env): TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, PRIVATE_KEY, [RPC_4663, RPC_56, RPC_8453, RPC_999, RPC_5042]
 """
 import asyncio
 from contextlib import asynccontextmanager
@@ -1741,6 +1741,17 @@ def compute_amount(ctx_data: dict, sqrtp: int | None = None,
         bal = ch.erc20(w3, meme).functions.balanceOf(addr).call()
         return (bal * ctx_data["amount_pct"] / 100) / 10 ** mdec
     gas_reserve = ch.gas_reserve_wei(cid, w3)
+    ne = ch.native_erc20(cid)
+    if ne and p["quote_addr"].lower() == ne:
+        # Quote-nya ADALAH native dengan wajah ERC20 (Arc: USDC). Saldo native TIDAK
+        # boleh ditambahkan lagi — `balanceOf` sudah membaca kantong yang sama, dan
+        # menjumlahkannya membuat "50% saldo" jadi ~99% lalu mint gagal di tengah.
+        # Cadangan gas tetap dipotong: gas dibayar dari kantong ini juga.
+        bal = ch.erc20(w3, p["quote_addr"]).functions.balanceOf(addr).call()
+        keep = gas_reserve // 10 ** (18 - p["quote_decimals"])
+        bal = max(0, bal - keep)
+        bal += ch.other_quote_capital(w3, cid, addr, p["quote_addr"])
+        return (bal * ctx_data["amount_pct"] / 100) / 10 ** p["quote_decimals"]
     if p["quote_addr"].lower() == ch.V4_NATIVE:
         # Pool v4 ber-quote ETH native. Modal = native + WETH (1:1, tinggal unwrap)
         # + quote lain seperti USDG (dijual otomatis saat mint lewat
@@ -1763,7 +1774,9 @@ def compute_amount(ctx_data: dict, sqrtp: int | None = None,
         # nanti di-swap otomatis ke quote saat mint
         try:
             wbal = ch.erc20(w3, cfg["wrapped"]).functions.balanceOf(addr).call()
-            wtotal = wbal + max(0, w3.eth.get_balance(addr) - gas_reserve)
+            # Chain ber-native_erc20 (Arc): saldo native SUDAH ikut terhitung di
+            # other_quote_capital lewat wajah ERC20-nya, jadi di sini cuma wrapped.
+            wtotal = wbal if ne else wbal + max(0, w3.eth.get_balance(addr) - gas_reserve)
             if wtotal > 0:
                 rate = ch.wrapped_per_quote_wei(w3, cid, p["quote_addr"])  # wei wrapped per wei quote
                 if rate > 0:
