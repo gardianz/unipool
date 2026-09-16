@@ -2014,9 +2014,45 @@ sesudahnya). Pasar sebenarnya ~0,00021, jadi pool baru itu lahir **27% di atas
 pasar** dan langsung diseret turun begitu ada likuiditas — tick 358322 → 361476,
 diverifikasi dari event `Initialize` di tx pembuatannya vs `getSlot0` sesudahnya.
 
+**Pool ber-HOOKS ikut jadi pembanding HARGA, walau tidak pernah jadi tempat LP.**
+Melewatinya benar untuk menaruh dana; SALAH untuk membaca harga. Di token
+launchpad justru di situlah seluruh volumenya — terukur DOT/USDC Arc: pool
+ber-hook `0x0d751ec0…` **$441.817/24 jam** sementara SEMUA pool tanpa hook
+digabung ~$800, dan rujukan harga yang dipilih dari pool tanpa hook meleset
+**125%** dari situ. `getSlot0(poolId)` adalah pembacaan murni StateView — hook-nya
+tidak dijalankan dan PoolKey-nya tidak perlu diketahui, jadi tidak ada kode asing
+yang tersentuh.
+
+`v4_hook_price_refs()` mengambilnya dari GeckoTerminal (poolId 66 karakter) lalu
+membaca slot0-nya. Orientasi currency dan desimal quote tidak bisa disimpulkan
+dari poolId (itu hash), jadi **keempat tafsir** yang mungkin dihitung dan dipilih
+yang paling dekat median pool yang sudah diketahui — teknik yang sama dengan
+`_v4_key_from_krystal` yang mencoba varian native maupun wrapped. Yang tetap
+meleset >10x dibuang.
+
+**sqrtPrice untuk `initialize` TETAP dari pool tanpa hook**: hanya di situ urutan
+currency dan desimalnya pasti (PoolKey-nya kita yang susun). Harga pool ber-hook
+cuma menggeser MEDIAN-nya — dan itu justru intinya.
+
 Pemilihannya sekarang: hanya pool yang **ada volume 24 jam**, lalu yang harganya
 **paling dekat MEDIAN** pool-pool itu — bukan yang volumenya terbesar (volume
-tunggal yang besar bisa wash trading) dan bukan yang TVL-nya terbesar. Kalau tidak
+tunggal yang besar bisa wash trading) dan bukan yang TVL-nya terbesar.
+Deviasi > `NP_DEV_BLOCK` (25%) **MENOLAK** pembuatan, bukan sekadar
+memperingatkan — harga awal yang meleset sejauh itu dijamin diambil arbitraser.
+
+Dua jebakan aritmetika di jalur ini, dua-duanya sudah menggigit sekali:
+
+- **Pool ber-harga mustahil menyeret median.** Pool ber-tick mentok (harga ~1e-20)
+  tetap punya volume kecil dan ikut terhitung. Median dihitung dua lintasan:
+  kasar dulu, lalu buang yang lebih dari 10x dari situ.
+- **Median panjang GENAP tidak boleh `v[n//2]`.** Indeks polos selalu mengambil
+  yang lebih tinggi — pada 6 pool DOT ia memilih 0,000144989 padahal dua tengahnya
+  0,000125074 dan 0,000144989. `np_median()` memakai rata-rata **geometrik** dua
+  nilai tengah; harga itu besaran rasio, jadi geometrik yang benar.
+
+Daftar pool di kartu dan persen deviasinya berasal dari himpunan yang SAMA
+(`c["used"]`). Sebelumnya kartu menampilkan 5 teratas per volume sedangkan median
+dihitung dari semuanya, dan angkanya tidak bisa direkonsiliasi user. Kalau tidak
 ada satu pun pool bervolume, kartu mengatakannya eksplisit ("pool rujukan tidak
 punya volume 24 jam — harganya bisa basi"). Median dihitung HANYA dari pool
 bervolume: pool debu yang tidak pernah diarbitrase harganya bisa ke mana saja, dan

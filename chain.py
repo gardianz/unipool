@@ -6420,6 +6420,83 @@ def v4_ref_sqrt_price(w3: Web3, chain_id: int, c0: str, c1: str,
     return best["sq"], best["pool"], cands
 
 
+def v4_hook_price_refs(chain_id: int, token: str, quote_addr: str,
+                       known: list[float], skip_ids: set | None = None) -> list[dict]:
+    """Pool v4 BER-HOOKS sebagai pembanding HARGA saja — tidak pernah untuk LP.
+
+    Melewati pool ber-hooks itu benar untuk menaruh dana (hook = kode arbitrer yang
+    ikut jalan tiap swap/mint/burn), tapi SALAH untuk membaca harga: di token
+    launchpad, pool ber-hook justru satu-satunya venue yang nyata. Terukur di
+    DOT/USDC Arc — pool ber-hook `0x0d751ec0…` bervolume **$422.571/24 jam**
+    sementara SELURUH pool tanpa hook digabung cuma ~$800, dan pool tanpa hook
+    yang jadi rujukan harga meleset 125% dari situ. Pool baru yang lahir dari
+    rujukan itu langsung diseret arbitraser.
+
+    `getSlot0(poolId)` adalah pembacaan murni StateView — hook-nya tidak dijalankan,
+    jadi tidak ada risiko kode asing. PoolKey-nya pun tidak perlu diketahui.
+
+    Orientasi currency dan desimal quote TIDAK bisa disimpulkan dari poolId (itu
+    hash), jadi keempat tafsir yang mungkin dihitung lalu dipilih yang PALING DEKAT
+    median harga pool yang sudah diketahui — teknik yang sama dengan
+    `_v4_key_from_krystal` yang mencoba varian native maupun wrapped. Tafsir yang
+    tetap meleset >10x dibuang: lebih baik kehilangan satu pembanding daripada
+    memakai angka yang salah tafsir."""
+    if not known:
+        return []
+    med = sorted(known)[len(known) // 2]
+    if med <= 0:
+        return []
+    cfg = CHAINS[chain_id]
+    net = cfg.get("gecko")
+    if not net:
+        return []
+    try:
+        r = _cf_get(_GECKO_POOLS.format(net=net, token=str(token).lower()),
+                    timeout=12, headers={"accept": "application/json"})
+        rows = (r.json() or {}).get("data") or []
+    except Exception:
+        return []
+    w3 = get_w3(chain_id)
+    sv = _v4c(w3, chain_id, "v4_stateview", V4_STATEVIEW_ABI)
+    try:
+        qdec = _v4_currency_info(w3, chain_id, quote_addr)["decimals"]
+    except Exception:
+        qdec = 18
+    tdec = token_info(w3, Web3.to_checksum_address(token))["decimals"]
+    skip = {str(x).lower() for x in (skip_ids or set())}
+    out = []
+    for row in rows:
+        try:
+            a = str((row.get("attributes") or {}).get("address") or "")
+            if len(a) != 66 or a.lower() in skip:
+                continue                      # bukan poolId v4, atau sudah dipakai
+            pid = bytes.fromhex(a[2:])
+            sq = sv.functions.getSlot0(pid).call()[0]
+            if sq <= 0:
+                continue
+            raw = (sq / Q96) ** 2
+            # 4 tafsir: quote di currency0/1 × desimal quote ERC20 / native 18
+            cand = []
+            for qd in {qdec, 18}:
+                cand.append(raw * 10 ** (tdec - qd))          # quote = currency1
+                cand.append(10 ** (tdec - qd) / raw)          # quote = currency0
+            px = min((x for x in cand if x > 0),
+                     key=lambda x: abs(math.log(x / med)), default=0.0)
+            if px <= 0 or abs(math.log(px / med)) > math.log(10):
+                continue
+            at = row.get("attributes") or {}
+            out.append({"sq": sq, "price": px, "hooked": True,
+                        "vol": float((at.get("volume_usd") or {}).get("h24") or 0),
+                        "tvl": float(at.get("reserve_in_usd") or 0),
+                        "pool": {"ver": 4, "pool": a, "fee": None,
+                                 "vol24_usd": float((at.get("volume_usd") or {}).get("h24") or 0),
+                                 "tvl_usd": float(at.get("reserve_in_usd") or 0),
+                                 "name": at.get("name")}})
+        except Exception:
+            continue
+    return out
+
+
 def v4_check_new_pool(w3: Web3, chain_id: int, key: tuple, sqrt_price: int) -> str | None:
     """None kalau PoolKey itu bisa di-initialize; kalau tidak, alasannya.
 
