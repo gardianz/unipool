@@ -2212,18 +2212,55 @@ def np_quotes(ctx: dict) -> list[tuple[str, str]]:
     return out
 
 
-def np_build(ctx: dict) -> tuple[dict, int, dict | None, str | None]:
-    """(pool_info, sqrtPriceX96 rujukan, pool rujukan, alasan ditolak). Dipanggil di thread."""
+def np_price(p: dict, tdec: int, sq: int) -> float:
+    """Harga meme dalam quote dari sqrtPriceX96, lewat `_meme_price` yang SAMA
+    dengan kartu mint. Versi pertama menuliskan rumusnya ulang dan tandanya
+    terbalik saat quote jadi currency0 — pool DOT/USDC yang harganya 0,00027480
+    tampil sebagai "0.0₂₀0" (meleset 1e24)."""
+    raw = (sq / ch.Q96) ** 2
+    if raw <= 0:
+        return 0.0
+    return _meme_price(p, tdec, int(round(math.log(raw) / math.log(1.0001))))
+
+
+def np_build(ctx: dict) -> tuple[dict, int, dict | None, str | None, float, list]:
+    """(pool_info, sqrtPrice rujukan, pool rujukan, alasan ditolak, deviasi, kandidat).
+    Dipanggil di thread."""
     cid = ctx["chain"]
     w3 = ch.get_w3(cid)
     fee, sp = int(ctx["fee"]), np_spacing(ctx)
     p = ch.v4_new_pool_info(w3, cid, ctx["token"]["address"], np_quote(ctx), fee, sp)
-    sq, ref = ch.v4_ref_sqrt_price(w3, cid, p["key"][0], p["key"][1], ctx["pools"])
+    sq, ref, cands = ch.v4_ref_sqrt_price(w3, cid, p["key"][0], p["key"][1], ctx["pools"])
     bad = ch.v4_check_new_pool(w3, cid, p["key"], sq)
-    return p, sq, ref, bad
+    # Deviasi dihitung dari HARGA (lewat np_price, helper yang sama dengan yang
+    # ditampilkan), bukan dari sqrtPrice mentah: untuk pool ber-quote currency0
+    # harga berbanding TERBALIK dengan sqrtPrice, jadi persen dari sq akan salah
+    # tanda. Median dipakai supaya satu pool basi tidak menyeret patokannya.
+    td = int(ctx["token"].get("decimals") or 18)
+    for c in cands:
+        c["price"] = np_price(p, td, c["sq"])
+    # Median HANYA dari pool yang benar-benar diperdagangkan. Pool debu yang tidak
+    # pernah diarbitrase harganya bisa ke mana saja, dan kalau ikut dihitung nyaris
+    # tiap token memicu peringatan — peringatan yang selalu menyala akan diabaikan,
+    # persis alasan tombol izin impact cuma muncul saat ambangnya benar-benar lewat.
+    traded = [c for c in cands if c["price"] > 0 and c["vol"] > 0]
+    dev = 0.0
+    if traded:
+        med = sorted(c["price"] for c in traded)[len(traded) // 2]
+        # Rujukan = pool bervolume yang harganya PALING DEKAT median, bukan yang
+        # volumenya terbesar. Volume tunggal yang besar bisa wash trading, dan pool
+        # yang harganya outlier justru yang paling mahal disalin: pool DOT/USDC 5%
+        # lahir 27% di atas pasar karena menyalin pool fee 20% ber-TVL $89 yang
+        # harganya belum pernah bergerak sama sekali.
+        pick = min(traded, key=lambda c: abs(c["price"] / med - 1) if med else 0)
+        sq, ref = pick["sq"], pick["pool"]
+        bad = ch.v4_check_new_pool(ch.get_w3(cid), cid, p["key"], sq)
+        dev = (pick["price"] / med - 1) if med else 0.0
+    return p, sq, ref, bad, dev, cands
 
 
-def np_text(ctx: dict, p: dict, sq: int, ref: dict | None, bad: str | None) -> str:
+def np_text(ctx: dict, p: dict, sq: int, ref: dict | None, bad: str | None,
+            dev: float = 0.0, cands: list | None = None) -> str:
     cid = ctx["chain"]
     tsym = ctx["token"]["symbol"]
     fee, sp = int(ctx["fee"]), np_spacing(ctx)
@@ -2233,14 +2270,32 @@ def np_text(ctx: dict, p: dict, sq: int, ref: dict | None, bad: str | None) -> s
          f"tick spacing <b>{sp}</b> (kisi {box_pct(p):.4f}%)",
          f"poolId: <code>{esc(p['pool'])}</code>"]
     if ref is not None and sq > 0:
-        raw = (sq / ch.Q96) ** 2
-        qd = int(p["quote_decimals"])
-        td = int(ctx["token"].get("decimals") or 18)
-        harga = raw * 10 ** (td - qd) if p["quote_is_token1"] else (
-            10 ** (qd - td) / raw if raw else 0)
+        # Harga dihitung lewat `_meme_price` yang SAMA dengan kartu mint, bukan
+        # rumus tersendiri. Versi pertama menuliskannya ulang dan tandanya terbalik
+        # saat quote jadi currency0 (`10**(qd-td)` bukan `10**(td-qd)`): pool
+        # DOT/USDC 5% yang harga awalnya 0,00027480 USDC tampil sebagai "0.0₂₀0",
+        # meleset 1e24 — dan itu justru angka yang paling harus dipercaya user.
+        harga = np_price(p, int(ctx["token"].get("decimals") or 18), sq)
+        vol = ref.get("vol24_usd")
         L.append(f"\nHarga awal: <b>{ch.fmt_price(harga)} {esc(p['quote_sym'])}</b>/{esc(tsym)}\n"
                  f"<i>disalin dari pool v{ref.get('ver')} fee {ref.get('fee', 0) / 1e4:g}% "
-                 f"(TVL {ch.fmt_usd(ref.get('tvl_usd'))}) — bukan tebakan.</i>")
+                 f"(TVL {ch.fmt_usd(ref.get('tvl_usd'))}, vol 24j "
+                 f"{ch.fmt_usd(vol) if vol else '—'}) — bukan tebakan.</i>")
+        # Pool yang TIDAK pernah ditransaksikan tidak tahu harga apa pun. Kejadian
+        # nyata: DOT/USDC 5% dibuat dari pool fee 20% ber-TVL $89 yang harganya belum
+        # pernah bergerak — pool barunya lahir 27% di atas pasar lalu diseret turun,
+        # dan biayanya keluar dari deposit pertama.
+        if not vol:
+            L.append("⚠️ <b>Pool rujukan ini tidak punya volume 24 jam</b> — harganya bisa "
+                     "basi. Bandingkan dulu dengan harga di luar (GMGN/DexScreener) "
+                     "sebelum membuat pool.")
+        if abs(dev) > 0.10 and any(c.get("vol") for c in (cands or [])):
+            lain = ", ".join(
+                f"v{c['pool'].get('ver')} {c['pool'].get('fee', 0) / 1e4:g}% → "
+                f"{ch.fmt_price(c.get('price') or 0)}"
+                for c in [x for x in (cands or []) if x.get("vol")][:5])
+            L.append(f"⚠️ Harga rujukan <b>{dev * 100:+.0f}%</b> dari median pool sepasang "
+                     f"yang ADA volumenya. Pool itu: {esc(lain)}")
     if ada:
         L.append("\n✅ Pool ini <b>sudah ada</b> — tombol di bawah langsung ke kartu mint, "
                  "tidak ada tx pembuatan.")
@@ -2302,7 +2357,7 @@ async def do_newpool(update: Update, key: str, create: bool):
         return
     cid = ctx["chain"]
     try:
-        p, sq, ref, bad = await asyncio.to_thread(np_build, ctx)
+        p, sq, ref, bad, dev, cands = await asyncio.to_thread(np_build, ctx)
     except Exception as e:
         await reply(update, f"❌ {esc(e)}")
         return
@@ -2349,10 +2404,10 @@ async def show_newpool(msg, key: str):
         await edit(msg, "⚠️ Tombol kadaluarsa (bot sempat restart). Paste alamat lagi.")
         return
     try:
-        p, sq, ref, bad = await asyncio.to_thread(np_build, ctx)
+        p, sq, ref, bad, dev, cands = await asyncio.to_thread(np_build, ctx)
         ada = await asyncio.to_thread(ch.v4_pool_exists, ch.get_w3(ctx["chain"]),
                                       ctx["chain"], p["pool_id"])
-        text = await asyncio.to_thread(np_text, ctx, p, sq, ref, bad)
+        text = await asyncio.to_thread(np_text, ctx, p, sq, ref, bad, dev, cands)
     except Exception as e:
         await edit(msg, f"❌ {esc(e)}")
         return

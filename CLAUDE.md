@@ -2001,11 +2001,35 @@ SESUDAH tx masuk blok — receipt sukses bukan bukti pool-nya jadi.
 **Harga awal disalin, tidak pernah ditebak.** `initialize()` menerima
 `sqrtPriceX96` apa adanya, dan yang membuat pool menentukan harganya; kalau
 meleset, arbitraser mengambil selisihnya dari deposit pertama — milik si pembuat.
-`v4_ref_sqrt_price()` mengambil sqrtPrice pool TERDALAM yang pasangan currency-nya
-PERSIS sama (v3 maupun v4) dan memakainya apa adanya: sqrtPriceX96 itu rasio
+`v4_ref_sqrt_price()` mengumpulkan semua pool yang pasangan currency-nya PERSIS
+sama (v3 maupun v4) dan memakai sqrtPrice-nya apa adanya: angka itu rasio
 token1-per-token0 dalam WEI, tidak bergantung fee maupun spacing. Tanpa pool
-rujukan, UI **menolak** — jadi pasangan yang sama sekali belum punya pool memang
-tidak bisa dibuat dari bot ini, dan itu disengaja.
+rujukan, UI **menolak** — pasangan yang sama sekali belum punya pool memang tidak
+bisa dibuat dari bot ini, dan itu disengaja.
+
+**TVL terbesar BUKAN patokan harga — itu sudah merugikan sekali.** Pool DOT/USDC
+5% di Arc dibuat dengan harga salinan dari pool fee 20% ber-TVL $89 yang harganya
+**belum pernah bergerak sama sekali** (0,0002748042 saat pool dibuat DAN berjam-jam
+sesudahnya). Pasar sebenarnya ~0,00021, jadi pool baru itu lahir **27% di atas
+pasar** dan langsung diseret turun begitu ada likuiditas — tick 358322 → 361476,
+diverifikasi dari event `Initialize` di tx pembuatannya vs `getSlot0` sesudahnya.
+
+Pemilihannya sekarang: hanya pool yang **ada volume 24 jam**, lalu yang harganya
+**paling dekat MEDIAN** pool-pool itu — bukan yang volumenya terbesar (volume
+tunggal yang besar bisa wash trading) dan bukan yang TVL-nya terbesar. Kalau tidak
+ada satu pun pool bervolume, kartu mengatakannya eksplisit ("pool rujukan tidak
+punya volume 24 jam — harganya bisa basi"). Median dihitung HANYA dari pool
+bervolume: pool debu yang tidak pernah diarbitrase harganya bisa ke mana saja, dan
+kalau ikut dihitung nyaris tiap token memicu peringatan — peringatan yang selalu
+menyala akan diabaikan.
+
+**Harga di kartu dihitung lewat `np_price()` → `_meme_price()`, helper yang SAMA
+dengan kartu mint.** Versi pertama menuliskan rumusnya ulang dan tandanya terbalik
+saat quote jadi currency0 (`10**(qd-td)` bukan `10**(td-qd)`): pool DOT/USDC yang
+harga awalnya 0,00027480 tampil sebagai **"0.0₂₀0"** — meleset 1e24, dan justru
+di angka yang paling harus dipercaya user. Deviasi persennya juga dihitung dari
+HARGA, bukan dari sqrtPrice mentah: untuk quote currency0 hubungannya terbalik,
+jadi persen dari `sq` akan salah tanda.
 
 **Jalur ini TIDAK lewat discovery.** Pool yang baru lahir belum diindeks
 Krystal/indexer/GeckoTerminal, dan `_drop_dead_pools()` juga akan membuangnya

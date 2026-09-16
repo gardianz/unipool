@@ -6364,22 +6364,31 @@ def v4_pool_exists(w3: Web3, chain_id: int, pool_id: bytes) -> bool:
 
 
 def v4_ref_sqrt_price(w3: Web3, chain_id: int, c0: str, c1: str,
-                      pools: list | None = None) -> tuple[int, dict | None]:
-    """(sqrtPriceX96, pool rujukan) untuk pasangan currency (c0, c1) — diambil dari
-    pool TERDALAM yang currency-nya PERSIS sama.
+                      pools: list | None = None) -> tuple[int, dict | None, list]:
+    """(sqrtPriceX96, pool rujukan, semua kandidat) untuk pasangan
+    currency (c0, c1) — diambil dari pool yang PALING AKTIF, bukan yang paling dalam.
 
     Yang membuat pool menentukan harganya: `initialize()` menerima sqrtPriceX96 apa
     adanya, dan kalau salah, arbitraser mengambil selisihnya dari deposit pertama —
     yaitu milik si pembuat. Karena itu harga awal TIDAK PERNAH diketik atau ditebak
     dari harga USD; ia disalin dari pool yang sudah diperdagangkan.
 
+    **TVL saja BUKAN patokan, dan itu terbukti merugikan.** Pool DOT/USDC 5% di Arc
+    dibuat dengan harga salinan dari pool fee 20% ber-TVL $89 yang harganya belum
+    pernah bergerak sama sekali (0,0002748042 saat itu DAN sekarang). Pasar
+    sebenarnya ~0,00021, jadi pool baru itu lahir **27% di atas pasar** dan langsung
+    diseret turun begitu ada likuiditas. Urutannya sekarang volume 24 jam dulu, TVL
+    belakangan — pool yang tidak pernah ditransaksikan tidak tahu harga apa pun.
+
     Aman disalin apa adanya karena sqrtPriceX96 itu rasio token1-per-token0 dalam
     satuan WEI dan tidak bergantung fee maupun tick spacing — jadi selama pasangan
-    currency-nya identik (termasuk sisi native vs wrapped), angkanya berlaku.
+    currency-nya identik (termasuk sisi native vs wrapped), angkanya berlaku. Untuk
+    alasan yang sama sqrtPrice antar pool sepasang bisa DIBANDINGKAN langsung, dan
+    rasio harganya = (sq1/sq2)**2.
 
-    (0, None) kalau tidak ada rujukan. Pemanggil WAJIB menolak, bukan menebak."""
+    (0, None, []) kalau tidak ada rujukan. Pemanggil WAJIB menolak, bukan menebak."""
     a, b = str(c0).lower(), str(c1).lower()
-    best, best_tvl = None, -1.0
+    cands = []
     for p in (pools or []):
         try:
             if p.get("ver") == 4:
@@ -6388,19 +6397,27 @@ def v4_ref_sqrt_price(w3: Web3, chain_id: int, c0: str, c1: str,
                 q0, q1 = str(p["token0"]).lower(), str(p["token1"]).lower()
             if {q0, q1} != {a, b}:
                 continue
-            tvl = float(p.get("tvl_usd") or 0)
-            if tvl <= best_tvl:
-                continue
             if p.get("ver") == 4:
                 sq = v4_slot0(w3, chain_id, p["pool_id"])[0]
             else:
                 sq = w3.eth.contract(address=Web3.to_checksum_address(p["pool"]),
                                      abi=POOL_ABI).functions.slot0().call()[0]
             if sq > 0:
-                best, best_tvl = (sq, p), tvl
+                cands.append({"sq": sq, "pool": p,
+                              "vol": float(p.get("vol24_usd") or 0),
+                              "tvl": float(p.get("tvl_usd") or 0)})
         except Exception:
             continue
-    return (best[0], best[1]) if best else (0, None)
+    if not cands:
+        return 0, None, []
+    cands.sort(key=lambda x: (-x["vol"], -x["tvl"]))
+    best = cands[0]
+    # Deviasi TIDAK dihitung di sini: sqrtPrice berbanding lurus dengan harga hanya
+    # kalau quote itu currency1; kalau quote currency0 hubungannya terbalik, dan
+    # persennya ikut terbalik tandanya. Pemanggil yang menghitungnya dari HARGA
+    # (lewat helper yang sama dengan yang ditampilkan), supaya angka di layar dan
+    # persen peringatannya tidak mungkin berbeda.
+    return best["sq"], best["pool"], cands
 
 
 def v4_check_new_pool(w3: Web3, chain_id: int, key: tuple, sqrt_price: int) -> str | None:
