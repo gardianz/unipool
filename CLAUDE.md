@@ -2075,10 +2075,29 @@ bentuk yang sama persis dengan `_uni_v4_pool()` supaya seluruh alur mint
 memakainya tanpa cabang khusus. Diuji: kartu mint, `assert_pool_orientation`, dan
 `assert_pool_price_sane` semuanya lolos dengan dict buatan lokal itu.
 
-**Dua tx, bukan satu.** `posm.multicall(initializePool, modifyLiquidities)` memang
-mungkin (selectornya ada di ketiga chain v4), tapi menggabungnya berarti menyentuh
-isi `mint_v4` — jalur yang memindahkan dana sungguhan dan tidak bisa diuji ulang
-tanpa biaya. Ongkos tambahannya satu tx murah; `mint_v4` tidak disentuh sama sekali.
+**Pembuatan pool terjadi DI DALAM `do_mint`, bukan sebelum kartunya.** Versi
+pertama membuat pool lalu menampilkan kartu konfirmasi dan MENUNGGU user menekan
+Confirm. Itu mengembalikan celah yang justru mau ditutup: harga pool baru beku
+sampai ada likuiditas, jadi jeda berapa detik pun berarti menyetor ke harga yang
+sudah basi. Sekarang `npok|` cuma menyiapkan `PENDING` (dengan `init_sqrtp`), dan
+tombol Confirm menjalankan `v4_init_pool` + `mint_v4` berurutan di dalam **satu
+`TX_LOCK`** — tanpa jeda manusia di antaranya.
+
+`ctx_slot0(ctx_data)` yang membuat itu mungkin: selama pool belum ada, ia memakai
+`init_sqrtp` sebagai ganti `v4_slot0` (yang balik 0), sehingga kartu konfirmasi,
+`current_mc`, dan `_amt` di `do_mint` semuanya menghitung range & jumlah deposit
+dari harga rujukan. Tanpa itu seluruh matematika range runtuh.
+
+**Harga rujukan DISEGARKAN tepat sebelum eksekusi** (`np_refresh_sqrt`), bukan
+dipakai apa adanya dari kartu — kartunya bisa didiamkan menit-menit. Terukur saat
+ditulis: dalam hitungan detik saja rujukan DOT/USDC bergeser **−10,03%**. Fungsi
+itu juga menolak kalau pool keburu dibuat pihak lain, kalau PoolKey-nya berubah,
+atau kalau deviasinya sudah lewat `NP_DEV_BLOCK`.
+
+**Tetap dua tx, bukan `posm.multicall`.** Menggabungnya jadi satu tx memang
+mungkin (selectornya ada di ketiga chain v4), tapi itu berarti menyentuh isi
+`mint_v4` — jalur dana yang tidak bisa diuji ulang tanpa biaya. Yang berbahaya
+bukan "dua tx", melainkan jeda manusia di antaranya, dan itu sudah hilang.
 
 **Default mode pool baru = `wide` (DUA SISI), dan itu bukan selera.** Di pool
 kosong, posisi satu sisi (Lower/Upper) meninggalkan tick aktif tanpa likuiditas

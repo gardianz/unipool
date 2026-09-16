@@ -1838,6 +1838,17 @@ def _meme_price(p: dict, tdec: int, tick: int) -> float:
     return (1 / raw if raw else 0) * 10 ** (tdec - p["quote_decimals"])
 
 
+def newpool_note(ctx_data: dict) -> str:
+    """Baris di kartu konfirmasi kalau pool-nya BELUM ada dan akan dibuat oleh
+    tombol Confirm — angka range & deposit di atasnya dihitung dari harga rujukan,
+    bukan dari pool yang sudah berjalan."""
+    if not ctx_data.get("init_sqrtp"):
+        return ""
+    return ("\n\n🆕 <b>Pool ini belum ada.</b> Tombol Confirm membuatnya lalu langsung "
+            "mint di transaksi berikutnya — keduanya berurutan tanpa jeda, jadi harga "
+            "awal tidak sempat basi. Range & jumlah di atas dihitung dari harga rujukan.")
+
+
 def pool_warnings(cid: int, p: dict) -> str:
     """Peringatan kartu konfirmasi untuk pool yang bukan profil normal."""
     cfg = ch.CHAINS[cid]
@@ -1992,7 +2003,7 @@ def build_preview(ctx_data: dict) -> str:
     # menskalakan nilai meme jadi budget quote. Tick tidak bergantung pada amount,
     # jadi urutan ini aman.
     if p.get("ver") == 4:
-        sqrtp, cur_tick = ch.v4_slot0(w3, cid, p["pool_id"])
+        sqrtp, cur_tick = ctx_slot0(ctx_data)
     else:
         pool = w3.eth.contract(address=ch.Web3.to_checksum_address(p["pool"]), abi=ch.POOL_ABI)
         slot0 = pool.functions.slot0().call()
@@ -2217,6 +2228,29 @@ def np_quotes(ctx: dict) -> list[tuple[str, str]]:
     return out
 
 
+def ctx_slot0(ctx_data: dict) -> tuple[int, int]:
+    """(sqrtPriceX96, tick) pool di ctx — memakai harga rujukan kalau pool-nya
+    BELUM di-initialize.
+
+    Alur "buat pool + mint" menyiapkan kartu konfirmasi SEBELUM pool-nya ada, supaya
+    user melihat range dan jumlah deposit yang sebenarnya lalu menekan SATU tombol:
+    pembuatan dan mint jalan berurutan di dalam satu `TX_LOCK`, tanpa jeda manusia
+    di antaranya. Tanpa ini `v4_slot0` mengembalikan 0 dan seluruh matematika range
+    runtuh."""
+    cid = ctx_data["chain"]
+    p = ctx_data["pool_info"]
+    w3 = ch.get_w3(cid)
+    if p.get("ver") == 4:
+        sq, tick = ch.v4_slot0(w3, cid, p["pool_id"])
+        if sq <= 0 and ctx_data.get("init_sqrtp"):
+            sq = int(ctx_data["init_sqrtp"])
+            tick = int(round(math.log((sq / ch.Q96) ** 2) / math.log(1.0001)))
+        return sq, tick
+    s0 = w3.eth.contract(address=ch.Web3.to_checksum_address(p["pool"]),
+                         abi=ch.POOL_ABI).functions.slot0().call()
+    return s0[0], s0[1]
+
+
 def np_median(px: list[float]) -> float:
     """Median harga. Untuk jumlah GENAP dipakai rata-rata GEOMETRIK dua nilai
     tengah, bukan elemen ke-n//2 — indeks polos selalu mengambil yang lebih tinggi
@@ -2356,8 +2390,8 @@ def np_text(ctx: dict, p: dict, sq: int, ref: dict | None, bad: str | None,
         if abs(dev) > 0.10 and live:
             L.append(f"⚠️ Harga rujukan <b>{dev * 100:+.0f}%</b> dari median pool di atas.")
     if ada:
-        L.append("\n✅ Pool ini <b>sudah ada</b> — tombol di bawah langsung ke kartu mint, "
-                 "tidak ada tx pembuatan.")
+        L.append("\n✅ Pool ini <b>sudah ada</b> — tidak ada tx pembuatan, "
+                 "tombol di bawah langsung ke kartu mint.")
     elif bad:
         L.append(f"\n❌ {esc(bad)}")
     else:
@@ -2379,7 +2413,8 @@ def np_kb(key: str, ctx: dict, p: dict, bad: str | None, ada: bool) -> InlineKey
     if ada:
         rows.append([InlineKeyboardButton("➡️ Ke kartu mint", callback_data=f"npgo|{key}")])
     elif not bad:
-        rows.append([InlineKeyboardButton("✅ Buat pool + lanjut mint", callback_data=f"npok|{key}")])
+        rows.append([InlineKeyboardButton("➡️ Siapkan mint (pool dibuat saat Confirm)",
+                                          callback_data=f"npok|{key}")])
     qs = np_quotes(ctx)
     if len(qs) > 1:
         cur = str(np_quote(ctx)).lower()
@@ -2403,13 +2438,43 @@ def np_kb(key: str, ctx: dict, p: dict, bad: str | None, ada: bool) -> InlineKey
     return InlineKeyboardMarkup(rows)
 
 
-async def do_newpool(update: Update, key: str, create: bool):
-    """Buat pool v4 (kalau perlu) lalu buka kartu konfirmasi mint untuk pool itu.
+def np_refresh_sqrt(ctx_data: dict) -> tuple[int, str]:
+    """(sqrtPriceX96 terbaru, alasan gagal) untuk pool yang belum ada.
 
-    Pembuatan pool dan mint SENGAJA dua tx terpisah. Menggabungnya lewat
-    `posm.multicall` memang mungkin, tapi itu berarti menyentuh isi `mint_v4` —
-    jalur yang memindahkan dana sungguhan dan tidak bisa diuji ulang tanpa biaya.
-    Ongkos tambahannya satu tx murah."""
+    Dihitung ulang dari discovery SEGAR memakai jalur yang sama dengan kartu
+    pembuatan — termasuk pool ber-hooks sebagai pembanding — lalu ditolak kalau
+    devisinya sudah lewat `NP_DEV_BLOCK`. Dipanggil di thread."""
+    cid = ctx_data["chain"]
+    p0 = ctx_data["pool_info"]
+    if ch.v4_pool_exists(ch.get_w3(cid), cid, p0["pool_id"]):
+        return 0, "pool sudah dibuat pihak lain — buka ulang kartunya"
+    res = ch.discover_any(cid, ctx_data["token"]["address"])
+    ctx = {"chain": cid, "token": ctx_data["token"], "pools": res.get("pools") or [],
+           "quote_addr": p0["quote_addr"], "fee": p0["fee"],
+           "spacing": p0["tick_spacing"]}
+    p, sq, ref, bad, dev, _ = np_build(ctx)
+    if bad:
+        return 0, bad
+    if sq <= 0:
+        return 0, "tidak ada pool rujukan"
+    if p["pool"] != p0["pool"]:
+        return 0, "PoolKey berubah — buka ulang kartunya"
+    return int(sq), ""
+
+
+async def do_newpool(update: Update, key: str):
+    """Siapkan kartu konfirmasi mint untuk pool baru — TANPA membuat pool dulu.
+
+    Pembuatan pool dipindah ke dalam `do_mint`, di `TX_LOCK` yang sama dengan
+    mint-nya. Versi pertama membuat pool lebih dulu lalu menampilkan kartu dan
+    MENUNGGU user menekan Confirm; harga pool baru beku sampai ada likuiditas,
+    jadi jeda itu — berapa detik pun — berarti menyetor ke harga yang sudah basi,
+    dan selisihnya diambil arbitraser dari deposit pertama.
+
+    Digabung jadi satu tx lewat `posm.multicall` memang mungkin (selectornya ada di
+    ketiga chain v4), tapi itu berarti menyentuh isi `mint_v4` — jalur dana yang
+    tidak bisa diuji ulang tanpa biaya. Dua tx berurutan dalam satu lock sudah
+    menutup celah yang nyata, yaitu jeda manusianya."""
     ctx = NEWPOOL.get(key)
     if not ctx:
         await reply(update, "⚠️ Tombol kadaluarsa (bot sempat restart). Paste alamat lagi.")
@@ -2420,29 +2485,10 @@ async def do_newpool(update: Update, key: str, create: bool):
     except Exception as e:
         await reply(update, f"❌ {esc(e)}")
         return
-    # Pool yang SUDAH ada membuat simulasi initialize revert PoolAlreadyInitialized
-    # (0x7983c051) — itu bukan alasan menolak, justru jalur "langsung ke mint".
     ada = await asyncio.to_thread(ch.v4_pool_exists, ch.get_w3(cid), cid, p["pool_id"])
     if bad and not ada:
         await reply(update, f"❌ {esc(bad)}")
         return
-    if create and not ada:
-        status = await reply(update, "⏳ Membuat pool v4 baru…")
-        async with TX_LOCK:
-            try:
-                txs = await with_progress(
-                    status, "⏳ Membuat pool v4 baru…",
-                    lambda: ch.v4_init_pool(cid, pk(), p["key"], sq))
-            except Exception as e:
-                await edit(status, f"❌ Gagal membuat pool: {esc(e)}")
-                return
-        gas = await asyncio.to_thread(gas_line, cid)
-        head = ("✅ <b>Pool sudah ada sebelumnya</b> — tidak ada tx." if not txs else
-                "✅ <b>Pool v4 dibuat.</b>\n" + "\n".join(f"· {esc(l)}: <code>{esc(h)}</code>"
-                                                          for l, h in txs))
-        await edit(status, head + (f"\n{gas}" if gas else ""))
-    # Kartu mint memakai pool_info yang dibangun LOKAL — pool baru belum diindeks
-    # sumber mana pun, jadi jalur discovery tidak akan menemukannya.
     s_set = store.load_settings(cid)
     mk = uuid.uuid4().hex[:10]
     PENDING[mk] = {"chain": cid, "token": ctx["token"], "pool_info": p,
@@ -2452,7 +2498,10 @@ async def do_newpool(update: Update, key: str, create: bool):
                    "low_pct": s_set["width_pct"], "up_pct": 100.0,
                    "amount_pct": s_set["amount_pct"], "amount_fixed": s_set["amount_fixed"],
                    "amount_src": "quote", "gap": int(s_set.get("gap", 1)),
-                   "vol": None, "rec": None}
+                   "vol": None, "rec": None,
+                   # Dipakai ctx_slot0() selama pool belum ada, dan jadi harga
+                   # `initialize` saat Confirm ditekan.
+                   "init_sqrtp": (0 if ada else int(sq))}
     msg = await reply(update, "⏳ Menyiapkan kartu mint…")
     await show_confirm(msg, mk)
 
@@ -2624,7 +2673,9 @@ def confirm_kb(key: str, ctx_data: dict) -> InlineKeyboardMarkup:
                                     callback_data=f"amtsrc|{key}|{val}")
 
     rows = [
-        [InlineKeyboardButton("✅ Confirm mint", callback_data=f"mint|{key}"),
+        [InlineKeyboardButton(
+            "✅ Buat pool + mint" if ctx_data.get("init_sqrtp") else "✅ Confirm mint",
+            callback_data=f"mint|{key}"),
          InlineKeyboardButton("❌ Cancel", callback_data=f"cancelp|{key}")],
         # Kembali ke DAFTAR POOL token yang sama. Tanpa ini satu-satunya jalan
         # membandingkan pool lain adalah Cancel lalu menempel ulang CA-nya.
@@ -2669,7 +2720,7 @@ async def show_confirm(msg, key: str):
     except Exception as e:
         await edit(msg, f"❌ {esc(e)}")
         return
-    text += pool_warnings(ctx_data["chain"], ctx_data["pool_info"])
+    text += pool_warnings(ctx_data["chain"], ctx_data["pool_info"]) + newpool_note(ctx_data)
     await edit(msg, text, confirm_kb(key, ctx_data))
     LAST_CONFIRM[msg.chat_id] = (key, msg)
 
@@ -2734,7 +2785,7 @@ def current_mc(ctx_data: dict) -> float:
     p = ctx_data["pool_info"]
     w3 = ch.get_w3(ctx_data["chain"])
     if p.get("ver") == 4:
-        _, tick = ch.v4_slot0(w3, ctx_data["chain"], p["pool_id"])
+        _, tick = ctx_slot0(ctx_data)
     elif p.get("ver") == 2:
         raise RuntimeError("Range tidak berlaku untuk pool v2.")
     else:
@@ -3056,18 +3107,26 @@ async def do_mint(update: Update, ctx_data: dict):
                 "mode": mode, "low_pct": ctx_data["low_pct"], "up_pct": ctx_data["up_pct"],
                 "gap": ctx_data.get("gap", 1)}
 
+    # Pool BELUM ada: harga rujukan DISEGARKAN tepat sebelum eksekusi. Kartu bisa
+    # saja didiamkan menit-menit sebelum Confirm ditekan, dan harga pool baru
+    # ditentukan saat `initialize` — bukan saat kartunya dirender. Kalau tidak
+    # disegarkan, jeda itu persis kembali jadi celah yang mau ditutup.
+    if ver == 4 and ctx_data.get("init_sqrtp"):
+        try:
+            fresh, why = await asyncio.to_thread(np_refresh_sqrt, ctx_data)
+        except Exception as e:
+            fresh, why = 0, str(e)
+        if not fresh:
+            await reply(update, f"❌ Harga rujukan tidak bisa disegarkan: {esc(why)}")
+            return
+        ctx_data["init_sqrtp"] = fresh
+
     # Sama persis dengan kartu konfirmasi: untuk `amount_src="meme"` budget-nya
     # bergantung rasio range, jadi tick harus ikut dihitung — kalau tidak, jumlah
     # yang dieksekusi beda dari yang ditampilkan.
     def _amt():
         p_ = ctx_data["pool_info"]
-        w3_ = ch.get_w3(ctx_data["chain"])
-        if p_.get("ver") == 4:
-            sq, ct = ch.v4_slot0(w3_, ctx_data["chain"], p_["pool_id"])
-        else:
-            s0 = w3_.eth.contract(address=ch.Web3.to_checksum_address(p_["pool"]),
-                                  abi=ch.POOL_ABI).functions.slot0().call()
-            sq, ct = s0[0], s0[1]
+        sq, ct = ctx_slot0(ctx_data)
         tk = ch.calc_strategy_range(ct, p_["fee"], p_["quote_is_token1"], mode,
                                     ctx_data["low_pct"], ctx_data["up_pct"],
                                     ctx_data.get("gap", 1), spacing=p_.get("tick_spacing"))
@@ -3087,6 +3146,12 @@ async def do_mint(update: Update, ctx_data: dict):
     status = await reply(update, head)
 
     def work():
+        # Pool BELUM ada (alur "buat pool + mint"): initialize dulu, di dalam
+        # `work` yang sama supaya keduanya duduk dalam SATU `TX_LOCK` dan tidak ada
+        # jeda manusia di antaranya. Harga pool baru beku sampai ada likuiditas,
+        # jadi jeda apa pun = menyetor ke harga yang sudah basi.
+        if ver == 4 and ctx_data.get("init_sqrtp"):
+            ch.v4_init_pool(cid, pk(), p["key"], int(ctx_data["init_sqrtp"]))
         if ver == 2:
             return ch.mint_v2(cid, pk(), p, amount, s["slippage_pct"])
         if ver == 4:
@@ -4587,9 +4652,8 @@ async def _route_callback(update: Update):
         await show_pools_for(q.message, ctx["chain"], ctx["token"]["address"])
         return
     if data.startswith(("npok|", "npgo|")):
-        k = data.split("|", 1)[1]
         await q.edit_message_reply_markup(None)
-        await do_newpool(update, k, create=data.startswith("npok|"))
+        await do_newpool(update, data.split("|", 1)[1])
         return
     if data.startswith("pools|"):
         # Balik ke daftar pool token yang sama, di pesan yang SAMA. ctx lama
