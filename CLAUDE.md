@@ -2014,31 +2014,119 @@ sesudahnya). Pasar sebenarnya ~0,00021, jadi pool baru itu lahir **27% di atas
 pasar** dan langsung diseret turun begitu ada likuiditas — tick 358322 → 361476,
 diverifikasi dari event `Initialize` di tx pembuatannya vs `getSlot0` sesudahnya.
 
-**Pool ber-HOOKS ikut jadi pembanding HARGA, walau tidak pernah jadi tempat LP.**
-Melewatinya benar untuk menaruh dana; SALAH untuk membaca harga. Di token
+**Pool ber-HOOKS ikut jadi pembanding HARGA, walau nyaris tidak pernah jadi tempat
+LP.** Melewatinya benar untuk menaruh dana; SALAH untuk membaca harga. Di token
 launchpad justru di situlah seluruh volumenya — terukur DOT/USDC Arc: pool
 ber-hook `0x0d751ec0…` **$441.817/24 jam** sementara SEMUA pool tanpa hook
-digabung ~$800, dan rujukan harga yang dipilih dari pool tanpa hook meleset
-**125%** dari situ. `getSlot0(poolId)` adalah pembacaan murni StateView — hook-nya
+digabung ~$800. `getSlot0(poolId)` adalah pembacaan murni StateView — hook-nya
 tidak dijalankan dan PoolKey-nya tidak perlu diketahui, jadi tidak ada kode asing
 yang tersentuh.
 
-`v4_hook_price_refs()` mengambilnya dari GeckoTerminal (poolId 66 karakter) lalu
-membaca slot0-nya. Orientasi currency dan desimal quote tidak bisa disimpulkan
-dari poolId (itu hash), jadi **keempat tafsir** yang mungkin dihitung dan dipilih
-yang paling dekat median pool yang sudah diketahui — teknik yang sama dengan
-`_v4_key_from_krystal` yang mencoba varian native maupun wrapped. Yang tetap
-meleset >10x dibuang.
+### Harga rujukan pool baru: patokan INDEPENDEN dulu, median belakangan
 
-**sqrtPrice untuk `initialize` TETAP dari pool tanpa hook**: hanya di situ urutan
-currency dan desimalnya pasti (PoolKey-nya kita yang susun). Harga pool ber-hook
-cuma menggeser MEDIAN-nya — dan itu justru intinya.
+Median pool sepasang saja TIDAK CUKUP, dan itu sudah memblokir pembuatan yang sah
+sekaligus meloloskan angka omong kosong. Kartu BEORN/USDG di Robinhood menghitung
+mediannya dari tiga pool debu — volume 24 jam **$8,04**, **$0,76**, dan **$0,06** —
+yang harganya berselisih **100×** satu sama lain, lalu menolak dengan "+859%".
+Empat pool BEORN/USDG yang benar-benar diperdagangkan (0,000232–0,000245) tidak
+ada di himpunan itu sama sekali, dan harga sebenarnya ~0,00025 — disepakati GMGN
+($0,00024906), pool terdalam GeckoTerminal ($0,00028666), dan `token_usd_price`
+($0,0002627).
 
-Pemilihannya sekarang: hanya pool yang **ada volume 24 jam**, lalu yang harganya
-**paling dekat MEDIAN** pool-pool itu — bukan yang volumenya terbesar (volume
-tunggal yang besar bisa wash trading) dan bukan yang TVL-nya terbesar.
-Deviasi > `NP_DEV_BLOCK` (25%) **MENOLAK** pembuatan, bukan sekadar
-memperingatkan — harga awal yang meleset sejauh itu dijamin diambil arbitraser.
+`ch.token_anchor_price()` karena itu membangun patokan yang **tidak berasal dari
+pool sepasang yang sedang dinilai**, dari tiga sumber yang di-median-geometrik:
+
+| sumber | dari mana |
+|---|---|
+| GMGN | `bot.gmgn_price_usd()` — `token_info()["price"]["price"]` |
+| pool terdalam | `ch.gecko_deep_price_usd()` — pool token itu yang volumenya terbesar di GeckoTerminal, **pasangan apa pun, termasuk ber-hooks** |
+| bot | `token_usd_price()` yang sudah ada |
+
+Itulah "pool terdalam dengan hook atau GMGN" yang dimaksud saat harga rujukan
+terlihat meleset: seluruh perdagangan BEORN terjadi di **BEORN/SHROOM
+($493.436/24 jam)**, pasangan yang tidak pernah bisa jadi kandidat sqrtPrice.
+
+**Kunci GMGN diambil di `bot.py`, bukan `chain.py`** — `extra=[("GMGN", …)]`
+dioper masuk. `chain._cf_request` meneruskan header ke operator proxy pihak
+ketiga, dan `X-APIKEY` tidak boleh ikut ke sana.
+
+**Patokan ini MENYARING dan MEMILIH, tidak pernah DISALIN.** GeckoTerminal bisa
+telat jauh (terukur di Arc: GT $67,77 saat pool terdalam on-chain $202,56), jadi
+angka yang masuk `initialize()` tetap sqrtPrice yang dibaca on-chain. Urutannya:
+
+1. Kandidat di luar `NP_ANCHOR_DROP` (3×) dari patokan **dibuang sebelum median
+   dihitung**. Tanpa ini saringan dua-lintasan tidak menolong sama sekali kalau
+   yang tersisa memang semuanya debu.
+2. Kalau tidak ada pool bervolume yang masuk akal, pool TANPA volume yang dekat
+   patokan masih dipakai. Kalau itu pun kosong, pembuatan **DITOLAK** — jangan
+   jatuh balik ke pilihan `v4_ref_sqrt_price` (pool bervolume terbesar): di
+   BEORN/USDG itu justru pool ber-tick mentok berharga **2,9e-27** yang volume
+   terlapornya $1.473.
+3. Yang dipilih adalah pool **paling ramai di antara yang harganya sudah dalam
+   10% dari patokan**, bukan yang terdekat median. "Terdekat median" saja memilih
+   pool mati — terukur LONG/USDC Arc: ia memilih pool fee 3,36% bervolume **$0,11**
+   padahal pool fee 1% bervolume **$109,5k** sama-sama rapat.
+4. `NP_DEV_BLOCK` (25% terhadap median) **dibatalkan** kalau pilihannya justru
+   rapat dengan patokan. Pool sepasang yang saling tidak sepakat itu lazim saat
+   semuanya debu; mediannya yang tidak bermakna, bukan pilihannya. Terukur
+   BEORN/WETH: dua pool sepasang berselisih 3,6× (volume $0,40 dan $0,63)
+   sementara pilihannya cuma 22,7% dari harga pasar tiga sumber.
+5. `NP_ANCHOR_BLOCK` (3×) menolak kalau MEDIAN pool sepasang sendiri sejauh itu
+   dari patokan — artinya tidak ada pool sepasang yang layak jadi rujukan.
+
+Hasil terukur sesudahnya: BEORN/USDG **+0,5%** dan LONG/USDC Arc **+0,3%** dari
+harga pasar, dari yang sebelumnya diblokir "+859%".
+
+**`v4_hook_price_refs()` TIDAK BOLEH menebak tafsir.** Versi pertama memakai
+setiap pool token itu apa adanya lalu memilih satu dari empat tafsir (quote di
+currency0/1 × desimal ERC20/18) yang paling dekat median pool yang sudah
+diketahui. Dua-duanya salah:
+
+- **Daftar GeckoTerminal memuat pasangan LAIN** (BEORN/SHROOM, BEORN/WETH).
+  Harganya bukan harga dalam quote ini sama sekali, dan yang menahannya cuma
+  saringan 10× — bukan pemahaman apa pun.
+- **Memilih tafsir "paling dekat median" itu MELINGKAR**: pembandingnya jadi
+  menegaskan median yang mau diperiksa. Terukur pada BEORN/USDG — dua pool yang
+  diketahui berharga 0,000368 dan 0,00000387 (rata-rata geometrik 0,0000378), dan
+  tafsir yang terpilih untuk pool ber-hook keluar **0,0000383**, yaitu 1,4% dari
+  rata-rata itu. Terlihat seperti konfirmasi sumber ketiga, padahal cuma pantulan
+  angka yang sama.
+
+Sekarang keduanya ditutup dan tidak ada yang ditebak lagi: hanya pool yang KEDUA
+sisinya cocok, dan orientasinya diturunkan dari aturan PoolKey — **currency0
+selalu alamat yang lebih kecil**, jadi native (`address(0)`) selalu currency0.
+Desimalnya dibaca dari kontraknya. Diverifikasi terhadap `base_token_price_usd`
+GeckoTerminal untuk pool yang sama: **beda 0,00%** pada pool mati (buktinya
+rumusnya eksak) dan 6–12% pada pool yang aktif diperdagangkan (GT-nya yang telat).
+
+**Native vs wrapped WAJIB diterima keduanya.** GeckoTerminal melaporkan pool ETH
+native sebagai `address(0)` sementara `CHAINS[...]["quotes"]` menyimpan alamat
+WETH — tanpa menerima kedua bentuk, filter pasangan membuang **SEMUA** pool ETH
+(terukur: 3 pool BEORN/WETH hilang seluruhnya). Jebakan yang sama sudah pernah
+menggigit di `_v4_key_from_krystal`. Orientasi dan desimal karena itu diturunkan
+dari sisi quote **BARIS ITU**, bukan dari target: baris native dan target wrapped
+adalah PoolKey yang berbeda.
+
+**Pool ber-hook BOLEH jadi sumber harga awal kalau `sq_ok`.** sqrtPriceX96 itu
+rasio token1-wei per token0-wei; fee, tick spacing, dan hooks tidak ikut
+menentukannya. Jadi ia berlaku apa adanya untuk PoolKey lain asalkan **urutan
+currency dan desimal kedua sisinya sama**. Tanpa ini, pasangan yang seluruh
+pool-nya ber-hook tidak bisa dibuat sama sekali — terukur BEORN/WETH Robinhood,
+di mana ketiga pool sepasangnya native dan tak satu pun masuk discovery.
+
+**Satu request GeckoTerminal, dipakai bertiga.** `_gecko_token_pools()` men-cache
+45 detik dan melayani `discover_gecko`, `gecko_deep_price_usd`, dan
+`v4_hook_price_refs` — dulu satu kartu menembak URL yang persis sama tiga kali,
+dan kegagalannya SENYAP (`[]`) sehingga gejalanya bukan error melainkan "tidak ada
+pool rujukan" yang muncul sesekali. Kegagalan tidak menimpa hasil lama, aturan yang
+sama dengan `_dex_pairs()`.
+
+**Selector PoolManager didekode jadi kalimat.** `v4_check_new_pool` dulu meneruskan
+teks mentah web3 — user melihat `PoolManager menolak PoolKey ini: ('0x7983c051',
+'0x7983c051')` untuk keadaan yang artinya cuma "pool ini sudah ada". Kelima
+selector yang sudah diukur (`0x7983c051` PoolAlreadyInitialized, `0xe9e90588`/
+`0xb70024f8` tick spacing, `0x14002113` fee, `0xe65af6a0` fee dinamis) sekarang
+punya kalimatnya sendiri.
 
 Dua jebakan aritmetika di jalur ini, dua-duanya sudah menggigit sekali:
 
@@ -2047,17 +2135,17 @@ Dua jebakan aritmetika di jalur ini, dua-duanya sudah menggigit sekali:
   kasar dulu, lalu buang yang lebih dari 10x dari situ.
 - **Median panjang GENAP tidak boleh `v[n//2]`.** Indeks polos selalu mengambil
   yang lebih tinggi — pada 6 pool DOT ia memilih 0,000144989 padahal dua tengahnya
-  0,000125074 dan 0,000144989. `np_median()` memakai rata-rata **geometrik** dua
-  nilai tengah; harga itu besaran rasio, jadi geometrik yang benar.
+  0,000125074 dan 0,000144989. `ch.geo_median()` memakai rata-rata **geometrik**
+  dua nilai tengah; harga itu besaran rasio, jadi geometrik yang benar. Satu
+  implementasi saja — `np_median()` cuma meneruskan ke sana.
 
 Daftar pool di kartu dan persen deviasinya berasal dari himpunan yang SAMA
 (`c["used"]`). Sebelumnya kartu menampilkan 5 teratas per volume sedangkan median
-dihitung dari semuanya, dan angkanya tidak bisa direkonsiliasi user. Kalau tidak
-ada satu pun pool bervolume, kartu mengatakannya eksplisit ("pool rujukan tidak
-punya volume 24 jam — harganya bisa basi"). Median dihitung HANYA dari pool
-bervolume: pool debu yang tidak pernah diarbitrase harganya bisa ke mana saja, dan
-kalau ikut dihitung nyaris tiap token memicu peringatan — peringatan yang selalu
-menyala akan diabaikan.
+dihitung dari semuanya, dan angkanya tidak bisa direkonsiliasi user. Kartu juga
+WAJIB menampilkan patokan independennya berikut tiap sumbernya — **dalam DOLAR
+dengan tanda $**, karena `per_quote` sudah dibagi harga quote dan menuliskannya
+tanpa satuan membuat "GMGN 0,000196" terbaca sebagai WETH/BEORN padahal itu USD
+(meleset 2.600× di quote ETH).
 
 **Harga di kartu dihitung lewat `np_price()` → `_meme_price()`, helper yang SAMA
 dengan kartu mint.** Versi pertama menuliskan rumusnya ulang dan tandanya terbalik

@@ -2790,14 +2790,8 @@ def discover_gecko(chain_id: int, token: str) -> list[dict]:
     pool tetap diverifikasi on-chain sebelum bisa dipakai: v2/v3 lewat `token0()/
     token1()` + kepemilikan factory, v4 lewat hash PoolKey."""
     cfg = CHAINS[chain_id]
-    net = cfg.get("gecko")
-    if not net:
-        return []
-    try:
-        r = _cf_get(_GECKO_POOLS.format(net=net, token=str(token).lower()),
-                    timeout=15, headers={"accept": "application/json"})
-        rows = (r.json() or {}).get("data") or []
-    except Exception:
+    rows = _gecko_token_pools(chain_id, token)
+    if not rows:
         return []
     w3 = get_w3(chain_id)
     tl = str(token).lower()
@@ -6420,78 +6414,255 @@ def v4_ref_sqrt_price(w3: Web3, chain_id: int, c0: str, c1: str,
     return best["sq"], best["pool"], cands
 
 
+# ---------- Harga rujukan INDEPENDEN (anchor) ----------
+# Longgar disengaja: yang dikejar harga yang OMONG KOSONG (faktor puluhan), bukan
+# pool yang kebetulan 30% mahal. Anchor-nya sendiri bisa telat beberapa persen.
+_ANCHOR_DROP_RATIO = 10.0
+_ANCHOR_MIN_VOL = 1.0
+
+
+def geo_median(px: list[float]) -> float:
+    """Median harga; untuk jumlah GENAP rata-rata GEOMETRIK dua nilai tengah.
+    Harga itu besaran rasio, jadi geometrik yang benar — dan indeks polos
+    `v[n//2]` selalu mengambil yang lebih tinggi (terukur pada 6 pool DOT: memilih
+    0,000144989 padahal dua tengahnya 0,000125074 dan 0,000144989)."""
+    v = sorted(x for x in px if x > 0)
+    if not v:
+        return 0.0
+    n = len(v)
+    return v[n // 2] if n % 2 else math.sqrt(v[n // 2 - 1] * v[n // 2])
+
+
+def _gecko_token_pools(chain_id: int, token: str, _cache={}) -> list:
+    """Daftar pool GeckoTerminal untuk satu token, di-cache pendek.
+
+    Dipakai DUA jalur pada kartu yang sama (`gecko_deep_price_usd` dan
+    `v4_hook_price_refs`). Tanpa cache, satu kartu menembak URL yang persis sama
+    dua kali — dan kegagalannya senyap (`[]`), jadi gejalanya bukan error
+    melainkan "tidak ada pool rujukan" yang muncul sesekali."""
+    net = CHAINS[chain_id].get("gecko")
+    if not net:
+        return []
+    key = (net, str(token).lower())
+    hit = _cache.get(key)
+    if hit and time.time() - hit[1] < 45:
+        return hit[0]
+    try:
+        r = _cf_get(_GECKO_POOLS.format(net=net, token=str(token).lower()),
+                    timeout=12, headers={"accept": "application/json"})
+        rows = (r.json() or {}).get("data") or []
+    except Exception:
+        # Kegagalan JANGAN menimpa hasil lama — sama seperti `_dex_pairs()`.
+        return hit[0] if hit else []
+    if rows:
+        _cache[key] = (rows, time.time())
+    return rows
+
+
+def gecko_deep_price_usd(chain_id: int, token: str) -> tuple[float, str, float]:
+    """(harga USD, nama pool, volume 24j) dari pool token ini yang volumenya
+    TERBESAR di GeckoTerminal — pasangan apa pun, TERMASUK pool ber-hooks.
+
+    Inilah "pool terdalam" yang dimaksud saat harga rujukan terlihat meleset:
+    pool sepasang <token>/<quote> bisa semuanya debu sementara seluruh
+    perdagangan token itu terjadi di pasangan LAIN. Terukur pada BEORN di
+    Robinhood: pool BEORN/SHROOM ber-volume **$493.436/24 jam** sedangkan SEMUA
+    pool BEORN/USDG yang sempat jadi rujukan digabung cuma ~$9.
+
+    GeckoTerminal mengirim `base_token_price_usd`/`quote_token_price_usd` per
+    pool — sudah benar orientasi dan desimalnya, jadi tidak ada yang perlu
+    ditafsirkan. Angkanya BISA TELAT (terukur di Arc: GT $67,77 vs pool terdalam
+    on-chain $202,56), jadi ia dipakai untuk MENYARING kandidat, tidak pernah
+    disalin jadi harga awal pool."""
+    rows = _gecko_token_pools(chain_id, token)
+    tl = str(token).lower()
+    best = (0.0, "", 0.0)
+    for row in rows:
+        try:
+            at = row.get("attributes") or {}
+            rel = row.get("relationships") or {}
+            def side(nm):
+                return str((((rel.get(nm) or {}).get("data") or {}).get("id") or "")
+                           ).split("_")[-1].lower()
+            if side("base_token") == tl:
+                px = float(at.get("base_token_price_usd") or 0)
+            elif side("quote_token") == tl:
+                px = float(at.get("quote_token_price_usd") or 0)
+            else:
+                continue                      # token ini bukan salah satu sisinya
+            vol = float((at.get("volume_usd") or {}).get("h24") or 0)
+            if px > 0 and vol > best[2]:
+                best = (px, str(at.get("name") or ""), vol)
+        except Exception:
+            continue
+    return best
+
+
+def token_anchor_price(chain_id: int, token: str, quote_sym: str | None = None,
+                       extra: list | None = None, _cache={}) -> dict:
+    """Patokan harga yang TIDAK berasal dari pool sepasang yang sedang dinilai.
+
+    Median pool sepasang saja tidak cukup, dan itu sudah merugikan: kartu pembuatan
+    pool BEORN/USDG di Robinhood menghitung mediannya dari tiga pool debu (volume
+    24 jam $8,04, $0,76, dan $0,06) yang harganya berselisih **100×** satu sama
+    lain, lalu memblokir pembuatan dengan "+859%". Empat pool BEORN/USDG yang
+    benar-benar diperdagangkan (0,000232–0,000245) tidak ada di himpunan itu, dan
+    harga sebenarnya ~0,00025 — disepakati GMGN ($0,00024906), pool terdalam
+    GeckoTerminal ($0,00028666), dan `token_usd_price` ($0,0002627).
+
+    Sumbernya sengaja beberapa dan di-median-kan: satu sumber yang menyimpang jauh
+    dari semua yang lain adalah sumbernya yang salah (aturan yang sama dipakai
+    `assert_pool_price_sane`). `extra` diisi pemanggil — di bot dipakai untuk harga
+    GMGN, supaya kunci API-nya tidak pernah lewat `_cf_request` (jalur proxy).
+
+    {"usd", "per_quote", "srcs": [(nama, harga)], "deep", "deep_vol"}."""
+    key = (chain_id, str(token).lower(), str(quote_sym or "").upper(),
+           tuple(sorted((str(n), round(float(v), 12)) for n, v in (extra or []) if v)))
+    hit = _cache.get(key)
+    if hit and time.time() - hit[1] < 60:
+        return hit[0]
+    srcs = [(str(n), float(v)) for n, v in (extra or []) if float(v or 0) > 0]
+    deep_px, deep_nm, deep_vol = gecko_deep_price_usd(chain_id, token)
+    if deep_px > 0 and deep_vol >= _ANCHOR_MIN_VOL:
+        srcs.append(("pool terdalam", deep_px))
+    try:
+        own = token_usd_price(get_w3(chain_id), chain_id, token)
+    except Exception:
+        own = 0.0
+    if own > 0:
+        srcs.append(("bot", own))
+    usd = geo_median([v for _, v in srcs])
+    per_quote = 0.0
+    if usd > 0 and quote_sym:
+        try:
+            q = quote_usd_price(get_w3(chain_id), chain_id, quote_sym)
+            if q > 0:
+                per_quote = usd / q
+        except Exception:
+            pass
+    out = {"usd": usd, "per_quote": per_quote, "srcs": srcs,
+           "deep": deep_nm, "deep_vol": deep_vol}
+    _cache[key] = (out, time.time())
+    return out
+
+
 def v4_hook_price_refs(chain_id: int, token: str, quote_addr: str,
-                       known: list[float], skip_ids: set | None = None) -> list[dict]:
+                       known: list[float], skip_ids: set | None = None,
+                       anchor: float = 0.0) -> list[dict]:
     """Pool v4 BER-HOOKS sebagai pembanding HARGA saja — tidak pernah untuk LP.
 
     Melewati pool ber-hooks itu benar untuk menaruh dana (hook = kode arbitrer yang
     ikut jalan tiap swap/mint/burn), tapi SALAH untuk membaca harga: di token
     launchpad, pool ber-hook justru satu-satunya venue yang nyata. Terukur di
     DOT/USDC Arc — pool ber-hook `0x0d751ec0…` bervolume **$422.571/24 jam**
-    sementara SELURUH pool tanpa hook digabung cuma ~$800, dan pool tanpa hook
-    yang jadi rujukan harga meleset 125% dari situ. Pool baru yang lahir dari
-    rujukan itu langsung diseret arbitraser.
+    sementara SELURUH pool tanpa hook digabung cuma ~$800.
 
     `getSlot0(poolId)` adalah pembacaan murni StateView — hook-nya tidak dijalankan,
     jadi tidak ada risiko kode asing. PoolKey-nya pun tidak perlu diketahui.
 
-    Orientasi currency dan desimal quote TIDAK bisa disimpulkan dari poolId (itu
-    hash), jadi keempat tafsir yang mungkin dihitung lalu dipilih yang PALING DEKAT
-    median harga pool yang sudah diketahui — teknik yang sama dengan
-    `_v4_key_from_krystal` yang mencoba varian native maupun wrapped. Tafsir yang
-    tetap meleset >10x dibuang: lebih baik kehilangan satu pembanding daripada
-    memakai angka yang salah tafsir."""
-    if not known:
-        return []
-    med = sorted(known)[len(known) // 2]
-    if med <= 0:
+    **Pasangan currency-nya WAJIB dicocokkan, dan orientasinya TIDAK ditebak.**
+    Versi pertama memakai setiap pool token itu apa adanya lalu memilih satu dari
+    empat tafsir (quote di currency0/1 × desimal ERC20/18) yang paling dekat median
+    pool yang sudah diketahui. Dua-duanya salah:
+
+    - Daftar GeckoTerminal memuat pool pasangan LAIN (BEORN/SHROOM, BEORN/WETH).
+      Harganya bukan harga dalam quote ini sama sekali, dan yang menahannya cuma
+      saringan 10× — bukan pemahaman apa pun.
+    - Memilih tafsir "paling dekat median" itu MELINGKAR: pembandingnya jadi
+      menegaskan median yang mau diperiksa. Terukur pada BEORN/USDG Robinhood —
+      dua pool yang diketahui berharga 0,000368 dan 0,00000387 (rata-rata
+      geometrik 0,0000378), dan tafsir yang terpilih untuk pool ber-hook keluar
+      **0,0000383**, yaitu 1,4% dari rata-rata itu. Terlihat seperti konfirmasi
+      dari sumber ketiga, padahal cuma pantulan angka yang sama.
+
+    Sekarang: hanya pool yang KEDUA sisinya cocok (native vs wrapped
+    dinormalkan), dan orientasinya diturunkan dari aturan PoolKey — currency0
+    selalu alamat yang lebih kecil. Desimalnya dibaca dari kontraknya. Jadi tidak
+    ada tafsir yang perlu dipilih; `anchor`/median tinggal jadi jaring pengaman
+    terhadap pool ber-tick mentok."""
+    ref = float(anchor or 0)
+    if ref <= 0:
+        ref = geo_median(known)
+    if ref <= 0:
         return []
     cfg = CHAINS[chain_id]
-    net = cfg.get("gecko")
-    if not net:
-        return []
-    try:
-        r = _cf_get(_GECKO_POOLS.format(net=net, token=str(token).lower()),
-                    timeout=12, headers={"accept": "application/json"})
-        rows = (r.json() or {}).get("data") or []
-    except Exception:
+    rows = _gecko_token_pools(chain_id, token)
+    if not rows:
         return []
     w3 = get_w3(chain_id)
     sv = _v4c(w3, chain_id, "v4_stateview", V4_STATEVIEW_ABI)
-    try:
-        qdec = _v4_currency_info(w3, chain_id, quote_addr)["decimals"]
-    except Exception:
-        qdec = 18
+    tok_n, q_n = _norm_currency(token), _norm_currency(quote_addr)
     tdec = token_info(w3, Web3.to_checksum_address(token))["decimals"]
+    # Quote NATIVE dan WRAPPED itu pasangan yang berbeda di PoolKey tapi nilainya
+    # sama, dan GeckoTerminal melaporkan pool ETH native sebagai `address(0)`
+    # sementara `CHAINS[...]["quotes"]` menyimpan alamat WETH. Tanpa menerima
+    # keduanya, filter pasangan membuang SEMUA pool ETH — terukur di BEORN
+    # Robinhood: 3 pool BEORN/WETH hilang seluruhnya. Jebakan yang sama sudah
+    # pernah menggigit di `_v4_key_from_krystal`.
+    try:
+        q_tgt_dec = _v4_currency_info(w3, chain_id, q_n)["decimals"]
+    except Exception:
+        q_tgt_dec = 18
+    ok_q = {q_n.lower()}
+    wrapped = _norm_currency(cfg["wrapped"]).lower()
+    if q_n.lower() in (wrapped, V4_NATIVE.lower()):
+        ok_q |= {wrapped, V4_NATIVE.lower()}
     skip = {str(x).lower() for x in (skip_ids or set())}
+    _qd = {}
     out = []
     for row in rows:
         try:
-            a = str((row.get("attributes") or {}).get("address") or "")
+            at = row.get("attributes") or {}
+            a = str(at.get("address") or "")
             if len(a) != 66 or a.lower() in skip:
                 continue                      # bukan poolId v4, atau sudah dipakai
-            pid = bytes.fromhex(a[2:])
-            sq = sv.functions.getSlot0(pid).call()[0]
+            rel = row.get("relationships") or {}
+            sides = set()
+            for nm in ("base_token", "quote_token"):
+                sd = str((((rel.get(nm) or {}).get("data") or {}).get("id") or "")
+                         ).split("_")[-1]
+                if sd:
+                    sides.add(_norm_currency(sd).lower())
+            if len(sides) != 2 or tok_n.lower() not in sides:
+                continue
+            qr = next(iter(sides - {tok_n.lower()}))
+            if qr not in ok_q:
+                continue                      # pasangan lain — harganya tak sebanding
+            # Orientasi & desimal diturunkan dari sisi quote BARIS INI, bukan dari
+            # target: baris native dan target wrapped adalah PoolKey yang berbeda,
+            # dan urutan currency-nya pun beda (native selalu currency0).
+            if qr not in _qd:
+                try:
+                    _qd[qr] = _v4_currency_info(w3, chain_id,
+                                                _norm_currency(qr))["decimals"]
+                except Exception:
+                    _qd[qr] = 18
+            qdec = _qd[qr]
+            # Aturan PoolKey: currency0 adalah alamat yang lebih KECIL, jadi
+            # orientasinya pasti — tidak ada yang perlu ditebak.
+            q_is_c0 = int(qr, 16) < int(tok_n, 16)
+            sq = sv.functions.getSlot0(bytes.fromhex(a[2:])).call()[0]
             if sq <= 0:
                 continue
-            raw = (sq / Q96) ** 2
-            # 4 tafsir: quote di currency0/1 × desimal quote ERC20 / native 18
-            cand = []
-            for qd in {qdec, 18}:
-                cand.append(raw * 10 ** (tdec - qd))          # quote = currency1
-                cand.append(10 ** (tdec - qd) / raw)          # quote = currency0
-            px = min((x for x in cand if x > 0),
-                     key=lambda x: abs(math.log(x / med)), default=0.0)
-            if px <= 0 or abs(math.log(px / med)) > math.log(10):
+            raw = (sq / Q96) ** 2             # token1-wei per token0-wei
+            px = (10 ** (tdec - qdec) / raw) if q_is_c0 else (raw * 10 ** (tdec - qdec))
+            # Jaring pengaman: pool ber-tick mentok (harga ~1e-20) tetap terbaca
+            # dan satu saja cukup menyeret median.
+            if px <= 0 or abs(math.log(px / ref)) > math.log(_ANCHOR_DROP_RATIO):
                 continue
-            at = row.get("attributes") or {}
-            out.append({"sq": sq, "price": px, "hooked": True,
-                        "vol": float((at.get("volume_usd") or {}).get("h24") or 0),
-                        "tvl": float(at.get("reserve_in_usd") or 0),
-                        "pool": {"ver": 4, "pool": a, "fee": None,
-                                 "vol24_usd": float((at.get("volume_usd") or {}).get("h24") or 0),
-                                 "tvl_usd": float(at.get("reserve_in_usd") or 0),
-                                 "name": at.get("name")}})
+            vol = float((at.get("volume_usd") or {}).get("h24") or 0)
+            tvl = float(at.get("reserve_in_usd") or 0)
+            # sqrtPriceX96 itu rasio token1-wei per token0-wei, jadi ia berlaku apa
+            # adanya untuk PoolKey LAIN asalkan urutan currency dan desimal kedua
+            # sisinya sama — fee, tick spacing, dan hooks tidak ikut menentukannya.
+            # `sq_ok` menandai baris yang memenuhi itu, sehingga pool ber-hook boleh
+            # jadi sumber HARGA AWAL, bukan cuma penggeser median. Tanpa ini pasangan
+            # yang seluruh pool-nya ber-hook tidak bisa dibuat sama sekali.
+            sq_ok = (q_is_c0 == (int(q_n, 16) < int(tok_n, 16))) and qdec == q_tgt_dec
+            out.append({"sq": sq, "price": px, "hooked": True, "sq_ok": sq_ok,
+                        "vol": vol, "tvl": tvl,
+                        "pool": {"ver": 4, "pool": a, "fee": None, "vol24_usd": vol,
+                                 "tvl_usd": tvl, "name": at.get("name")}})
         except Exception:
             continue
     return out
@@ -6522,6 +6693,15 @@ def v4_check_new_pool(w3: Web3, chain_id: int, key: tuple, sqrt_price: int) -> s
         # 0x14002113 LPFeeTooLarge, 0xe65af6a0 HookAddressNotValid), bukan teks
         # panjang web3 — jadi ambil potongan terakhir yang memuatnya.
         msg = str(e).strip().replace("\n", " ")
+        # Selector yang sudah diukur ke PoolManager — teks mentahnya tidak berarti
+        # apa pun bagi user ("('0x7983c051', '0x7983c051')").
+        for sel, txt in (("0x7983c051", "Pool ini sudah ada (PoolAlreadyInitialized)."),
+                         ("0xe9e90588", "Tick spacing terlalu kecil."),
+                         ("0xb70024f8", "Tick spacing terlalu besar."),
+                         ("0x14002113", "Fee terlalu besar (maks 100%)."),
+                         ("0xe65af6a0", "Fee dinamis wajib punya hook — tidak didukung bot ini.")):
+            if sel in msg:
+                return txt
         return f"PoolManager menolak PoolKey ini: {msg[-160:]}"
 
 

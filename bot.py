@@ -2252,18 +2252,11 @@ def ctx_slot0(ctx_data: dict) -> tuple[int, int]:
 
 
 def np_median(px: list[float]) -> float:
-    """Median harga. Untuk jumlah GENAP dipakai rata-rata GEOMETRIK dua nilai
-    tengah, bukan elemen ke-n//2 — indeks polos selalu mengambil yang lebih tinggi
-    dan biasnya nyata: pada 6 pool DOT ia memilih 0,000144989 padahal dua tengahnya
-    0,000125074 dan 0,000144989 (median sebenarnya 0,000134). Harga itu besaran
-    rasio, jadi rata-rata geometrik yang benar, bukan aritmetik."""
-    v = sorted(x for x in px if x > 0)
-    if not v:
-        return 0.0
-    n = len(v)
-    if n % 2:
-        return v[n // 2]
-    return math.sqrt(v[n // 2 - 1] * v[n // 2])
+    """Median harga — satu implementasi saja, di `ch.geo_median`. Jumlah GENAP
+    memakai rata-rata GEOMETRIK dua nilai tengah, bukan elemen ke-n//2 (indeks
+    polos selalu mengambil yang lebih tinggi; pada 6 pool DOT ia memilih
+    0,000144989 padahal dua tengahnya 0,000125074 dan 0,000144989)."""
+    return ch.geo_median(px)
 
 
 def np_price(p: dict, tdec: int, sq: int) -> float:
@@ -2277,9 +2270,54 @@ def np_price(p: dict, tdec: int, sq: int) -> float:
     return _meme_price(p, tdec, int(round(math.log(raw) / math.log(1.0001))))
 
 
-def np_build(ctx: dict) -> tuple[dict, int, dict | None, str | None, float, list]:
-    """(pool_info, sqrtPrice rujukan, pool rujukan, alasan ditolak, deviasi, kandidat).
-    Dipanggil di thread."""
+# Di luar rasio ini terhadap anchor, kandidat dibuang SEBELUM median dihitung.
+NP_ANCHOR_DROP = 3.0
+# Kalau median pool sepasang sendiri sejauh ini dari anchor, tidak ada pool
+# sepasang yang layak jadi rujukan — pembuatan DITOLAK.
+NP_ANCHOR_BLOCK = 3.0
+
+
+def gmgn_price_usd(cid: int, token: str, _cache={}) -> float:
+    """Harga USD token dari GMGN, 0 kalau tidak tersedia. Dipanggil di thread.
+
+    Dipakai sebagai salah satu sumber `ch.token_anchor_price`. Sengaja berdiri di
+    `bot.py`, bukan di `chain.py`: kunci GMGN tidak boleh pernah lewat
+    `ch._cf_request` — jalur itu meneruskan header ke operator proxy pihak ketiga.
+    Klien scanner dipakai ulang supaya throttle per-IP-nya tetap satu penghitung."""
+    if not ch.CHAINS[cid].get("gmgn"):
+        return 0.0
+    key = (cid, str(token).lower())
+    hit = _cache.get(key)
+    if hit and time.time() - hit[1] < 120:
+        return hit[0]
+    px = 0.0
+    try:
+        cl = _scan_client(float((scanner_cfg().get("pace") or 1.0)))
+        if cl is not None:
+            d = cl.token_info(ch.CHAINS[cid]["gmgn"], str(token).lower()) or {}
+            px = float(((d.get("price") or {}).get("price")) or 0)
+    except Exception:
+        px = 0.0
+    _cache[key] = (px, time.time())
+    return px
+
+
+def np_anchor(ctx: dict, p: dict) -> dict:
+    """Patokan harga INDEPENDEN untuk kartu pembuatan pool. Dipanggil di thread.
+
+    Menggabungkan GMGN, pool terdalam GeckoTerminal (pasangan apa pun, termasuk
+    ber-hooks), dan `token_usd_price` bot sendiri — persis dua sumber yang disebut
+    user saat harga rujukan meleset: "tinggal ambil dari pool terdalam dengan hook
+    atau gmgn bisa"."""
+    cid = ctx["chain"]
+    tok = ctx["token"]["address"]
+    extra = [("GMGN", gmgn_price_usd(cid, tok))]
+    return ch.token_anchor_price(cid, tok, p.get("quote_sym"), extra=extra)
+
+
+def np_build(ctx: dict) -> tuple[dict, int, dict | None, str | None, float, list, dict]:
+    """(pool_info, sqrtPrice rujukan, pool rujukan, alasan ditolak, deviasi,
+    kandidat, anchor). Dipanggil di thread."""
     cid = ctx["chain"]
     w3 = ch.get_w3(cid)
     fee, sp = int(ctx["fee"]), np_spacing(ctx)
@@ -2289,27 +2327,56 @@ def np_build(ctx: dict) -> tuple[dict, int, dict | None, str | None, float, list
     for c in cands:
         c["price"] = np_price(p, td, c["sq"])
         c["hooked"] = False
+
+    # Patokan INDEPENDEN dulu, sebelum menyentuh median pool sepasang. Median pool
+    # sepasang saja pernah dihitung dari tiga pool debu (volume $8,04 / $0,76 /
+    # $0,06) yang harganya berselisih 100× — lihat `ch.token_anchor_price`.
+    try:
+        anchor = np_anchor(ctx, p)
+    except Exception:
+        anchor = {"usd": 0.0, "per_quote": 0.0, "srcs": [], "deep": "", "deep_vol": 0.0}
+    ap = float(anchor.get("per_quote") or 0)
+
     live = [c for c in cands if c["price"] > 0 and c["vol"] > 0]
 
     # Pool BER-HOOKS ikut jadi pembanding harga (bukan tempat menaruh dana). Di
     # token launchpad justru di situlah seluruh volumenya: terukur DOT/USDC Arc,
     # pool ber-hook $441.817/24 jam sementara semua pool tanpa hook digabung ~$800.
-    if live:
+    if live or ap > 0:
         try:
             hooked = ch.v4_hook_price_refs(
                 cid, ctx["token"]["address"], p["quote_addr"],
                 [c["price"] for c in live],
-                skip_ids={str(c["pool"].get("pool")) for c in cands})
+                skip_ids={str(c["pool"].get("pool")) for c in cands},
+                anchor=ap)
         except Exception:
             hooked = []
         live += [h for h in hooked if h["vol"] > 0]
         cands = cands + hooked
 
-    # Buang pool yang harganya mustahil sebelum menghitung median. Pool ber-tick
-    # mentok (harga ~1e-20) tetap punya volume kecil, dan satu saja cukup menyeret
-    # median — kelas kegagalan yang sama dengan patokan rusak di
-    # `assert_pool_price_sane`. Dua lintasan: median kasar dulu, lalu buang yang
-    # lebih dari 10x dari situ.
+    # Buang kandidat yang jauh dari patokan independen SEBELUM median dihitung.
+    # Tanpa ini, pool yang harganya mustahil ikut menentukan mediannya sendiri dan
+    # saringan dua-lintasan di bawah tidak menolong sama sekali kalau yang tersisa
+    # memang semuanya debu.
+    if ap > 0:
+        keep = [c for c in live if abs(math.log(c["price"] / ap)) <= math.log(NP_ANCHOR_DROP)]
+        live = keep
+    # Kalau tidak ada satu pun pool BERVOLUME yang masuk akal, pool tanpa volume
+    # masih lebih baik daripada tidak ada rujukan — asalkan ia dekat patokan.
+    no_ref = False
+    if not live and ap > 0:
+        live = [c for c in cands
+                if c["price"] > 0
+                and abs(math.log(c["price"] / ap)) <= math.log(NP_ANCHOR_DROP)]
+        # Masih kosong = harga pasarnya DIKETAHUI tapi tidak ada satu pun pool
+        # sepasang yang mendekatinya. Jangan jatuh balik ke pilihan `v4_ref_sqrt_price`
+        # (pool bervolume terbesar): di BEORN/USDG itu justru pool ber-tick mentok
+        # berharga 2,9e-27 dengan volume terlapor $1.473.
+        no_ref = not live
+
+    # Pool ber-tick mentok (harga ~1e-20) tetap punya volume kecil, dan satu saja
+    # cukup menyeret median. Dua lintasan: median kasar dulu, lalu buang yang lebih
+    # dari 10x dari situ.
     if len(live) > 2:
         m0 = np_median([c["price"] for c in live])
         if m0 > 0:
@@ -2323,34 +2390,75 @@ def np_build(ctx: dict) -> tuple[dict, int, dict | None, str | None, float, list
     for c in live:
         c["used"] = True
     dev = 0.0
+    med = 0.0
+    pick_px = 0.0
     if live:
         med = np_median([c["price"] for c in live])
         # Rujukan sqrtPrice HARUS dari pool tanpa hook: hanya di situ urutan currency
         # dan desimalnya pasti (PoolKey-nya kita yang susun). Harga pool ber-hook
         # cuma dipakai menggeser MEDIAN-nya, dan itu justru intinya.
-        vanilla = [c for c in live if not c.get("hooked")]
+        # Pool ber-hook boleh jadi sumber harga awal HANYA kalau `sq_ok`: urutan
+        # currency dan desimal kedua sisinya sama dengan PoolKey target, sehingga
+        # sqrtPriceX96-nya berlaku apa adanya. Untuk pool tanpa hook itu selalu
+        # benar — PoolKey-nya kita sendiri yang susun.
+        vanilla = [c for c in live if not c.get("hooked") or c.get("sq_ok")]
         if vanilla and med:
-            pick = min(vanilla, key=lambda c: abs(math.log(c["price"] / med)))
+            # Di antara pool yang harganya SUDAH rapat dengan harga pasar,
+            # yang paling ramai diperdagangkan adalah sumber terbaik: harganya yang
+            # paling sering diarbitrase, jadi paling kecil kemungkinan basi.
+            # "Terdekat median" saja bisa memilih pool mati — terukur pada LONG/USDC
+            # Arc, ia memilih pool fee 3,36% bervolume $0,11 padahal pool fee 1%
+            # bervolume $109.5k harganya sama-sama rapat.
+            near = ([c for c in vanilla
+                     if abs(math.log(c["price"] / ap)) <= math.log(1.10)] if ap > 0 else [])
+            pick = (max(near, key=lambda c: c["vol"]) if near
+                    else min(vanilla, key=lambda c: abs(math.log(c["price"] / med))))
             sq, ref = pick["sq"], pick["pool"]
-            bad = ch.v4_check_new_pool(w3, cid, p["key"], sq)
-            dev = pick["price"] / med - 1
-        else:
-            bad = ch.v4_check_new_pool(w3, cid, p["key"], sq)
-    else:
-        bad = ch.v4_check_new_pool(w3, cid, p["key"], sq)
+            pick_px = pick["price"]
+            dev = pick_px / med - 1
+    bad = ch.v4_check_new_pool(w3, cid, p["key"], sq)
 
     # Di atas ambang ini pembuatan DITOLAK, bukan sekadar diperingatkan — harga
     # awal yang meleset sejauh itu dijamin diambil arbitraser dari deposit pertama.
-    if not bad and abs(dev) > NP_DEV_BLOCK:
+    # Deviasi terhadap patokan independen — dipakai untuk MEMBATALKAN blokir di
+    # atas. Kalau pool sepasang saling tidak sepakat (lazim saat semuanya debu)
+    # tapi yang dipilih justru rapat dengan harga pasar, mediannya yang tidak
+    # bermakna, bukan pilihannya. Terukur di BEORN/WETH Robinhood: dua pool
+    # sepasang berselisih 3,6x (volume $0,40 dan $0,63) sementara pilihannya cuma
+    # 24,9% dari harga pasar tiga sumber.
+    dev_ap = (pick_px / ap - 1) if (ap > 0 and pick_px > 0) else None
+    if not bad and abs(dev) > NP_DEV_BLOCK and (dev_ap is None or abs(dev_ap) > NP_DEV_BLOCK):
+        lain = "" if dev_ap is None else f" dan {dev_ap * 100:+.0f}% dari harga pasar"
         bad = (f"Harga rujukan meleset {dev * 100:+.0f}% dari median pool yang "
-               f"benar-benar diperdagangkan (termasuk pool ber-hooks). Pool baru "
+               f"benar-benar diperdagangkan (termasuk pool ber-hooks){lain}. Pool baru "
                f"yang lahir di harga itu langsung diarbitrase dari deposit Anda — "
                f"pilih quote lain atau tunggu harganya rapat.")
-    return p, sq, ref, bad, dev, cands
+    # Anchor-nya sendiri BISA TELAT beberapa persen (GeckoTerminal terukur jauh
+    # tertinggal di Arc), jadi ambangnya sengaja kasar: yang dikejar keadaan di mana
+    # SELURUH pool sepasang memang tidak layak jadi rujukan, bukan selisih puluhan
+    # persen. Blok ini yang seharusnya berbunyi untuk BEORN/USDG, bukan "+859%"
+    # terhadap median debu.
+    if not bad and ap > 0 and med > 0 and abs(math.log(med / ap)) > math.log(NP_ANCHOR_BLOCK):
+        bad = (f"Harga pool sepasang ({ch.fmt_price(med)}) meleset "
+               f"{med / ap:.1f}x dari harga pasar {ch.fmt_price(ap)} "
+               f"{p['quote_sym']}/{ctx['token']['symbol']} "
+               f"({', '.join(n for n, _ in anchor.get('srcs') or [])}). "
+               f"Tidak ada pool {ctx['token']['symbol']}/{p['quote_sym']} yang layak "
+               f"jadi rujukan — pilih quote lain (mis. pasangan pool terdalamnya).")
+    if not bad and no_ref:
+        bad = (f"Harga pasar {ctx['token']['symbol']} diketahui ({ch.fmt_price(ap)} "
+               f"{p['quote_sym']} — {', '.join(n for n, _ in anchor.get('srcs') or [])}) "
+               f"tapi tidak ada pool {ctx['token']['symbol']}/{p['quote_sym']} yang "
+               f"harganya mendekati itu. Menyalin harga dari pool yang ada = pool baru "
+               f"lahir salah harga. Pilih quote lain.")
+    if not bad and sq <= 0 and ap <= 0:
+        bad = "Harga awal tidak diketahui — tidak ada pool rujukan untuk pasangan ini."
+    return p, sq, ref, bad, dev, cands, anchor
 
 
 def np_text(ctx: dict, p: dict, sq: int, ref: dict | None, bad: str | None,
-            dev: float = 0.0, cands: list | None = None) -> str:
+            dev: float = 0.0, cands: list | None = None,
+            anchor: dict | None = None) -> str:
     cid = ctx["chain"]
     tsym = ctx["token"]["symbol"]
     fee, sp = int(ctx["fee"]), np_spacing(ctx)
@@ -2367,8 +2475,12 @@ def np_text(ctx: dict, p: dict, sq: int, ref: dict | None, bad: str | None,
         # meleset 1e24 — dan itu justru angka yang paling harus dipercaya user.
         harga = np_price(p, int(ctx["token"].get("decimals") or 18), sq)
         vol = ref.get("vol24_usd")
+        # Rujukan bisa berupa pool ber-hook (fee-nya tidak diketahui dari poolId —
+        # itu hash). Menulis `fee/1e4` apa adanya akan meledak di None.
+        rfee = ref.get("fee")
+        lbl = f"fee {rfee / 1e4:g}%" if rfee else f"🪝 ber-hook {esc(ref.get('name') or '')}"
         L.append(f"\nHarga awal: <b>{ch.fmt_price(harga)} {esc(p['quote_sym'])}</b>/{esc(tsym)}\n"
-                 f"<i>disalin dari pool v{ref.get('ver')} fee {ref.get('fee', 0) / 1e4:g}% "
+                 f"<i>disalin dari pool v{ref.get('ver')} {lbl} "
                  f"(TVL {ch.fmt_usd(ref.get('tvl_usd'))}, vol 24j "
                  f"{ch.fmt_usd(vol) if vol else '—'}) — bukan tebakan.</i>")
         # Pool yang TIDAK pernah ditransaksikan tidak tahu harga apa pun. Kejadian
@@ -2389,6 +2501,31 @@ def np_text(ctx: dict, p: dict, sq: int, ref: dict | None, bad: str | None,
             L.append(f"<i>Pool sepasang yang ada volumenya: {esc(lain)}</i>")
         if abs(dev) > 0.10 and live:
             L.append(f"⚠️ Harga rujukan <b>{dev * 100:+.0f}%</b> dari median pool di atas.")
+    # Patokan independen selalu disebut, juga saat semuanya rapat: user perlu bisa
+    # membandingkan harga awal pool dengan harga yang ia lihat di GMGN sendiri.
+    ap = float((anchor or {}).get("per_quote") or 0)
+    if ap > 0:
+        # Sumbernya dalam DOLAR, sedangkan `per_quote` sudah dibagi harga quote.
+        # Menuliskannya tanpa satuan membuat "GMGN 0,000196" terbaca sebagai
+        # WETH/BEORN padahal itu USD — meleset 2.600x di quote ETH.
+        src = ", ".join(f"{esc(n)} ${ch.fmt_price(v)}" for n, v in (anchor.get("srcs") or []))
+        deep = anchor.get("deep")
+        L.append(f"\n<b>Harga pasar (di luar pool sepasang):</b> {ch.fmt_price(ap)} "
+                 f"{esc(p['quote_sym'])}/{esc(tsym)}\n<i>{src}"
+                 + (f" · pool terdalam {esc(deep)} (vol {ch.fmt_usd(anchor.get('deep_vol'))})"
+                    if deep else "") + "</i>")
+        if sq > 0 and ref is not None:
+            h = np_price(p, int(ctx["token"].get("decimals") or 18), sq)
+            if h > 0:
+                L.append(f"<i>Harga awal di atas {h / ap - 1:+.1%} dari itu.</i>")
+                # Diperingatkan, tidak diblokir: patokan ini BISA telat beberapa
+                # puluh persen (terukur di Arc GeckoTerminal melaporkan CRCL $67,77
+                # saat pool terdalam on-chain $202,56). Yang memblokir tetap dua
+                # ambang yang dihitung dari pembacaan on-chain serentak.
+                if abs(math.log(h / ap)) > math.log(1.25):
+                    L.append(f"⚠️ Selisihnya di atas 25%. Kalau harga pasar di atas yang "
+                             f"benar, arbitraser mengambil {abs(h / ap - 1) * 100:.0f}% "
+                             f"dari deposit pertama Anda. Bandingkan dulu di GMGN.")
     if ada:
         L.append("\n✅ Pool ini <b>sudah ada</b> — tidak ada tx pembuatan, "
                  "tombol di bawah langsung ke kartu mint.")
@@ -2452,7 +2589,7 @@ def np_refresh_sqrt(ctx_data: dict) -> tuple[int, str]:
     ctx = {"chain": cid, "token": ctx_data["token"], "pools": res.get("pools") or [],
            "quote_addr": p0["quote_addr"], "fee": p0["fee"],
            "spacing": p0["tick_spacing"]}
-    p, sq, ref, bad, dev, _ = np_build(ctx)
+    p, sq, ref, bad, dev, _c, _a = np_build(ctx)
     if bad:
         return 0, bad
     if sq <= 0:
@@ -2481,7 +2618,7 @@ async def do_newpool(update: Update, key: str):
         return
     cid = ctx["chain"]
     try:
-        p, sq, ref, bad, dev, cands = await asyncio.to_thread(np_build, ctx)
+        p, sq, ref, bad, dev, cands, anchor = await asyncio.to_thread(np_build, ctx)
     except Exception as e:
         await reply(update, f"❌ {esc(e)}")
         return
@@ -2512,10 +2649,10 @@ async def show_newpool(msg, key: str):
         await edit(msg, "⚠️ Tombol kadaluarsa (bot sempat restart). Paste alamat lagi.")
         return
     try:
-        p, sq, ref, bad, dev, cands = await asyncio.to_thread(np_build, ctx)
+        p, sq, ref, bad, dev, cands, anchor = await asyncio.to_thread(np_build, ctx)
         ada = await asyncio.to_thread(ch.v4_pool_exists, ch.get_w3(ctx["chain"]),
                                       ctx["chain"], p["pool_id"])
-        text = await asyncio.to_thread(np_text, ctx, p, sq, ref, bad, dev, cands)
+        text = await asyncio.to_thread(np_text, ctx, p, sq, ref, bad, dev, cands, anchor)
     except Exception as e:
         await edit(msg, f"❌ {esc(e)}")
         return
