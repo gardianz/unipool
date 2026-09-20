@@ -412,15 +412,53 @@ const CMDS = {
    * kalau lebih lebar dari MAX_BIN_LENGTH_ALLOWED_IN_ONE_TX (26 bin). */
   async add_new(req, conn, kp) {
     const { inst, active } = await poolState(conn, req.pool);
-    const posKp = Keypair.generate();
     const lower = Number(req.lower_bin), upper = Number(req.upper_bin);
+    const width = upper - lower + 1;
+    const strategy = { maxBinId: upper, minBinId: lower,
+                       strategyType: strategyOf(req.strategy) };
+    const slippage = req.slippage_pct === undefined ? undefined : Number(req.slippage_pct);
+
+    /* Lebih dari DEFAULT_BIN_PER_POSITION (70) bin TIDAK bisa lewat
+     * `initializePositionAndAddLiquidityByStrategy`. Akun posisi lahir seukuran
+     * 70 bin dan harus di-realloc untuk sisanya, sedangkan Solana membatasi
+     * realloc **10240 byte per inner instruction** — simulasinya gagal
+     * `Failed to reallocate account data` ("Account data size realloc limited
+     * to 10240 in inner instructions"). Terukur pada range 125 bin.
+     *
+     * `initializeMultiplePositionAndAddLiquidityByStrategy2` yang menanganinya:
+     * ia memecah jadi beberapa posisi/tx sendiri dan mengembalikan instruksi
+     * per posisi. Dipakai HANYA di atas 70 bin supaya jalur yang sudah terbukti
+     * untuk range biasa tidak ikut berubah. */
+    if (width > dlmmPkg.DEFAULT_BIN_PER_POSITION) {
+      const resp = await inst.initializeMultiplePositionAndAddLiquidityByStrategy2(
+        async (count) => Array.from({ length: count }, () => Keypair.generate()),
+        bn(req.amount_x_raw), bn(req.amount_y_raw), strategy,
+        kp.publicKey, kp.publicKey, slippage === undefined ? 5 : slippage);
+      const sigs = [];
+      const positions = [];
+      for (const grp of resp.instructionsByPositions || []) {
+        positions.push(grp.positionKeypair.publicKey.toBase58());
+        for (const ixs of grp.transactionInstructions || []) {
+          if (!ixs || !ixs.length) continue;
+          const tx = new web3.Transaction();
+          tx.feePayer = kp.publicKey;
+          for (const ix of ixs) tx.add(ix);
+          sigs.push(await sendOne(conn, tx, [kp, grp.positionKeypair],
+                                  req.priority_micro_lamports));
+        }
+      }
+      return { signatures: sigs, position: positions[0] || null,
+               positions, active_bin: active.binId,
+               lower_bin: lower, upper_bin: upper, extended: true };
+    }
+
+    const posKp = Keypair.generate();
     const txs = await inst.initializePositionAndAddLiquidityByStrategy({
       positionPubKey: posKp.publicKey,
       user: kp.publicKey,
       totalXAmount: bn(req.amount_x_raw),
       totalYAmount: bn(req.amount_y_raw),
-      strategy: { maxBinId: upper, minBinId: lower, strategyType: strategyOf(req.strategy) },
-      slippage: req.slippage_pct === undefined ? undefined : Number(req.slippage_pct),
+      strategy, slippage,
     });
     const list = Array.isArray(txs) ? txs : [txs];
     const sigs = [];
@@ -429,7 +467,8 @@ const CMDS = {
                               req.priority_micro_lamports));
     }
     return { signatures: sigs, position: posKp.publicKey.toBase58(),
-             active_bin: active.binId, lower_bin: lower, upper_bin: upper };
+             positions: [posKp.publicKey.toBase58()], active_bin: active.binId,
+             lower_bin: lower, upper_bin: upper, extended: false };
   },
 
   async add_existing(req, conn, kp) {

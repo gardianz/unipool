@@ -431,6 +431,17 @@ Percobaan pertama memakai `actualAmountXDeposited` sebagai "yang disetor" dan
 kartunya menulis **0** untuk operasi yang sebenarnya menyetor ulang 71.724 FLEX
 + 1,0956 SOL. `_rb_amounts()` menamainya `in_*` / `from_*` / `to_*`.
 
+**Range >70 bin TIDAK bisa lewat `initializePositionAndAddLiquidityByStrategy`.**
+Akun posisi lahir seukuran `DEFAULT_BIN_PER_POSITION` (70) dan harus di-realloc
+untuk sisanya, sedangkan Solana membatasi realloc **10.240 byte per inner
+instruction**. Gejalanya `Failed to reallocate account data` dengan log
+*"Account data size realloc limited to 10240 in inner instructions"* — terukur
+pada range 125 bin. `add_new` karena itu memakai
+`initializeMultiplePositionAndAddLiquidityByStrategy2` di atas 70 bin (ia
+memecah jadi beberapa posisi/tx sendiri dan mengembalikan instruksi per
+posisi), dan jalur lama tetap dipakai untuk range biasa supaya yang sudah
+terbukti tidak ikut berubah.
+
 `rebalancePosition` mengembalikan **instruksi**, bukan `Transaction` (beda dengan
 jalur add/remove). `buildTxs()` memecahnya jadi dua tx: init bin array harus
 sudah masuk chain sebelum instruksi rebalance jalan, dan menggabungnya bisa
