@@ -777,12 +777,16 @@ def position_one(address: str, position: str, pool: str | None = None) -> dict |
     hanya ketiadaan yang mengembalikan None — kalau disamakan, RPC sibuk terbaca
     sebagai "posisi hilang" dan user mengira dananya lenyap."""
     if pool:
-        d = sidecar("positions", owner=address, pool=pool)
-        pinfo = pool_info(pool)
-        for raw in d.get("positions") or []:
-            if raw["address"] == position:
-                return _position_detail(raw, pinfo, d.get("active_bin"))
-        return None
+        # `positions_by_key` membaca AKUN YANG DITUNJUK saja. Jangan diganti
+        # `positions` (yang menyapu `getProgramAccounts` seluruh program DLMM):
+        # terukur **43,7 detik lalu 429** untuk SATU posisi, dan fungsi ini duduk
+        # persis di jalur klik `pos|`/`reb|`/`fee|`/`cmp|`. Ini satu-satunya
+        # tempat yang terlewat saat jalur lain dipindah ke pembacaan per-alamat.
+        d = sidecar("positions_by_key", pool=pool, positions=[position])
+        raw = next(iter(d.get("positions") or []), None)
+        if raw is None:
+            return None
+        return _position_detail(raw, pool_info(pool), d.get("active_bin"))
     # Tanpa `pool`, pool-nya dicari dari akun posisinya sendiri (satu
     # `getAccountInfo`) — BUKAN dengan menyapu semua posisi wallet.
     try:
@@ -974,6 +978,15 @@ def swap(secret: str, pool: str, amount_in: float, swap_for_y: bool,
                    amount_in_raw=_amt_raw(amount_in, dec),
                    slippage_bps=int(round(float(slippage_pct) * 100)),
                    priority_micro_lamports=int(priority))
+
+
+def keygen() -> dict:
+    """{'address','secret'} keypair Solana baru.
+
+    Lewat sidecar karena ed25519 tidak ada di Python di sini: `address_of()`
+    cuma bisa MEMBACA 32 byte terakhir dari secret 64 byte, tidak menurunkan
+    alamat dari seed."""
+    return sidecar("keygen", timeout=30)
 
 
 def explorer_tx(sig: str) -> str:

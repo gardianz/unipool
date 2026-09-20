@@ -9,6 +9,7 @@ Env (.env): TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, PRIVATE_KEY, [RPC_4663, RPC_56
 import asyncio
 from contextlib import asynccontextmanager
 import functools
+import hashlib
 import html
 import logging
 import json
@@ -94,6 +95,8 @@ def all_pks() -> tuple[str, ...]:
     keys = list(env_pks())
     seen = {k.lower() for k in keys}
     for w in store.wallets():
+        if w.get("kind") != "evm":
+            continue                 # key Solana tidak boleh masuk daftar EVM
         k = w["pk"] if w["pk"].startswith("0x") else "0x" + w["pk"]
         if k.lower() not in seen:
             keys.append(k)
@@ -141,9 +144,15 @@ def sol_pks() -> tuple[str, ...]:
     milik siapa pun, dan dana yang dikirim ke sana hilang."""
     try:
         import sol as _so
-        return tuple(_so.secret_keys())
+        keys = list(_so.secret_keys())
     except Exception:
-        return ()
+        keys = []
+    seen = {k.lower() for k in keys}
+    for w in store.wallets():
+        if w.get("kind") == "sol" and w["pk"].lower() not in seen:
+            keys.append(w["pk"])
+            seen.add(w["pk"].lower())
+    return tuple(keys)
 
 
 def pks_for(cid) -> tuple[str, ...]:
@@ -179,6 +188,38 @@ def wallet_label(idx: int | None = None, cid=None) -> str:
     return f"{wallet_prefix(cid)}{idx + 1}"
 
 
+def detect_key_kind(raw: str) -> str | None:
+    """"evm" / "sol" / None — dari BENTUK key, tanpa bertanya ke user.
+
+    Urutannya penting. Array JSON dan base58 64-byte itu Solana; hex 64 karakter
+    (dengan atau tanpa `0x`) itu EVM. Base58 32-byte DITOLAK: itu seed Solana
+    tanpa public key, dan alamatnya butuh ed25519 yang tidak ada di Python di
+    sini — lebih baik menolak dengan jelas daripada menyimpan key yang nanti
+    gagal dipakai."""
+    t = str(raw or "").strip().strip('"\'')
+    if not t:
+        return None
+    if t.startswith("["):
+        try:
+            b = bytes(json.loads(t))
+        except Exception:
+            return None
+        return "sol" if len(b) == 64 else None
+    h = t[2:] if t.lower().startswith("0x") else t
+    if len(h) == 64:
+        try:
+            int(h, 16)
+            return "evm"
+        except ValueError:
+            pass
+    try:
+        import sol as _so
+        n = len(_so.b58decode(t))
+    except Exception:
+        return None
+    return "sol" if n == 64 else None
+
+
 def _is_sol_key(key: str) -> bool:
     """Secret Solana vs private key EVM, dari BENTUKNYA — bukan dari chain aktif.
 
@@ -205,6 +246,59 @@ def _addr_of(key: str) -> str:
         return _so.address_of(key)
     from web3 import Web3
     return Web3().eth.account.from_key(key).address
+
+
+# ── Callback Telegram: BATAS KERAS 64 BYTE ───────────────────────────────────
+# Telegram menolak SELURUH pesan dengan `Button_data_invalid` kalau ada satu
+# tombol yang `callback_data`-nya lewat 64 byte — bukan tombolnya saja yang
+# hilang, seluruh kartu gagal terkirim. Terjadi sungguhan begitu Solana masuk:
+# pid DLMM itu `dlmm:` + pubkey base58 44 karakter = 49 byte, sehingga
+#   posc|1399811149|dlmm:<44>          = 65 byte  ✗ (lewat 1 byte)
+#   rebok|dlmm:<44>|lower:BidAsk:125   = 72 byte  ✗
+# dan `/list` maupun `/start` sama sekali tidak bisa dirender.
+#
+# Karena itu pid PANJANG tidak pernah masuk callback apa adanya: yang dikirim
+# HANDLE 13 byte, dan router menukarnya balik sebelum handler mana pun melihat
+# datanya — jadi tidak ada handler yang perlu tahu soal ini.
+_CB_PID: dict[str, str] = {}
+_CB_MAX = 64
+
+
+def cb(pid) -> str:
+    """pid → token callback. pid pendek (EVM) dikirim apa adanya supaya
+    callback lama tetap terbaca."""
+    s = str(pid)
+    if len(s) <= 20:
+        return s
+    h = "~" + hashlib.blake2s(s.encode(), digest_size=6).hexdigest()
+    _CB_PID[h] = s
+    return h
+
+
+def _cb_rebuild() -> None:
+    """Isi ulang tabel handle dari posisi yang ada.
+
+    Perlu karena tabelnya di memori: sesudah restart, tombol di pesan LAMA
+    masih membawa handle yang sudah tidak dikenal. Pembacaannya lewat
+    `list_positions_all` yang sudah ber-cache, jadi lazimnya nol RPC."""
+    for cid in ch.CHAINS:
+        try:
+            if not pks_for(cid):
+                continue
+            for p in list_positions_all(cid):
+                cb(p.get("pid"))
+        except Exception:
+            continue
+
+
+def cb_restore(data: str) -> str:
+    """Tukar balik tiap handle di callback jadi pid penuh."""
+    if "~" not in data:
+        return data
+    parts = data.split("|")
+    if any(p.startswith("~") and p not in _CB_PID for p in parts):
+        _cb_rebuild()
+    return "|".join(_CB_PID.get(p, p) if p.startswith("~") else p for p in parts)
 
 
 def disp_pid(pid) -> str:
@@ -1599,17 +1693,40 @@ def wallets_kb(cid=None) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+def fam_keys(fam: str) -> tuple[str, ...]:
+    return sol_pks() if fam == "sol" else all_pks()
+
+
 def wallet_pick_kb(action: str) -> InlineKeyboardMarkup:
-    """Daftar wallet untuk dipilih (ekspor/hapus). Wallet .env tidak bisa dihapus."""
+    """Daftar wallet untuk dipilih (ekspor/hapus), KEDUA keluarga.
+
+    Keluarganya ikut di callback (`wal2|<action>|<fam>|<i>`) — indeks saja
+    ambigu begitu dua daftar tampil berdampingan, dan salah keluarga berarti
+    menghapus/ekspor wallet yang bukan dimaksud."""
     rows = []
-    # EVM saja: brankas bot menyimpan key secp256k1.
-    for i, k in enumerate(all_pks()):
-        if action == "del" and is_env_pk(k):
-            continue
-        rows.append([InlineKeyboardButton(f"W{i + 1} · {_addr_of(k)[:8]}…{_addr_of(k)[-4:]}",
-                                          callback_data=f"wal2|{action}|{i}")])
+    for fam, pref in (("evm", "W"), ("sol", "S")):
+        for i, k in enumerate(fam_keys(fam)):
+            if action == "del" and is_env_pk_any(k):
+                continue          # .env tidak bisa dihapus lewat bot
+            a = _addr_of(k)
+            rows.append([InlineKeyboardButton(
+                f"{pref}{i + 1} · {a[:8]}…{a[-4:]}",
+                callback_data=f"wal2|{action}|{fam}|{i}")])
     rows.append([InlineKeyboardButton("‹ Batal", callback_data="wal2|back")])
     return InlineKeyboardMarkup(rows)
+
+
+def is_env_pk_any(key: str) -> bool:
+    """Key ini berasal dari `.env` (keluarga mana pun)? Wallet `.env` milik
+    operator mesin dan tidak boleh dihapus lewat bot."""
+    k = str(key).lower()
+    if any(x.lower() == k for x in env_pks()):
+        return True
+    try:
+        import sol as _so
+        return any(x.lower() == k for x in _so.secret_keys())
+    except Exception:
+        return False
 
 
 async def _autodelete(msg, secs: int = 60):
@@ -1628,27 +1745,54 @@ async def handle_wallets_cb(update: Update, q, data: str):
     if act == "import":
         AWAITING[update.effective_chat.id] = {"kind": "wallet_import", "key": ""}
         await edit(q.message,
-                   "🔑 <b>Impor wallet</b>\n\nBalas pesan ini dengan private key "
-                   "(64 hex, boleh pakai awalan <code>0x</code>).\n\n"
+                   "🔑 <b>Impor wallet</b>\n\nBalas pesan ini dengan private key. "
+                   "Keluarganya <b>dideteksi otomatis</b>:\n"
+                   "· <b>EVM</b> — 64 hex, boleh berawalan <code>0x</code>\n"
+                   "· <b>Solana</b> — base58 64 byte (ekspor Phantom/Solflare) "
+                   "atau array JSON 64 angka (<code>solana-keygen</code>)\n\n"
                    "⚠️ Pesanmu akan otomatis dihapus setelah dibaca, tapi key tetap "
                    "sempat melewati server Telegram. Jangan impor wallet utama.",
                    InlineKeyboardMarkup([[InlineKeyboardButton("‹ Batal", callback_data="wal2|back")]]))
         return
     if act == "new":
-        from web3 import Web3
-        acct = Web3().eth.account.create()
-        key = acct.key.hex()
-        key = key if key.startswith("0x") else "0x" + key
-        store.add_wallet(key, "baru")
+        fam = parts[2] if len(parts) > 2 else None
+        if fam not in ("evm", "sol"):
+            await edit(q.message,
+                       "🆕 <b>Buat wallet baru</b>\n\nKeluarga kuncinya beda dan tidak "
+                       "bisa saling dipakai — EVM secp256k1, Solana ed25519.",
+                       InlineKeyboardMarkup([
+                           [InlineKeyboardButton("⟠ EVM", callback_data="wal2|new|evm"),
+                            InlineKeyboardButton("◎ Solana", callback_data="wal2|new|sol")],
+                           [InlineKeyboardButton("‹ Batal", callback_data="wal2|back")]]))
+            return
+        try:
+            if fam == "sol":
+                import sol as _so
+                d = await asyncio.to_thread(_so.keygen)
+                addr, key = d["address"], d["secret"]
+            else:
+                from web3 import Web3
+                acct = Web3().eth.account.create()
+                key = acct.key.hex()
+                key = key if key.startswith("0x") else "0x" + key
+                addr = acct.address
+        except Exception as e:
+            await edit(q.message, f"❌ Gagal membuat wallet: {esc(e)}", wallets_kb())
+            return
+        store.add_wallet(key, "baru", kind=fam)
         await edit(q.message,
-                   f"✅ <b>Wallet baru dibuat</b>\n<code>{esc(acct.address)}</code>\n\n"
+                   f"✅ <b>Wallet {'Solana' if fam == 'sol' else 'EVM'} baru dibuat</b>\n"
+                   f"<code>{esc(addr)}</code>\n\n"
                    f"<i>Private key TIDAK ditampilkan di sini. Pakai tombol Ekspor kalau "
                    f"benar-benar perlu mencadangkannya.</i>", wallets_kb())
         return
     if act in ("exportmenu", "delmenu"):
         kind = "export" if act == "exportmenu" else "del"
-        pks = all_pks()
-        if kind == "del" and all(is_env_pk(k) for k in pks):
+        semua = (*all_pks(), *sol_pks())
+        if not semua:
+            await edit(q.message, "Belum ada wallet sama sekali.", wallets_kb())
+            return
+        if kind == "del" and all(is_env_pk_any(k) for k in semua):
             await edit(q.message, "Tidak ada wallet yang bisa dihapus — semuanya dari "
                                   "<code>.env</code>.", wallets_kb())
             return
@@ -1656,35 +1800,38 @@ async def handle_wallets_cb(update: Update, q, data: str):
                  else "🗑 Pilih wallet yang mau <b>dihapus</b>:")
         await edit(q.message, title, wallet_pick_kb(kind))
         return
-    if act in ("export", "del") and len(parts) == 3:
-        i = int(parts[2])
-        pks = all_pks()
+    if act in ("export", "del") and len(parts) == 4:
+        fam, i = parts[2], int(parts[3])
+        pks = fam_keys(fam)
         if i >= len(pks):
             await edit(q.message, "⚠️ Wallet sudah berubah. Buka menu lagi.", wallets_kb())
             return
+        lbl = f"{'S' if fam == 'sol' else 'W'}{i + 1}"
         addr = _addr_of(pks[i])
         if act == "export":
             await edit(q.message,
-                       f"🔑 <b>Ekspor W{i + 1}</b>\n<code>{esc(addr)}</code>\n\n"
+                       f"🔑 <b>Ekspor {lbl}</b>\n<code>{esc(addr)}</code>\n\n"
                        f"⚠️ Private key akan dikirim sebagai pesan chat. Siapa pun yang "
                        f"bisa membuka Telegram-mu (atau backup-nya) bisa mengambil seluruh "
                        f"dana wallet ini. Pesannya dihapus otomatis 60 detik.",
                        InlineKeyboardMarkup([[
-                           InlineKeyboardButton("Ya, tampilkan", callback_data=f"wal2|export2|{i}"),
+                           InlineKeyboardButton("Ya, tampilkan",
+                                                callback_data=f"wal2|export2|{fam}|{i}"),
                            InlineKeyboardButton("‹ Batal", callback_data="wal2|back")]]))
         else:
             await edit(q.message,
-                       f"🗑 <b>Hapus W{i + 1}?</b>\n<code>{esc(addr)}</code>\n\n"
+                       f"🗑 <b>Hapus {lbl}?</b>\n<code>{esc(addr)}</code>\n\n"
                        f"⚠️ Key-nya dibuang dari <code>wallets.json</code>. Kalau belum "
                        f"kamu cadangkan, dana di wallet ini TIDAK BISA diakses lagi. "
                        f"Ekspor dulu kalau ragu.",
                        InlineKeyboardMarkup([[
-                           InlineKeyboardButton("Ya, hapus", callback_data=f"wal2|del2|{i}"),
+                           InlineKeyboardButton("Ya, hapus",
+                                                callback_data=f"wal2|del2|{fam}|{i}"),
                            InlineKeyboardButton("‹ Batal", callback_data="wal2|back")]]))
         return
-    if act == "export2" and len(parts) == 3:
-        i = int(parts[2])
-        pks = all_pks()
+    if act == "export2" and len(parts) == 4:
+        fam, i = parts[2], int(parts[3])
+        pks = fam_keys(fam)
         if i >= len(pks):
             await edit(q.message, "⚠️ Wallet sudah berubah.", wallets_kb())
             return
@@ -1694,15 +1841,17 @@ async def handle_wallets_cb(update: Update, q, data: str):
         asyncio.create_task(_autodelete(m, 60))
         await edit(q.message, wallets_text(), wallets_kb())
         return
-    if act == "del2" and len(parts) == 3:
-        i = int(parts[2])
-        pks = all_pks()
-        if i >= len(pks) or is_env_pk(pks[i]):
+    if act == "del2" and len(parts) == 4:
+        fam, i = parts[2], int(parts[3])
+        pks = fam_keys(fam)
+        if i >= len(pks) or is_env_pk_any(pks[i]):
             await edit(q.message, "⚠️ Wallet itu dari .env — tidak bisa dihapus lewat bot.",
                        wallets_kb())
             return
         store.remove_wallet(pks[i])
-        store.set_global("wallet_idx", 0)   # jangan menunjuk wallet yang sudah hilang
+        # Jangan menunjuk wallet yang sudah hilang — indeks keluarga ITU yang
+        # direset, bukan keduanya.
+        store.set_global("sol_wallet_idx" if fam == "sol" else "wallet_idx", 0)
         await edit(q.message, "✅ Wallet dihapus.", wallets_kb())
         return
     await edit(q.message, wallets_text(), wallets_kb())
@@ -3450,7 +3599,7 @@ async def handle_awaiting(update: Update) -> bool:
         pid = st["key"]
         await reply(update, f"➖ Tarik <b>{pct}%</b> dari {disp_pid(pid)}?",
                     InlineKeyboardMarkup([[
-                        InlineKeyboardButton(f"✅ Ya, tarik {pct}%", callback_data=f"redok|{pid}|{pct}"),
+                        InlineKeyboardButton(f"✅ Ya, tarik {pct}%", callback_data=f"redok|{cb(pid)}|{pct}"),
                         InlineKeyboardButton("❌ Batal", callback_data="cancel")]]))
         return True
     if st["kind"] == "wallet_import":
@@ -3462,17 +3611,32 @@ async def handle_awaiting(update: Update) -> bool:
         except Exception:
             pass
         AWAITING.pop(chat_id, None)
-        key = raw if raw.startswith("0x") else "0x" + raw
+        # Keluarga kunci DIDETEKSI dari bentuknya, tidak ditanyakan: menebaknya
+        # salah berarti menyimpan key dengan awalan `0x` yang merusaknya, atau
+        # menurunkan alamat dengan kurva yang salah — dua-duanya gagal senyap.
+        fam = detect_key_kind(raw)
+        if fam is None:
+            await reply(update,
+                        "❌ Private key tidak dikenali. Yang diterima:\n"
+                        "· <b>EVM</b> — 64 hex (boleh <code>0x</code>)\n"
+                        "· <b>Solana</b> — base58 64 byte, atau array JSON 64 angka\n"
+                        "<i>Seed Solana 32 byte ditolak: alamatnya tidak bisa "
+                        "diturunkan tanpa public key-nya.</i>")
+            return True
+        key = raw.strip().strip('"\'')
+        if fam == "evm" and not key.lower().startswith("0x"):
+            key = "0x" + key
         try:
             addr = _addr_of(key)
-        except Exception:
-            await reply(update, "❌ Private key tidak valid. Harus 64 karakter hex.")
+        except Exception as e:
+            await reply(update, f"❌ Private key tidak valid: {esc(e)}")
             return True
-        if not store.add_wallet(key):
+        if not store.add_wallet(key, kind=fam):
             await reply(update, f"⚠️ Wallet <code>{esc(addr)}</code> sudah ada.", wallets_kb())
             return True
         await reply(update,
-                    f"✅ Wallet ditambahkan: <code>{esc(addr)}</code>\n"
+                    f"✅ Wallet <b>{'Solana' if fam == 'sol' else 'EVM'}</b> ditambahkan: "
+                    f"<code>{esc(addr)}</code>\n"
                     f"<i>Pesan berisi key sudah dihapus dari chat. Key tersimpan di "
                     f"wallets.json (permission 600).</i>", wallets_kb())
         return True
@@ -3561,7 +3725,7 @@ async def handle_awaiting(update: Update) -> bool:
         desc = f"{val:g}% saldo" if is_pct else f"{val:g} quote"
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton(f"✅ Tambah {desc} ke {disp_pid(tid)}",
-                                  callback_data=f"addok|{tid}|{val:g}|{'p' if is_pct else 'f'}")],
+                                  callback_data=f"addok|{cb(tid)}|{val:g}|{'p' if is_pct else 'f'}")],
             [InlineKeyboardButton("❌ Cancel", callback_data="cancel")],
         ])
         msg = await reply(update, "⏳ Menghitung detail…")
@@ -3594,9 +3758,9 @@ async def handle_awaiting(update: Update) -> bool:
         sl_s = str(int(round(sl))) if sl is not None else "x"
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ Buat + auto-swap saat trigger",
-                                  callback_data=f"orderok|{pid}|{tp_s}|{sl_s}|1")],
+                                  callback_data=f"orderok|{cb(pid)}|{tp_s}|{sl_s}|1")],
             [InlineKeyboardButton("✅ Buat, tahan token saat trigger",
-                                  callback_data=f"orderok|{pid}|{tp_s}|{sl_s}|0")],
+                                  callback_data=f"orderok|{cb(pid)}|{tp_s}|{sl_s}|0")],
             [InlineKeyboardButton("❌ Cancel", callback_data="cancel")],
         ])
         await reply(update, (
@@ -4279,21 +4443,21 @@ def position_kb(cid: int, p: dict) -> InlineKeyboardMarkup:
     pid = p["pid"]
     ver = p.get("ver", 3)
     meme_ca = p["token0"] if p["quote_is_token1"] else p["token1"]
-    actions = [InlineKeyboardButton("➕ Add", callback_data=f"add|{pid}"),
-               InlineKeyboardButton("➖ Reduce", callback_data=f"red|{pid}")]
+    actions = [InlineKeyboardButton("➕ Add", callback_data=f"add|{cb(pid)}"),
+               InlineKeyboardButton("➖ Reduce", callback_data=f"red|{cb(pid)}")]
     if ver != 2:  # fee v2 auto-compound — tidak ada klaim terpisah
-        actions.append(InlineKeyboardButton("💰 Fee", callback_data=f"fee|{pid}"))
-        actions.append(InlineKeyboardButton("♻️ Compound", callback_data=f"cmp|{pid}"))
-    actions.append(InlineKeyboardButton("🗑 Close", callback_data=f"close|{pid}"))
-    rows = [chart_buttons(cid, p["pool"], meme_ca) + [InlineKeyboardButton("🔄", callback_data=f"pos|{pid}")],
+        actions.append(InlineKeyboardButton("💰 Fee", callback_data=f"fee|{cb(pid)}"))
+        actions.append(InlineKeyboardButton("♻️ Compound", callback_data=f"cmp|{cb(pid)}"))
+    actions.append(InlineKeyboardButton("🗑 Close", callback_data=f"close|{cb(pid)}"))
+    rows = [chart_buttons(cid, p["pool"], meme_ca) + [InlineKeyboardButton("🔄", callback_data=f"pos|{cb(pid)}")],
             actions]
     if ver != 2:
         rows.append([InlineKeyboardButton("🎯 TP/SL (auto-close di market cap)",
-                                          callback_data=f"tpsl|{pid}")])
+                                          callback_data=f"tpsl|{cb(pid)}")])
         rows.append([InlineKeyboardButton("⚖️ Rebalance (mint ulang di harga sekarang)",
-                                          callback_data=f"reb|{pid}")])
+                                          callback_data=f"reb|{cb(pid)}")])
         rows.append([InlineKeyboardButton("🔀 Pindah pool (fee tier lain)",
-                                          callback_data=f"mig|{pid}")])
+                                          callback_data=f"mig|{cb(pid)}")])
     rows.append([InlineKeyboardButton("⬅️ Posisi", callback_data="menu|list"),
                  InlineKeyboardButton("🏠 Menu", callback_data="menu|main")])
     return InlineKeyboardMarkup(rows)
@@ -4557,9 +4721,9 @@ async def ask_reduce(update: Update, pid: str):
     except Exception:
         head = ""
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"➖ {pct}%", callback_data=f"redok|{pid}|{pct}")
+        [InlineKeyboardButton(f"➖ {pct}%", callback_data=f"redok|{cb(pid)}|{pct}")
          for pct in (10, 25, 50, 75)],
-        [InlineKeyboardButton("✏️ Custom %…", callback_data=f"askred|{pid}")],
+        [InlineKeyboardButton("✏️ Custom %…", callback_data=f"askred|{cb(pid)}")],
         [InlineKeyboardButton("❌ Cancel", callback_data="cancel")],
     ])
     await reply(update, (
@@ -4675,11 +4839,11 @@ async def ask_rebalance(update: Update, pid: str):
         # layar berikutnya (`rebsh|`) — menggabung 3 mode × 3 shape jadi satu
         # layar berarti 9 tombol yang artinya tidak bisa ditebak dari labelnya.
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("⚖️ Wide — dua sisi", callback_data=f"rebsh|{pid}|wide")],
+            [InlineKeyboardButton("⚖️ Wide — dua sisi", callback_data=f"rebsh|{cb(pid)}|wide")],
             [InlineKeyboardButton(f"Lower — {p['quote_sym'] or 'quote'} saja (nampung turun)",
-                                  callback_data=f"rebsh|{pid}|lower"),
+                                  callback_data=f"rebsh|{cb(pid)}|lower"),
              InlineKeyboardButton(f"Upper — {meme_sym} saja (jual naik)",
-                                  callback_data=f"rebsh|{pid}|upper")],
+                                  callback_data=f"rebsh|{cb(pid)}|upper")],
             [InlineKeyboardButton("❌ Cancel", callback_data="cancel")],
         ])
         await reply(update, (
@@ -4696,11 +4860,11 @@ async def ask_rebalance(update: Update, pid: str):
             f"dibayar lagi untuk posisi baru. 2–4 transaksi.</i>"), kb)
         return
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("⚖️ Wide — dua sisi", callback_data=f"rebok|{pid}|wide")],
+        [InlineKeyboardButton("⚖️ Wide — dua sisi", callback_data=f"rebok|{cb(pid)}|wide")],
         [InlineKeyboardButton(f"Lower — {p['quote_sym'] or 'quote'} saja (nampung turun)",
-                              callback_data=f"rebok|{pid}|lower"),
+                              callback_data=f"rebok|{cb(pid)}|lower"),
          InlineKeyboardButton(f"Upper — {meme_sym} saja (jual naik)",
-                              callback_data=f"rebok|{pid}|upper")],
+                              callback_data=f"rebok|{cb(pid)}|upper")],
         [InlineKeyboardButton("❌ Cancel", callback_data="cancel")],
     ])
     await reply(update, (
@@ -4750,12 +4914,12 @@ async def ask_rebalance_shape(update: Update, pid: str, mode: str,
     step_pct = int(p.get("bin_step") or 1) / 100.0
     span = ((1.0 + step_pct / 100.0) ** width - 1.0) * 100.0
     rows = [[InlineKeyboardButton(("✓ " if n == width else "") + lbl.split(" · ")[0],
-                                  callback_data=f"rebw|{pid}|{mode}|{n}")
+                                  callback_data=f"rebw|{cb(pid)}|{mode}|{n}")
              for n, lbl in opts]]
     rows.append([InlineKeyboardButton(SHAPE_LABEL[sh],
-                                      callback_data=f"rebok|{pid}|{mode}:{sh}:{width}")
+                                      callback_data=f"rebok|{cb(pid)}|{mode}:{sh}:{width}")
                  for sh in ("Spot", "Curve", "BidAsk")])
-    rows.append([InlineKeyboardButton("⬅️ Ganti mode", callback_data=f"reb|{pid}"),
+    rows.append([InlineKeyboardButton("⬅️ Ganti mode", callback_data=f"reb|{cb(pid)}"),
                  InlineKeyboardButton("❌ Cancel", callback_data="cancel")])
     text = (
         f"⚖️ <b>Rebalance {_pos_disp(p)} · {esc(STRAT_LABEL.get(mode, mode))}</b>\n"
@@ -4897,8 +5061,8 @@ async def ask_close(update: Update, pid: str):
                   if p.get("pending_claim") else "Full exit LP (decrease + collect).")
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton(f"✅ Close + swap {meme_sym} → {wsym if ver != 4 else 'quote'}",
-                              callback_data=f"closeok|{pid}|1")],
-        [InlineKeyboardButton(f"✅ Close, tahan {meme_sym}", callback_data=f"closeok|{pid}|0")],
+                              callback_data=f"closeok|{cb(pid)}|1")],
+        [InlineKeyboardButton(f"✅ Close, tahan {meme_sym}", callback_data=f"closeok|{cb(pid)}|0")],
         [InlineKeyboardButton("❌ Cancel", callback_data="cancel")],
     ])
     await reply(update, (
@@ -5025,7 +5189,10 @@ async def _route_callback(update: Update):
         await q.answer()
     except Exception as e:
         log.warning("answer callback gagal (%s) — aksi tetap dijalankan", e)
-    data = q.data or ""
+    # Handle pendek ditukar balik jadi pid penuh SEBELUM handler mana pun
+    # melihatnya — dengan begitu tidak ada handler yang perlu tahu soal batas
+    # 64 byte callback Telegram.
+    data = cb_restore(q.data or "")
 
     if data == "del":
         try:
@@ -6214,7 +6381,7 @@ async def after_action(cid: int, pid: str, judul: str = "Sesudah") -> tuple[list
                  + ("🟢 IN range" if p["in_range"] else "🔴 OUT of range"))
     lines.append(f"Range: {esc(range_str(p))}")
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"📋 Buka {disp_pid(pid)}", callback_data=f"pos|{pid}")],
+        [InlineKeyboardButton(f"📋 Buka {disp_pid(pid)}", callback_data=f"pos|{cb(pid)}")],
         *NAV_KB.inline_keyboard,
     ])
     return lines, kb
@@ -6269,9 +6436,9 @@ async def _emit_range_alerts(app, cid: int, positions: list[dict]):
                 f"Range: {esc(range_str(p))}")
         meme_ca = p["token0"] if p["quote_is_token1"] else p["token1"]
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📋 Detail", callback_data=f"pos|{p['pid']}"),
-             InlineKeyboardButton("⚖️ Rebalance", callback_data=f"reb|{p['pid']}"),
-             InlineKeyboardButton("🗑 Close", callback_data=f"close|{p['pid']}"), DEL_BTN],
+            [InlineKeyboardButton("📋 Detail", callback_data=f"pos|{cb(p['pid'])}"),
+             InlineKeyboardButton("⚖️ Rebalance", callback_data=f"reb|{cb(p['pid'])}"),
+             InlineKeyboardButton("🗑 Close", callback_data=f"close|{cb(p['pid'])}"), DEL_BTN],
             chart_buttons(cid, p["pool"], meme_ca),
         ])
         for chat_id in allowed_chat_ids():
@@ -6986,7 +7153,7 @@ async def ask_compound(update: Update, pid: str):
               "2–4 transaksi.")
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton(f"♻️ Compound {ch.fmt_usd(p['unclaimed_usd'])}",
-                              callback_data=f"cmpok|{pid}")],
+                              callback_data=f"cmpok|{cb(pid)}")],
         [InlineKeyboardButton("❌ Cancel", callback_data="cancel")]])
     # pool_stats di dalamnya menembak StateView + dexscreener — jangan di event loop.
     pool_line = await asyncio.to_thread(_pool_info_line, cid, p, ver)
@@ -7033,7 +7200,7 @@ async def do_compound(update: Update, pid: str):
             await edit(status,
                        await asyncio.to_thread(compound_card_dlmm, cid, pid, r),
                        InlineKeyboardMarkup([[InlineKeyboardButton(
-                           "📄 Buka posisi", callback_data=f"pos|{pid}")]]))
+                           "📄 Buka posisi", callback_data=f"pos|{cb(pid)}")]]))
             return
         pre_fee = _reinvested_fee_usd(cid, pid)
         async with TX_LOCK:

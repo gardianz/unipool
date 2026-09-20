@@ -640,6 +640,39 @@ diam. `idx_key(cid)` memilih setelan yang benar; tombol `wselx|<fam>|<i>` di
 layar gabungan menyebut keluarganya eksplisit, sedangkan `wsel|<i>` di menu
 utama selalu mengikuti chain aktif.
 
+#### callback_data Telegram: BATAS KERAS 64 BYTE, dan seluruh pesan yang ditolak
+
+Telegram membalas **`Button_data_invalid`** kalau ada SATU tombol yang
+`callback_data`-nya lewat 64 byte — dan yang gagal bukan tombolnya saja,
+melainkan **seluruh pesan**. Terjadi begitu Solana masuk: pid DLMM itu
+`dlmm:` + pubkey base58 44 karakter = **49 byte**, sehingga
+
+| callback | byte | |
+|---|---|---|
+| `pos\|dlmm:<44>` | 53 | ok |
+| `rebw\|dlmm:<44>\|lower\|125` | 64 | mepet |
+| `posc\|1399811149\|dlmm:<44>` | **65** | ✗ lewat SATU byte |
+| `rebok\|dlmm:<44>\|lower:BidAsk:125` | **72** | ✗ |
+
+Akibatnya `/list` dan `/start` **sama sekali tidak bisa dirender** — user cuma
+melihat "Telegram menolak pesan hasil: Button_data_invalid" berulang, dan
+tombolnya tidak pernah muncul.
+
+Karena itu pid panjang TIDAK PERNAH masuk callback apa adanya. `cb(pid)`
+menukarnya jadi **handle 13 byte** (`~` + blake2s 6 byte), dan `cb_restore()`
+di BARIS PERTAMA router menukarnya balik sebelum handler mana pun melihat
+datanya — jadi tidak ada satu pun handler yang perlu tahu soal batas ini. Pid
+pendek (EVM) dikirim apa adanya supaya callback di pesan lama tetap terbaca.
+
+Tabel handle ada di memori, jadi `cb_restore` memanggil `_cb_rebuild()` saat
+handle tidak dikenal: tombol di pesan LAMA tetap hidup sesudah restart.
+Pembacaannya lewat `list_positions_all` yang sudah ber-cache, jadi lazimnya nol
+RPC.
+
+Pemeriksaan murah sebelum menambah callback baru: render keyboard-nya untuk
+posisi DLMM lalu pastikan `len(callback_data.encode()) <= 64` — terukur 9 tombol
+`/list`, nol yang lewat.
+
 **`menu|home` tidak pernah ada di router** — tombol "‹ Menu" di layar Kelola
 wallet karena itu diam sejak commit `74e9574`. Yang benar `menu|main`.
 Pemeriksaan murah untuk mencegah terulang: kumpulkan semua literal
@@ -659,6 +692,13 @@ Tiap panggilan sidecar itu **proses Node baru** (~0,7–1 detik hanya untuk star
 lintas chain punya anggaran **5 detik TOTAL**. Dua hal yang memperbaikinya:
 
 - `positions_by_key` menerima `groups` — semua pool dalam SATU panggilan.
+- **`position_one()` WAJIB memakai `positions_by_key`, bukan `positions`.**
+  Ini satu-satunya tempat yang terlewat saat jalur lain dipindah ke pembacaan
+  per-alamat, dan ia duduk persis di jalur klik `pos|`/`reb|`/`fee|`/`cmp|`:
+  terukur **43,7 detik lalu 429** untuk SATU posisi, karena `positions` menyapu
+  `getProgramAccounts` seluruh program DLMM dan sidecar mencobanya di tiap
+  endpoint. Sesudah diperbaiki **0,67 detik**, dan `position_by_pid` 47,8 → 0,48
+  detik.
 - `pool_info` per pool diambil **paralel**, dan harga kedua sisi dibaca dari
   payload pool yang sudah ada (`px0`/`px1`) alih-alih `token_usd_price()` per
   token — itu satu request per TOKEN per posisi, 10 request tambahan untuk 5

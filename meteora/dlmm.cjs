@@ -277,6 +277,19 @@ const CMDS = {
     return { sdk: ver, node: process.version, program: dlmmPkg.LBCLMM_PROGRAM_IDS["mainnet-beta"] };
   },
 
+  /* Keypair Solana baru. Dibuat di sini dan bukan di Python karena ed25519
+   * tidak tersedia di sana — `address_of()` hanya bisa MEMBACA 32 byte terakhir
+   * dari secret 64 byte, tidak menurunkannya dari seed. */
+  async keygen() {
+    const kp = Keypair.generate();
+    return {
+      address: kp.publicKey.toBase58(),
+      // base58 64 byte: bentuk yang sama dengan ekspor Phantom/Solflare, jadi
+      // key-nya bisa dipakai balik di wallet biasa.
+      secret: bs58.encode(Buffer.from(kp.secretKey)),
+    };
+  },
+
   async pool(req, conn) {
     const { inst, active, dx, dy } = await poolState(conn, req.pool);
     const out = poolOut(inst, active, dx, dy, req.pool);

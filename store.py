@@ -127,22 +127,35 @@ def _write_secret(path: Path, data):
 
 
 def wallets() -> list[dict]:
-    """[{name, pk}] — wallet tambahan di luar .env."""
+    """[{name, pk, kind}] — wallet tambahan di luar .env.
+
+    `kind` = "evm" (secp256k1, `0x…`) atau "sol" (ed25519, base58/array JSON).
+    Entri lama tidak punya field itu; semuanya EVM karena brankas dulu memang
+    memaksa awalan `0x`, jadi ketiadaannya disimpulkan dari bentuk key-nya —
+    bukan diasumsikan buta."""
     d = _read(WALLETS_FILE, {"wallets": []})
     out = []
     for w in d.get("wallets", []):
         if isinstance(w, dict) and w.get("pk"):
-            out.append({"name": str(w.get("name") or ""), "pk": str(w["pk"])})
+            pk = str(w["pk"])
+            kind = str(w.get("kind") or ("evm" if pk.startswith("0x") else "sol"))
+            out.append({"name": str(w.get("name") or ""), "pk": pk, "kind": kind})
     return out
 
 
-def add_wallet(pk: str, name: str = "") -> bool:
-    """False kalau private key itu sudah ada (tidak digandakan)."""
-    pk = pk if pk.startswith("0x") else "0x" + pk
+def add_wallet(pk: str, name: str = "", kind: str = "evm") -> bool:
+    """False kalau private key itu sudah ada (tidak digandakan).
+
+    Awalan `0x` HANYA dipasang untuk key EVM. Memasangnya pada key Solana
+    (base58 / array JSON) merusak key-nya — dan rusaknya senyap: alamat yang
+    diturunkan jadi milik orang lain."""
+    kind = "sol" if str(kind) == "sol" else "evm"
+    if kind == "evm":
+        pk = pk if pk.startswith("0x") else "0x" + pk
     ws = wallets()
     if any(w["pk"].lower() == pk.lower() for w in ws):
         return False
-    ws.append({"name": name, "pk": pk})
+    ws.append({"name": name, "pk": pk, "kind": kind})
     _write_secret(WALLETS_FILE, {"wallets": ws})
     return True
 
