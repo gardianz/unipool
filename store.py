@@ -57,6 +57,11 @@ DEFAULT_SETTINGS = {
     },
     "list_all_chains": True,  # /list menampilkan posisi SEMUA chain, bukan chain aktif saja
     "wallet_idx": 0,        # wallet aktif (index di daftar PRIVATE_KEY, PRIVATE_KEY_2, ...)
+    # Indeks wallet Solana DIPISAH dari wallet_idx. Daftarnya beda panjang dan
+    # beda keluarga kunci (secp256k1 vs ed25519), jadi satu indeks bersama
+    # membuat memilih wallet Solana ikut memindahkan wallet EVM aktif — dan
+    # sebaliknya — tanpa user memintanya.
+    "sol_wallet_idx": 0,
     # Tombol jumlah TETAP di kartu mint, PER CHAIN: {"4663": {"USDG": [10, 25, 50]}}.
     # Diubah lewat /presets atau menu Pengaturan. Angka = jumlah token, bukan persen.
     #

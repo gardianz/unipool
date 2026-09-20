@@ -624,13 +624,27 @@ Dua yang TIDAK ikut, dan sengaja:
   monitor dan eksekutor order jalan lintas chain. Kalau daftar Solana tidak
   ikut, alert/order posisi DLMM tidak akan pernah menemukan key-nya.
 - **Brankas bot (`wallets.json`) menyimpan key EVM**, jadi tombol Impor/Buat/
-  Ekspor/Hapus TIDAK ditawarkan di chain Solana — tombol yang dijamin salah
-  lebih buruk daripada tombol yang tidak ada. Wallet Solana hanya dari
+  Ekspor/Hapus hanya berlaku untuk wallet EVM — tombol yang dijamin salah lebih
+  buruk daripada tombol yang tidak ada. Wallet Solana hanya dari
   `SOLANA_PRIVATE_KEY(S)`, dan layarnya mengatakan itu.
 
-`active_wallet_idx()` dijepit ke daftar TERPANJANG di antara kedua keluarga
-(bukan ke daftar EVM saja — wallet Solana ke-3 akan terpotong jadi indeks 0
-kalau wallet EVM cuma satu); penjepitan per-chain yang sebenarnya di `pk(cid)`.
+**Layar Kelola wallet menampilkan KEDUA keluarga sekaligus** (⟠ EVM / ◎ Solana)
+— itu yang dicari user ("wallet saya ada di mana") — tapi **dinomori
+TERPISAH**: `W1…Wn` untuk EVM, `S1…Sn` untuk Solana. Penomoran bersama membuat
+"W2" ambigu begitu dua daftar tampil berdampingan.
+
+**Indeks wallet juga DIPISAH** (`wallet_idx` vs `sol_wallet_idx`). Dengan satu
+indeks bersama, memilih wallet Solana ikut memindahkan wallet EVM aktif tanpa
+user memintanya — dan kalau daftarnya beda panjang, indeksnya terpotong diam-
+diam. `idx_key(cid)` memilih setelan yang benar; tombol `wselx|<fam>|<i>` di
+layar gabungan menyebut keluarganya eksplisit, sedangkan `wsel|<i>` di menu
+utama selalu mengikuti chain aktif.
+
+**`menu|home` tidak pernah ada di router** — tombol "‹ Menu" di layar Kelola
+wallet karena itu diam sejak commit `74e9574`. Yang benar `menu|main`.
+Pemeriksaan murah untuk mencegah terulang: kumpulkan semua literal
+`callback_data=` lalu cocokkan ke literal `data ==` / `data.startswith(` di
+router (terukur 105 tombol unik, nol tanpa handler).
 
 `wallet_idx` dipakai bersama semua chain, jadi indeksnya **dijepit** ke panjang
 daftar chain itu — tanpa itu chain ber-1 wallet menampilkan wallet pertamanya
