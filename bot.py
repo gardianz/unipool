@@ -518,14 +518,51 @@ def _fit(text: str) -> str:
     return cut.rstrip() + "\n… <i>(dipotong — terlalu panjang)</i>"
 
 
+def _fit_kb(kb):
+    """Jaring pengaman batas 64 byte `callback_data` di JALUR KIRIM.
+
+    Telegram menolak SELURUH pesan (`Button_data_invalid`) kalau ada satu tombol
+    yang lewat batas — bukan tombolnya saja. Situs pembuat callback ada puluhan
+    dan satu yang terlewat sudah cukup mematikan `/list` dan `/start`; terjadi
+    dua kali, dan yang kedua lolos justru karena callback-nya dibangun ke
+    variabel dulu sehingga pemeriksaan yang melihat `callback_data=f"…"` tidak
+    menemukannya.
+
+    Karena itu penjagaannya dipindah ke SATU tempat yang dilewati semua pesan:
+    yang kepanjangan ditukar jadi handle `cb()` dan dicatat di log, sehingga
+    kelalaian jadi satu baris WARNING — bukan kartu yang tidak pernah muncul."""
+    if kb is None or not getattr(kb, "inline_keyboard", None):
+        return kb
+    ubah = False
+    rows = []
+    for row in kb.inline_keyboard:
+        out = []
+        for b in row:
+            d = getattr(b, "callback_data", None)
+            if d and len(str(d).encode()) > _CB_MAX:
+                pref, _, rest = str(d).partition("|")
+                fixed = f"{pref}|{cb(rest)}" if rest else cb(str(d))
+                if len(fixed.encode()) > _CB_MAX:
+                    fixed = cb(str(d))
+                log.warning("callback_data %d byte (batas %d) dipendekkan: %s",
+                            len(str(d).encode()), _CB_MAX, str(d)[:70])
+                b = InlineKeyboardButton(b.text, callback_data=fixed)
+                ubah = True
+            out.append(b)
+        rows.append(out)
+    return InlineKeyboardMarkup(rows) if ubah else kb
+
+
 async def reply(update: Update, text: str, kb: InlineKeyboardMarkup | None = None):
     return await update.effective_chat.send_message(
-        _fit(text), parse_mode=ParseMode.HTML, reply_markup=kb, disable_web_page_preview=True)
+        _fit(text), parse_mode=ParseMode.HTML, reply_markup=_fit_kb(kb),
+        disable_web_page_preview=True)
 
 
 async def edit(msg, text: str, kb: InlineKeyboardMarkup | None = None):
     """Edit pesan status in-place; fallback kirim baru kalau gagal."""
     text = _fit(text)
+    kb = _fit_kb(kb)
     try:
         await msg.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=kb,
                             disable_web_page_preview=True)
@@ -4199,9 +4236,16 @@ async def cmd_list(update: Update, _, status_msg=None):
             if m["pnl_pct"] is not None:
                 label += f" · {m['pnl_pct']:+.0f}%"
             label += f" · {m['age']}"
-            # posc| memindahkan chain aktif dulu; pos| tetap ada untuk chain aktif
-            cb = f"pos|{p['pid']}" if c == cid else f"posc|{c}|{p['pid']}"
-            buttons.append([InlineKeyboardButton(label, callback_data=cb)])
+            # posc| memindahkan chain aktif dulu; pos| tetap ada untuk chain aktif.
+            # Variabelnya SENGAJA tidak bernama `cb`: nama itu menaungi fungsi
+            # `cb()` di scope ini, dan pid-nya lalu masuk mentah-mentah —
+            # `posc|1399811149|dlmm:<44>` = 65 byte, satu byte di atas batas
+            # Telegram, sehingga SELURUH pesan /list ditolak `Button_data_invalid`.
+            # Dibangun ke variabel dulu, jadi baris ini juga lolos dari
+            # pemeriksaan yang cuma melihat `callback_data=f"…"`.
+            cbd = (f"pos|{cb(p['pid'])}" if c == cid
+                   else f"posc|{c}|{cb(p['pid'])}")
+            buttons.append([InlineKeyboardButton(label, callback_data=cbd)])
     # Posisi tanpa event mint (mis. hasil /recover, atau mint yang sempat dilaporkan
     # gagal) menambah open_value TANPA deposit pembanding — PnL jadi terlalu bagus.
     # Sebut jumlahnya, jangan diam-diam.

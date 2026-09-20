@@ -696,9 +696,28 @@ handle tidak dikenal: tombol di pesan LAMA tetap hidup sesudah restart.
 Pembacaannya lewat `list_positions_all` yang sudah ber-cache, jadi lazimnya nol
 RPC.
 
+**Penjagaan terakhir ada di JALUR KIRIM, bukan di situs pembuatnya.**
+`_fit_kb()` di `reply()`/`edit()` memeriksa tiap tombol, menukar yang
+kepanjangan jadi handle, dan mencatat WARNING. Itu perlu karena situs pembuat
+callback ada puluhan dan satu yang terlewat sudah cukup mematikan `/list` dan
+`/start` — dan itu memang terjadi DUA KALI. Yang kedua lolos dari dua lapis
+pemeriksaan sekaligus:
+
+```python
+cb = f"pos|{p['pid']}" if c == cid else f"posc|{c}|{p['pid']}"   # SALAH
+buttons.append([InlineKeyboardButton(label, callback_data=cb)])
+```
+
+Callback-nya dibangun ke VARIABEL dulu, jadi pencarian `callback_data=f"…"`
+(grep maupun scan AST atas keyword `callback_data`) tidak menemukannya. Lebih
+buruk: variabelnya dinamai **`cb`**, yang menaungi fungsi `cb()` di scope itu —
+jadi seandainya pun dibungkus, hasilnya `TypeError`. Jangan pernah memakai nama
+`cb` untuk variabel lokal.
+
 Pemeriksaan murah sebelum menambah callback baru: render keyboard-nya untuk
-posisi DLMM lalu pastikan `len(callback_data.encode()) <= 64` — terukur 9 tombol
-`/list`, nol yang lewat.
+posisi DLMM **dengan chain aktif yang BERBEDA** (supaya cabang `posc|` ikut
+terpakai) lalu pastikan `len(callback_data.encode()) <= 64`. Terukur sesudah
+diperbaiki: `posc|` 65 → **29 byte**.
 
 **`menu|home` tidak pernah ada di router** — tombol "‹ Menu" di layar Kelola
 wallet karena itu diam sejak commit `74e9574`. Yang benar `menu|main`.
