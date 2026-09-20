@@ -623,10 +623,37 @@ Dua yang TIDAK ikut, dan sengaja:
   mencari kunci dari ALAMAT, dan alamat itu bisa milik chain mana pun karena
   monitor dan eksekutor order jalan lintas chain. Kalau daftar Solana tidak
   ikut, alert/order posisi DLMM tidak akan pernah menemukan key-nya.
-- **Brankas bot (`wallets.json`) menyimpan key EVM**, jadi tombol Impor/Buat/
-  Ekspor/Hapus hanya berlaku untuk wallet EVM — tombol yang dijamin salah lebih
-  buruk daripada tombol yang tidak ada. Wallet Solana hanya dari
-  `SOLANA_PRIVATE_KEY(S)`, dan layarnya mengatakan itu.
+- **Brankas bot (`wallets.json`) menyimpan KEDUA keluarga**, dengan field
+  `kind` (`"evm"` / `"sol"`). Entri lama tidak punya field itu; semuanya EVM
+  karena brankas dulu memaksa awalan `0x`, jadi ketiadaannya disimpulkan dari
+  BENTUK key-nya, bukan diasumsikan buta.
+
+**Impor MENDETEKSI keluarga kuncinya sendiri** (`detect_key_kind`), tidak
+bertanya: menebak salah berarti memasang awalan `0x` pada key Solana (merusaknya)
+atau menurunkan alamat dengan kurva yang salah — dua-duanya gagal SENYAP. Yang
+diterima: 64 hex (dengan/tanpa `0x`) = EVM; base58 64 byte atau array JSON 64
+angka = Solana. **Seed Solana 32 byte DITOLAK** dengan pesan jelas — alamatnya
+tidak bisa diturunkan tanpa public key-nya, dan menyimpannya berarti key yang
+nanti gagal dipakai.
+
+**Key WAJIB dikanonikkan sebelum masuk brankas** (`canon_key`). Satu key Solana
+punya dua ejaan — base58 dan array JSON — dan `add_wallet` mendedupe dengan
+membandingkan TEKS. Tanpa normalisasi, key yang SAMA diimpor dua kali tersimpan
+dua kali lalu muncul sebagai dua wallet beralamat identik (terukur:
+`FY2Y2k518XXX…` tampil dobel di `sol_pks()`). Base58 yang dipilih karena itu
+bentuk ekspor Phantom/Solflare, jadi hasil tombol Ekspor bisa ditempel balik ke
+wallet biasa.
+
+**Keypair Solana baru dibuat di SIDECAR** (`keygen`), bukan Python: ed25519
+tidak ada di sana — `address_of()` cuma bisa MEMBACA 32 byte terakhir dari
+secret 64 byte, tidak menurunkan alamat dari seed. Tombol "Buat baru" karena itu
+bertanya keluarganya dulu (`wal2|new|evm` / `wal2|new|sol`).
+
+**Ekspor/Hapus menyebut KELUARGA di callback** (`wal2|<aksi>|<fam>|<i>`) —
+indeks saja ambigu begitu dua daftar tampil berdampingan, dan salah keluarga
+berarti menghapus wallet yang bukan dimaksud. Wallet `.env` (keluarga mana pun)
+tidak pernah muncul di daftar Hapus dan ditolak `is_env_pk_any()` kalau tetap
+dicoba.
 
 **Layar Kelola wallet menampilkan KEDUA keluarga sekaligus** (⟠ EVM / ◎ Solana)
 — itu yang dicari user ("wallet saya ada di mana") — tapi **dinomori
@@ -3114,7 +3141,8 @@ Mencabut aman: bot minta approval lagi sendiri saat mint/swap berikutnya.
 ### Wallet: .env + brankas
 
 `all_pks()` = wallet `.env` (urutannya TETAP, supaya arti "W1" tidak bergeser) lalu
-wallet dari `store.wallets()`. Sengaja TIDAK di-cache — brankas berubah saat runtime.
+wallet EVM dari `store.wallets()` — entri ber-`kind == "sol"` DILEWATI, kalau tidak
+key ed25519 masuk daftar secp256k1. `sol_pks()` kebalikannya. Sengaja TIDAK di-cache — brankas berubah saat runtime.
 `env_pks()` yang di-cache. Wallet `.env` tidak bisa dihapus lewat bot (`is_env_pk()`).
 
 Private key lewat chat itu permanen di riwayat Telegram, jadi: pesan impor dihapus

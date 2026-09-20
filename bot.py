@@ -188,6 +188,24 @@ def wallet_label(idx: int | None = None, cid=None) -> str:
     return f"{wallet_prefix(cid)}{idx + 1}"
 
 
+def canon_key(raw: str, fam: str) -> str:
+    """Bentuk KANONIK sebuah private key sebelum masuk brankas.
+
+    Satu key Solana punya dua ejaan — base58 dan array JSON 64 angka — dan
+    `add_wallet` mendedupe dengan membandingkan TEKS. Tanpa normalisasi, key
+    yang SAMA diimpor dua kali tersimpan dua kali, lalu muncul sebagai dua
+    wallet beralamat identik (terukur: `FY2Y2k518XXX…` tampil dobel di
+    `sol_pks()`). Base58 dipilih karena itu bentuk yang dipakai ekspor
+    Phantom/Solflare, jadi hasil Ekspor bisa ditempel balik ke wallet biasa."""
+    t = str(raw).strip().strip('"\'')
+    if fam == "sol":
+        if t.startswith("["):
+            import sol as _so
+            return _so.b58encode(bytes(json.loads(t)))
+        return t
+    return t if t.lower().startswith("0x") else "0x" + t
+
+
 def detect_key_kind(raw: str) -> str | None:
     """"evm" / "sol" / None — dari BENTUK key, tanpa bertanya ke user.
 
@@ -3623,9 +3641,9 @@ async def handle_awaiting(update: Update) -> bool:
                         "<i>Seed Solana 32 byte ditolak: alamatnya tidak bisa "
                         "diturunkan tanpa public key-nya.</i>")
             return True
-        key = raw.strip().strip('"\'')
-        if fam == "evm" and not key.lower().startswith("0x"):
-            key = "0x" + key
+        # Dinormalkan DULU: dua ejaan key Solana yang sama harus jadi satu
+        # entri brankas, bukan dua wallet beralamat identik.
+        key = canon_key(raw, fam)
         try:
             addr = _addr_of(key)
         except Exception as e:
