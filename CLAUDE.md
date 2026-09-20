@@ -13,12 +13,15 @@ memakai **bahasa Indonesia**. Ikuti gaya itu untuk perubahan baru.
 pip install -r requirements.txt
 cp .env.example .env      # isi TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, PRIVATE_KEY
 
+npm install --prefix meteora   # sidecar Meteora DLMM (hanya perlu untuk Solana)
+
 python3 bot.py            # bot Telegram (long polling)
 python3 web.py            # UI web → http://127.0.0.1:8899
 ```
 
 Tidak ada test suite, linter, atau build step di repo ini — verifikasi dilakukan manual
-terhadap chain live. Pemeriksaan termurah setelah edit: `python3 -m py_compile chain.py bot.py web.py`.
+terhadap chain live. Pemeriksaan termurah setelah edit:
+`python3 -m py_compile chain.py bot.py web.py sol.py && node --check meteora/dlmm.cjs`.
 
 Kedua proses bisa jalan bersamaan dan berbagi state file (`settings.json`, `history.json`).
 Deploy di VPS pakai systemd (unit lengkap ada di README) — setiap `git pull` perlu
@@ -41,6 +44,12 @@ kedua UI ikut berubah.
 - **`web.py`** — server `http.server` stdlib (tanpa framework) + API JSON. Meng-`import bot`
   untuk `pk()`, `_addr_of()`, `compute_amount()` — jadi `bot.py` harus tetap aman di-import
   tanpa efek samping (jangan taruh kode jalan di luar `main()`).
+- **`sol.py`** — mesin **Solana** (hanya Meteora DLMM). Kedudukannya sama dengan
+  `chain.py` untuk chain EVM. `chain.py` merutekan ke sini lewat
+  `is_solana(chain_id)`; `get_w3()` MENOLAK chain itu.
+- **`meteora/dlmm.cjs`** — sidecar Node (SDK resmi `@meteora-ag/dlmm`), satu
+  request JSON di stdin → satu response di stdout. Dipasang dengan
+  `npm install --prefix meteora`.
 - **`store.py`** — state JSON: settings, event PnL, registry posisi v2/v4, order TP/SL,
   brankas wallet (`wallets.json`, ditulis mode 0600 lewat `_write_secret()`).
 - **`static/`** — `index.html` + `app.js` + `lightweight-charts.js` (di-vendor, offline).
@@ -101,6 +110,7 @@ Verifikasi alamat baru **on-chain** sebelum dipakai (semua alamat di dict itu su
 | Base 8453 | Uniswap | ya | ya | WETH, USDC | ETH |
 | HyperEVM 999 | HyperSwap | tidak | tidak | WHYPE, USDC | HYPE |
 | Arc 5042 | Uniswap | ya | ya | USDC | **USDC** |
+| Solana 1399811149 | **Meteora DLMM** | — | tidak | SOL, USDC, USDT | SOL |
 
 Semua alamat di dua entri baru diverifikasi on-chain sebelum dipakai:
 `npm.factory()`, `npm.WETH9()`, `router.factory()`, `router.WETH9()`,
@@ -219,6 +229,222 @@ fee 10%).
 **Explorer `arc-scan.org`** (pihak ketiga). `arcscan.app` hanya melayani testnet —
 apex-nya tidak punya A record — dan `explorer.arc.io` ada di balik Cloudflare
 Access milik Circle.
+
+### Solana 1399811149: Meteora DLMM, dan kenapa ada proses Node
+
+**Bukan chain EVM.** `get_w3()` MENOLAK id ini dengan pesan eksplisit, dan
+`is_solana(cid)` adalah penjagaan di tiap jalur EVM — bukan cuma penanda
+tampilan. Tanpa itu satu `CHAINS[cid]["factory"]` yang lolos menghasilkan
+KeyError samar yang tidak menunjuk apa pun, pola kegagalan yang sama dengan
+`cfg['gmgn']` di Arc yang dulu mematikan seluruh kartu mint.
+
+Id `1399811149` dipakai registry lintas-chain (Wormhole/chainlist) untuk
+mainnet-beta — dipilih justru karena mustahil bentrok dengan chainId EVM.
+
+Mesinnya **`sol.py`** (bukan `solana.py`: nama itu akan menaungi paket PyPI
+`solana`, dan `meteora.py` bentrok dengan direktori `meteora/`).
+
+**Tiga sumber, pembagiannya disengaja:**
+
+| sumber | untuk apa |
+|---|---|
+| Data API Meteora (`dlmm.datapi.meteora.ag`) | daftar pool, TVL, volume, APR, fee, harga USD, INDEKS posisi |
+| RPC Solana (Alchemy) | keadaan pool & posisi yang sebenarnya |
+| sidecar Node `meteora/dlmm.cjs` | SDK resmi `@meteora-ag/dlmm` — baca posisi + TANDA TANGAN tx |
+
+#### Sidecar Node: alasannya, dan dua jebakan yang sudah menggigit
+
+SDK resmi Meteora **cuma ada di TypeScript/Rust**, dan seluruh bagian yang
+berbahaya ada di dalamnya: encode instruksi Anchor, turunan PDA bin array,
+matematika bin, Token-2022 transfer hook, compute budget. Menulis ulang itu di
+Python berarti menulis sendiri jalur uang yang tidak bisa diuji tanpa biaya —
+dan tidak ada SDK Python sama sekali (`solana`/`solders`/`anchorpy` tidak
+terpasang, dan memasangnya pun tidak memberi satu pun fungsi DLMM).
+
+- **CommonJS, bukan ESM.** Build ESM SDK-nya RUSAK: `import` dari
+  `dist/index.mjs` gagal *"Directory import …/@coral-xyz/anchor/dist/cjs/utils/
+  bytes is not supported"*. Jangan menambahkan `"type": "module"` ke
+  `meteora/package.json`.
+- **`require("@meteora-ag/dlmm/package.json")` ditolak** ("Package subpath
+  './package.json' is not defined by exports") — versinya dibaca dari
+  `node_modules` lewat `fs` kalau perlu, dan itu informasi, bukan syarat.
+
+Protokolnya SATU request JSON di stdin, SATU response di stdout. **`secret`
+HANYA lewat stdin, tidak pernah argv** — argv terlihat di `ps` oleh setiap user
+di mesin itu.
+
+`sidecar_ready()` memeriksa node + node_modules + SDK SEBELUM ada tx, dan
+`/rpc` menampilkannya.
+
+#### `getProgramAccounts` ditolak 429 — indeks Data API yang menyelamatkannya
+
+Ini bukan optimasi, tanpa ini `/list` **tidak jalan sama sekali** di RPC free
+tier. `DLMM.getAllLbPairPositionsByUser` dan bahkan
+`getPositionsByUserAndLbPair` (yang sudah difilter satu pool) memakai
+`getProgramAccounts` — memindai seluruh akun program DLMM. Terukur: Alchemy
+menjawab **429 "exceeded its compute units per second"** di KEEMPAT key yang
+sehat, untuk SATU wallet di SATU pool.
+
+Urutan yang dipakai sekarang:
+
+1. `GET /portfolio/open?user=<wallet>` memberi daftar pool **dan alamat tiap
+   posisi** (`listPositions`) — terindeks, nol RPC, terukur 0,19 detik.
+2. `positions_by_key` membaca tiap alamat lewat `inst.getPosition(pubkey)` —
+   akun yang ditunjuk saja, jadi ongkosnya tetap walau wallet punya ratusan
+   posisi. Terukur 1 posisi dalam 4,6 detik dari dingin.
+3. Sapuan penuh hanya kalau indeks kosong/gagal. Ia benar tapi mahal, jadi
+   **cadangan** — dan karena ia ada, posisi yang belum terindeks (baru dibuat
+   beberapa detik lalu) tetap ketemu. Indeks yang telat tidak pernah
+   MENGHILANGKAN posisi, aturan yang sama dengan indexer Uniswap di jalur EVM.
+
+Konsekuensinya: **Solana tidak butuh registry `history.json`.** Posisi DLMM bisa
+dienumerasi dari owner-nya, jadi `v2_refs`/`v4_refs` diabaikan dan registry yang
+bolong tidak pernah menghilangkan posisi — berbeda dari v4 EVM.
+
+#### Rotasi RPC: dua jenis kegagalan, dua perlakuan
+
+`healthy_rpc_urls()` memprobe tiap endpoint sekali per 600 detik dan
+mengelompokkannya. **Yang `not enabled` DIBUANG, yang 429 TIDAK.** Bedanya
+menentukan: *"SOLANA_MAINNET is not enabled for this app"* permanen sampai
+network-nya dinyalakan per app di dashboard Alchemy (sama seperti
+`base-mainnet` dan `arc-mainnet`), sedangkan 429 throughput pulih dalam
+hitungan detik dan membuangnya bisa menghabiskan kandidat.
+
+Terukur pada key user: **4 dari 6 sehat**, `…Ev8C` kuota bulanan habis,
+`…s8dK` belum di-enable.
+
+**Sidecar menerima SELURUH daftar** (`rpcs`) dan mencoba berurutan — tapi
+**perintah yang MENANDATANGANI tidak pernah diulang ke endpoint lain**:
+mengirim ulang tx yang dibangun ulang bisa menyetor dua kali. Aturan yang sama
+dengan `_recover_sent()` di jalur EVM.
+
+#### Bin, bukan tick — dan jangan pernah menghitungnya sendiri
+
+Harga bin: `P_i = (1 + bin_step/10.000)^i`. `bin_step` dalam basis point, jadi
+satu kotak = **`bin_step/100` persen PERSIS** — bukan `exp(0,0001 × spacing)`
+seperti tick Uniswap. Kebetulan hampir sama untuk bin step kecil (4 → 0,040%),
+tapi melenceng makin besar (400 → 4,00% vs 4,08%). `box_pct()` karena itu punya
+cabang sendiri untuk `ver == 5`.
+
+Lebih penting: **konversi harga↔bin untuk RANGE selalu lewat SDK**
+(`bins`/`quote_add`), tidak pernah `log()` di Python. Pembulatan bin saat
+deposit ditentukan SDK, dan kartu yang memakai pembulatan berbeda akan
+menjanjikan range yang bukan range yang terjadi.
+
+Kelalaian yang sudah kejadian: `range_str()` menjalankan bin id lewat
+matematika tick (`1,0001^tick`) dan melaporkan posisi SOL/USDC bin step 4 yang
+rangenya **104,44–110,98** sebagai **568,43–577,08**.
+
+`tick_lower`/`tick_upper`/`cur_tick` di dict posisi DIISI BIN ID — perannya
+sama (koordinat harga diskret yang membatasi range), jadi seluruh UI range dan
+penanda IN/OUT jalan tanpa cabang.
+
+**Batas 1.400 bin per posisi** (`MAX_BINS_PER_POSITION`; default layout 70).
+Range yang lebih lebar dipangkas **SIMETRIS di sekitar bin aktif** — memotong
+satu ujung diam-diam menggeser pusat range yang user pilih — dan kartu
+MENYEBUTKAN pemangkasannya. Terukur: ±25/50% di pool bin step 4 butuh lebih
+dari 1.400 bin, jadi lebar segitu memang menuntut bin step lebih besar.
+
+#### Shape Spot/Curve/Bid-Ask: knop yang tidak ada di Uniswap
+
+`StrategyType` SDK: Spot=0, Curve=1, BidAsk=2. Ini **bukan** mode range
+(wide/lower/upper) melainkan bentuk SEBARAN likuiditas di dalam range, jadi ia
+baris tombol tersendiri di kartu konfirmasi. Terukur pada SOL/USDC ±25/50%
+dengan 100 USDC: Spot butuh 0,8756 SOL, Curve 0,9112, BidAsk 0,8423 — Curve
+menumpuk dekat bin aktif sehingga butuh sisi lawan lebih banyak.
+
+Karena shape tidak punya padanan di mode EVM, **`rebalance_position` MENOLAK
+posisi DLMM**: rebalance = close + mint ulang, dan menebak shape berarti
+memindahkan dana user ke bentuk likuiditas yang tidak pernah ia pilih.
+
+**Compound juga ditolak**, dengan alasan berbeda: fee DLMM ditarik ke WALLET
+saat diklaim (tidak mengendap di posisi seperti v3, tidak bisa dikreditkan
+terhadap tagihan seperti v4), jadi "compound" = Claim lalu Add — dua tombol
+yang sudah ada.
+
+#### Komposisi dua sisi dihitung SDK, dan sisinya ditentukan letak range
+
+Bin **di bawah** bin aktif hanya menampung token Y (quote), bin **di atas**
+hanya token X. Jadi:
+
+- range seluruhnya di bawah harga → **100% quote**, persis limit buy bertingkat;
+- range seluruhnya di atas → **100% meme**, persis limit sell bertingkat;
+- straddle → dua sisi.
+
+`quote_add` memanggil `autoFillXByStrategy`/`autoFillYByStrategy` — fungsi yang
+SAMA yang menentukan jumlah tertarik saat deposit, jadi kartu dan eksekusi tidak
+bisa berbeda. Sisi yang tidak tertampung **DINOLKAN dan dilaporkan**
+(`unusable_*`): autoFill menolkan sisi yang dihitungnya, tapi jumlah yang
+dikirim pemanggil untuk sisi yang salah tetap lewat — dan kartu lalu menjanjikan
+"100 USDC masuk" untuk range yang tidak bisa menerima USDC sama sekali.
+
+**Mode `upper` budgetnya satuan MEME**, sama seperti jalur EVM (`budget_sym()`).
+Mengirimnya sebagai quote membuat sisi meme dihitung dari angka yang salah
+satuan — terukur menghasilkan setoran **0,0000057 SOL** untuk budget "100".
+
+**Balapan bin aktif.** `range_bins` dan `quote_add` membaca bin aktif lewat
+panggilan RPC yang BERBEDA, dan bin aktif bergerak tiap swap. Kalau bergeser di
+antara keduanya, range mode satu-sisi menyentuh bin aktif lagi dan kartu
+"Lower (100% quote)" diam-diam menarik sisi meme. `plan_mint` memeriksa
+`side` hasilnya dan menjepit ulang sekali kalau tidak sesuai — terukur terjadi
+pada SOL/USDC bin step 4 (0,04% per bin): satu blok saja cukup.
+
+**Tidak ada swap otomatis di jalur Solana.** Kalau sisi meme kurang, kartu
+MENGATAKANNYA dan menyarankan mode Lower — bukan menukar diam-diam. Sama untuk
+close: sisa token tidak dijual.
+
+#### Wallet & sewa akun
+
+**`SOLANA_PRIVATE_KEY` WAJIB terpisah dari `PRIVATE_KEY`.** Key EVM secp256k1,
+Solana ed25519 — dipakai silang bukan cuma gagal, ia menghasilkan alamat yang
+bukan milik siapa pun. `pks_for(cid)` memilih daftar yang berlaku, dan
+`wallet_idx` dijepit ke panjang daftar chain itu (jumlah wallet EVM dan Solana
+tidak harus sama).
+
+`_addr_of()` membedakannya dari BENTUK key, bukan dari chain aktif — ia dipakai
+untuk daftar wallet lintas chain. Alamat diturunkan **tanpa kriptografi**:
+secret Solana 64 byte = 32 seed + 32 public key, jadi alamatnya 32 byte
+terakhir. Seed 32 byte saja ditolak dengan pesan jelas.
+
+**Sewa akun posisi ~0,05724 SOL TERKUNCI selama posisi hidup** dan kembali saat
+Close. Wajib disebut UI — kalau tidak user mengira SOL-nya hilang. `gas_reserve`
+Solana 0,08 menutup fee tx DAN sewa itu; tanpa potongan sebesar ini "100% saldo"
+gagal justru di langkah terakhir.
+
+**Reduce 100% WAJIB `shouldClaimAndClose`** — tanpa itu sewanya terkunci
+selamanya di akun kosong.
+
+#### ADDR_RE sekarang dua bentuk, dan base58 WAJIB diverifikasi
+
+Regexnya menangkap `0x…40hex` ATAU base58 32–44 karakter. Cabang base58 juga
+cocok dengan kata biasa sepanjang itu, jadi kecocokannya WAJIB diverifikasi
+`sol.is_sol_address()` — dekode base58 harus menghasilkan tepat 32 byte. Tanpa
+cek itu, kalimat biasa memicu discovery.
+
+`token_chains()` punya cabang sendiri untuk alamat Solana: Krystal maupun
+GeckoTerminal tidak akan pernah menemukannya lewat query alamat EVM, dan tanpa
+cabang ini user menempel mint Solana lalu bot memindai chain EVM aktif —
+gejalanya terlihat seperti salah deteksi.
+
+#### pid `dlmm:<pubkey>` = ver 5, dan tiap dispatcher WAJIB punya cabangnya
+
+`reduce_any`/`close_any` jatuh ke cabang v2 untuk apa pun yang bukan 3/4, jadi
+TANPA cabang eksplisit sebuah posisi DLMM dikirim ke `reduce_v2()` dan berakhir
+di jalur EVM yang salah. `close_any` juga memanggil `get_w3()` di baris PERTAMA
+untuk `assert_position_open` — cabang ver 5 harus di ATAS panggilan itu, kalau
+tidak setiap close DLMM ditolak sebelum sempat sampai ke cabangnya.
+
+`pid` cuma membawa alamat POSISI, sedangkan tiap aksi SDK butuh POOL-nya.
+`pool_of_position()` membacanya lewat `wrapPosition` SDK (di-cache selamanya —
+pool sebuah posisi tidak pernah berubah), **bukan** dengan mengambil offset byte
+sendiri: layout Position, PositionV2, dan extended position berbeda, dan offset
+yang ditebak mengembalikan pubkey yang salah TANPA gejala.
+
+#### Yang belum ada untuk Solana
+
+Rebalance, compound, swap komposisi otomatis, revoke approval (Solana tidak
+punya allowance), order TP/SL, dan `/cleanup`. Semuanya menolak dengan pesan
+yang menyebut alasannya, bukan gagal diam-diam.
 
 ### Dispatch versi pool
 

@@ -351,7 +351,56 @@ CHAINS = {
         },
         "stable_syms": {"USDT", "USDC"},
     },
+    # ── Solana ─────────────────────────────────────────────────────────────
+    # BUKAN chain EVM. Tidak ada factory/npm/router/permit2, dan `get_w3()`
+    # MENOLAK id ini — seluruh mesinnya ada di `sol.py` + sidecar Node
+    # `meteora/dlmm.cjs`. Entrinya tetap tinggal di sini supaya pemilih chain,
+    # `/list` lintas chain, setelan per-chain, dan `store.set_chain()` bekerja
+    # tanpa tabel kedua.
+    #
+    # 1399811149 adalah id numerik yang dipakai registry lintas-chain
+    # (Wormhole/chainlist) untuk Solana mainnet-beta — dipilih justru karena
+    # mustahil bentrok dengan chainId EVM mana pun.
+    1399811149: {
+        "kind": "solana",
+        "name": "Solana",
+        "dex": "Meteora DLMM",
+        "uni_api": False,
+        # Cadangan SOL untuk fee tx DAN sewa akun posisi (~0,0572 SOL per posisi,
+        # kembali saat close). Tanpa cadangan sebesar ini, "100% saldo" membuat
+        # pembuatan posisi gagal justru di langkah terakhir.
+        "gas_reserve": 0.08,
+        "gmgn": "sol",
+        "gecko": "solana",
+        "dexscreener": "solana",
+        "explorer": "https://solscan.io",
+        "native_symbol": "SOL",
+        "wrapped_symbol": "SOL",       # wSOL dibungkus/dibuka SDK di dalam satu tx
+        "wrapped": "So11111111111111111111111111111111111111112",
+        "quotes": {
+            "USDC": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+            "USDT": "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
+            "SOL": "So11111111111111111111111111111111111111112",
+        },
+        "stable_syms": {"USDC", "USDT"},
+    },
 }
+
+SOL_CHAIN = 1399811149
+
+
+def is_solana(chain_id) -> bool:
+    """True untuk chain yang mesinnya `sol.py`, bukan web3.
+
+    Dipakai SEBAGAI PENJAGA di tiap jalur EVM, bukan cuma untuk tampilan: satu
+    `CHAINS[cid]["factory"]` yang lolos ke chain ini akan KeyError dengan pesan
+    yang tidak menunjuk apa pun — pola kegagalan yang sama dengan `cfg['gmgn']`
+    di Arc, yang dulu mematikan seluruh kartu mint dan user cuma melihat
+    `❌ 'gmgn'`."""
+    try:
+        return CHAINS[int(chain_id)].get("kind") == "solana"
+    except (KeyError, TypeError, ValueError):
+        return False
 
 
 # ---------- Kemampuan per chain & per DEX ----------
@@ -397,7 +446,11 @@ def any_has_v4(chain_id: int) -> bool:
 
 
 def versions_label(chain_id: int) -> str:
-    """'v2/v3/v4' atau 'v2/v3' — dipakai di pesan discovery kedua UI."""
+    """'v2/v3/v4' atau 'v2/v3' — dipakai di pesan discovery kedua UI.
+
+    Solana tidak punya versi Uniswap sama sekali; yang ada satu jenis pool."""
+    if is_solana(chain_id):
+        return "DLMM"
     return "v2/v3/v4" if any_has_v4(chain_id) else "v2/v3"
 
 
@@ -1411,6 +1464,14 @@ def rpc_health(chain_id: int) -> list[dict]:
 def get_w3(chain_id: int, fresh: bool = False) -> Web3:
     """Failover multi-RPC: coba tiap endpoint (env override dulu), verifikasi
     chain_id, cache yang jalan 5 menit."""
+    # Fail-closed untuk chain non-EVM. Tanpa ini, satu jalur EVM yang terlewat
+    # penjagaannya akan menghasilkan KeyError samar di dalam `_chain_rpcs`
+    # ("'rpcs'") yang tidak menunjuk apa pun; dengan ini, pemanggil yang salah
+    # langsung terbaca dari pesannya.
+    if is_solana(chain_id):
+        raise RuntimeError(
+            "Solana bukan chain EVM — tidak ada Web3 di sini. Pakai `sol.py` "
+            "(discover/list_positions/add_new/...) lewat dispatcher generik.")
     hit = _W3_CACHE.get(chain_id)
     if hit and not fresh and time.time() - hit[1] < 300:
         return hit[0]
@@ -1886,6 +1947,8 @@ def wait_ok(w3: Web3, txhash: str, what: str, total_wait: int = 180):
 
 
 def tx_link(chain_id: int, h: str) -> str:
+    # Solscan memakai /tx/<sig> juga, jadi bentuknya kebetulan sama — tapi
+    # `explorer` tetap dibaca dari CHAINS, bukan ditulis ulang di sini.
     return f"{CHAINS[chain_id]['explorer']}/tx/{h}"
 
 
@@ -1900,6 +1963,10 @@ def pos_link_any(chain_id: int, pid) -> str:
     """Link posisi lintas versi. v2 tidak punya halaman posisi → link pair dexscreener."""
     ver, ref = parse_pid(pid)
     cfg = CHAINS[chain_id]
+    if ver == 5:
+        # Halaman posisi Meteora dibuka per POOL, bukan per posisi; akun
+        # posisinya sendiri tetap bisa dilihat di Solscan.
+        return f"{cfg['explorer']}/account/{ref}"
     if ver == 4:
         return f"https://app.uniswap.org/positions/v4/{cfg['slug']}/{ref}"
     if ver == 2:
@@ -2663,6 +2730,19 @@ def token_chains(token: str, _cache={}, ttl: int = 180) -> list[tuple[int, float
     hit = _cache.get(key)
     if hit and time.time() - hit[1] < ttl:
         return hit[0]
+    # Alamat Solana (base58 32 byte) tidak akan pernah ditemukan Krystal maupun
+    # GeckoTerminal lewat query alamat EVM, dan tanpa cabang ini user menempel
+    # mint Solana lalu bot memindai chain EVM aktif — gejalanya terlihat seperti
+    # salah deteksi. Total TVL-nya dipakai hanya untuk MENGURUTKAN pilihan chain.
+    so = _sol()
+    if so.is_sol_address(token):
+        try:
+            pools = so.discover(str(token)).get("pools") or []
+        except Exception:
+            pools = []
+        out = [(SOL_CHAIN, sum(float(p.get("tvl_usd") or 0) for p in pools))] if pools else []
+        _cache[key] = (out, time.time())
+        return out
     tot: dict[int, float] = {}
     try:
         r = _krystal_get({"tokenAddress": key, "skipCheckAutomation": "true"})
@@ -3166,6 +3246,11 @@ def discover_any(chain_id: int, token_addr: str) -> dict:
     mana saja yang menyumbang (mis. `krystal+uniswap`) — WAJIB ditampilkan UI.
     Terakhir ditambah pool ber-quote di luar daftar tetap (mis. RTX/NVDAB) — banyak
     memecoin cuma punya pool jenis ini, tak terjangkau scan quote biasa."""
+    # Solana: satu sumber saja (Data API Meteora), dan bentuk hasilnya sudah
+    # sama persis dengan jalur EVM — tidak ada Krystal/indexer/GeckoTerminal
+    # yang mengindeks DLMM dengan fee & bin step eksak.
+    if is_solana(chain_id):
+        return _sol().discover(token_addr)
     # Krystal DAN indexer Uniswap dijalankan BERSAMAAN lalu digabung — bukan
     # "Krystal duluan, indexer cuma cadangan". Daftar Krystal disaring >=$1K TVL dan
     # per-quote, jadi ia bisa MELEWATKAN pool terdalam: terukur untuk RADIO di
@@ -7596,8 +7681,27 @@ def _v4_tvl_onchain(w3: Web3, chain_id: int, p: dict) -> float:
     return q_virt / 10 ** qdec * qusd * 2
 
 
+def mint_dlmm(chain_id: int, secret: str, pool_info: dict, budget: float,
+              strategy: dict, slippage_pct: float) -> dict:
+    """Mint posisi Meteora DLMM. Bentuk argumen & hasilnya menyamai `mint_v4`
+    supaya `do_mint` cuma perlu satu cabang, bukan alur tersendiri.
+
+    `strategy["shape"]` = Spot / Curve / BidAsk — knop yang TIDAK ada padanannya
+    di Uniswap. `mode`/`low_pct`/`up_pct` artinya sama persis dengan jalur EVM."""
+    if not is_solana(chain_id):
+        raise RuntimeError("mint_dlmm hanya untuk chain Solana.")
+    return _sol().mint_new(
+        secret, pool_info["pool"], float(budget),
+        float(strategy.get("low_pct") or 0), float(strategy.get("up_pct") or 0),
+        str(strategy.get("mode") or "wide"), str(strategy.get("shape") or "Spot"),
+        float(slippage_pct))
+
+
 def pool_stats(w3: Web3, chain_id: int, p: dict, _cache={}) -> dict:
     """Angka tingkat-POOL untuk kartu detail posisi: TVL, volume 24 jam, fee, kisi.
+
+    Solana: seluruhnya dari Data API Meteora (satu request, sudah di-cache di
+    `sol.py`), jadi `w3` tidak dipakai sama sekali di jalur itu.
 
     Dihitung on-demand dan HANYA untuk kartu satu posisi — jangan dipanggil dari
     daftar posisi: TVL v4 butuh StateView dan volume butuh dexscreener, jadi biayanya
@@ -7611,6 +7715,13 @@ def pool_stats(w3: Web3, chain_id: int, p: dict, _cache={}) -> dict:
     if hit and time.time() - hit[1] < 60:
         return hit[0]
     ver = p.get("ver", 3)
+    if ver == 5:
+        st = _sol().pool_stats(p)
+        out = {"tvl_usd": st.get("tvl_usd"), "vol24_usd": st.get("vol24_usd"),
+               "fee_pct": (st.get("fee") or 0) / 1e4, "tick_spacing": st.get("tick_spacing"),
+               "dex": p.get("dex"), "tvl_src": "meteora", "apr_pct": st.get("apr_pct")}
+        _cache[ck] = (out, time.time())
+        return out
     q_is_t1 = bool(p.get("quote_is_token1"))
     meme = p["token0"] if q_is_t1 else p["token1"]
     out = {"tvl_usd": None, "vol24_usd": None, "fee_pct": None,
@@ -8143,10 +8254,27 @@ def dex_slug(d: str) -> str:
     return str(d or "").lower().replace(" ", "")
 
 
+def _sol():
+    """Modul `sol.py`, di-import saat dipakai.
+
+    Lazy supaya chain EVM tidak membayar import-nya, dan supaya bot tetap hidup
+    di host yang file/sidecar-nya belum ada — kegagalannya muncul sebagai pesan
+    di jalur Solana saja, bukan crash saat import."""
+    import sol
+    return sol
+
+
 def parse_pid(pid) -> tuple[int, object]:
     """'183469' → (3, 183469) · 'v4:12' → (4, 12) · 'v2:0xabc' → (2, '0xabc')
-    · 'uniswap:99' → (3, 99) di DEX non-utama."""
+    · 'uniswap:99' → (3, 99) di DEX non-utama · 'dlmm:<pubkey>' → (5, '<pubkey>').
+
+    **ver 5 = Meteora DLMM (Solana).** Tiap dispatcher WAJIB punya cabang ver 5
+    sendiri SEBELUM jatuh ke cabang terakhir: `reduce_any`/`close_any` jatuh ke
+    v2 untuk apa pun yang bukan 3/4, jadi tanpa cabang eksplisit sebuah posisi
+    DLMM akan dikirim ke `reduce_v2()` dan berakhir di jalur EVM yang salah."""
     s = str(pid)
+    if s.startswith("dlmm:"):
+        return 5, s[5:]
     if s.startswith("v4:"):
         return 4, int(s[3:])
     if s.startswith("v2:"):
@@ -8161,6 +8289,8 @@ def pid_dex(chain_id: int, pid) -> str | None:
     NPM berbeda bisa bertabrakan. v2 dikembalikan None — pemiliknya dicari on-chain
     dari factory (alamat pair unik, jadi tidak ambigu)."""
     s = str(pid)
+    if s.startswith("dlmm:"):
+        return "Meteora DLMM"
     if s.startswith("v4:"):
         return v4_dex(chain_id)
     if s.startswith("v2:"):
@@ -8177,6 +8307,8 @@ def pid_dex(chain_id: int, pid) -> str | None:
 def make_pid(chain_id: int, ver: int, ref, dex: str | None = None) -> str:
     """Bentuk pid. DEX utama tetap memakai format lama supaya history.json yang
     sudah ada tetap terbaca."""
+    if ver == 5:
+        return f"dlmm:{ref}"
     if ver == 4:
         return f"v4:{ref}"
     if ver == 2:
@@ -8199,6 +8331,9 @@ def position_by_pid(chain_id: int, pk: str, pid) -> dict | None:
     pemanggil bisa membedakan "gagal dibaca" dari "memang tidak ada".
     """
     ver, ref = parse_pid(pid)
+    if ver == 5:
+        so = _sol()
+        return so.position_one(so.address_of(pk), str(ref))
     w3 = get_w3(chain_id)
     addr = w3.eth.account.from_key(pk).address
     if ver == 4:
@@ -8220,6 +8355,19 @@ def position_by_pid(chain_id: int, pk: str, pid) -> dict | None:
     return p
 
 
+def _list_solana(pk: str, errors: list | None) -> list[dict]:
+    so = _sol()
+    try:
+        return so.list_positions(so.address_of(pk))
+    except Exception as e:
+        # Gagal dibaca BUKAN "tidak ada" — sama seperti jalur EVM, kegagalannya
+        # dilaporkan supaya UI bisa menulis "belum tentu tertutup".
+        if errors is not None:
+            errors.append(f"Solana: {e}")
+            return []
+        raise
+
+
 def list_all_positions(chain_id: int, pk: str, v2_refs: list[str] = (),
                        v4_refs: list[str] = (), full: bool = False,
                        errors: list | None = None, light: bool = False) -> list[dict]:
@@ -8229,11 +8377,17 @@ def list_all_positions(chain_id: int, pk: str, v2_refs: list[str] = (),
     gagal dibaca berbeda dari posisi yang memang tidak ada — kalau tidak dibedakan,
     RPC sibuk terlihat seperti dana hilang.
 
+    Solana TIDAK butuh registry: posisi DLMM bisa dienumerasi on-chain dari
+    owner-nya (`getProgramAccounts` lewat SDK), jadi `v2_refs`/`v4_refs`
+    diabaikan dan `history.json` yang bolong tidak pernah menghilangkan posisi.
+
     `light=True` memakai `_v4_light()` untuk sisi v4: cukup untuk alert range dan
     pemicu TP/SL, dan **6 panggilan RPC per posisi jadi 1**. Hasilnya bertanda
     `p["light"]` dan `value_usd`/`unclaimed_usd`-nya **0** — pemanggil WAJIB
     membaca detail penuh sebelum memakai angka itu (mis. mencatat event PnL).
     v3/v2 tidak terpengaruh: pembacaannya memang sudah satu panggilan."""
+    if is_solana(chain_id):
+        return _list_solana(pk, errors)
     w3 = get_w3(chain_id)
     account = w3.eth.account.from_key(pk)
     out = []
@@ -8293,6 +8447,8 @@ def list_all_positions(chain_id: int, pk: str, v2_refs: list[str] = (),
 
 def add_any(chain_id: int, pk: str, pid, budget_quote: float, slippage_pct: float) -> dict:
     ver, ref = parse_pid(pid)
+    if ver == 5:
+        return _sol().add_any(pk, ref, budget_quote, slippage_pct)
     if ver == 3:
         return increase_position(chain_id, pk, ref, budget_quote, slippage_pct,
                                  dex=pid_dex(chain_id, pid))
@@ -8303,6 +8459,8 @@ def add_any(chain_id: int, pk: str, pid, budget_quote: float, slippage_pct: floa
 
 def reduce_any(chain_id: int, pk: str, pid, pct: int, slippage_pct: float) -> dict:
     ver, ref = parse_pid(pid)
+    if ver == 5:
+        return _sol().reduce_any(pk, ref, pct)
     if ver == 3:
         return decrease_position(chain_id, pk, ref, pct, dex=pid_dex(chain_id, pid))
     if ver == 4:
@@ -8400,6 +8558,10 @@ def _compound_v4(w3: Web3, chain_id: int, pk: str, tid: int, slippage_pct: float
 def assert_position_open(w3: Web3, chain_id: int, pid) -> None:
     """Gagalkan LEBIH AWAL kalau posisinya sudah tidak ada.
 
+    Untuk DLMM (`dlmm:`) `w3` TIDAK dipakai — pemanggil wajib sudah melewatkan
+    `get_w3()` untuk chain Solana, kalau tidak fungsi ini tidak akan pernah
+    tercapai.
+
     Dua alur yang berjalan berdekatan (mis. tombol Close tertekan dua kali) bikin
     yang kedua mengirim tx ke posisi yang sudah di-burn: tx-nya masuk blok lalu
     revert `NOT_MINTED`, gas terbakar percuma, dan pesan errornya bikin user
@@ -8423,6 +8585,12 @@ def assert_position_open(w3: Web3, chain_id: int, pid) -> None:
 def compound_any(chain_id: int, pk: str, pid, slippage_pct: float = 5.0) -> dict:
     """Reinvestasi fee unclaimed ke posisi yang SAMA. Tidak memakai saldo wallet lain.
 
+    **Belum ada untuk DLMM.** Bukan karena tidak mungkin, tapi karena fee DLMM
+    ditarik ke WALLET saat diklaim (tidak mengendap di posisi seperti v3, dan
+    tidak bisa dikreditkan terhadap tagihan seperti v4). Jadi "compound"-nya
+    adalah Claim lalu Add — dua aksi yang tombolnya SUDAH ada, dan menyatukannya
+    diam-diam akan menyembunyikan bahwa dananya sempat mampir ke wallet.
+
     Jalannya beda per versi karena perlakuan fee-nya memang beda:
 
     - **v4** — `INCREASE_LIQUIDITY` mengkreditkan `feesAccrued` terhadap tagihan
@@ -8435,6 +8603,11 @@ def compound_any(chain_id: int, pk: str, pid, slippage_pct: float = 5.0) -> dict
     - **v2** — fee sudah auto-compound ke dalam LP, tidak ada yang bisa dikerjakan.
     """
     ver, ref = parse_pid(pid)
+    if ver == 5:
+        raise RuntimeError(
+            "Compound belum ada untuk Meteora DLMM. Fee DLMM ditarik ke WALLET "
+            "saat diklaim, jadi compound-nya = Claim fee lalu Add — dua tombol "
+            "yang sudah ada di kartu ini.")
     if ver == 2:
         raise RuntimeError("Fee LP v2 sudah auto-compound ke dalam posisi — "
                            "tidak ada yang perlu di-compound.")
@@ -8470,6 +8643,8 @@ def compound_any(chain_id: int, pk: str, pid, slippage_pct: float = 5.0) -> dict
 
 def collect_any(chain_id: int, pk: str, pid) -> dict:
     ver, ref = parse_pid(pid)
+    if ver == 5:
+        return _sol().collect_any(pk, ref)
     if ver == 3:
         return collect_fees(chain_id, pk, ref, dex=pid_dex(chain_id, pid))
     if ver == 4:
@@ -8478,10 +8653,15 @@ def collect_any(chain_id: int, pk: str, pid) -> dict:
 
 
 def close_any(chain_id: int, pk: str, pid, slippage_pct: float, autoswap: bool) -> dict:
+    ver, ref = parse_pid(pid)
+    if ver == 5:
+        # Tanpa `get_w3` — Solana tidak punya Web3, dan panggilan itu dulu ada
+        # di baris PERTAMA fungsi ini sehingga ia akan menolak setiap close DLMM
+        # sebelum sempat sampai ke cabangnya.
+        return _sol().close_any(pk, ref, autoswap)
     # Gagalkan lebih awal kalau posisinya sudah tertutup — kalau tidak, tx-nya
     # terkirim, revert NOT_MINTED, dan gasnya terbakar percuma.
     assert_position_open(get_w3(chain_id), chain_id, pid)
-    ver, ref = parse_pid(pid)
     if ver == 3:
         return close_position(chain_id, pk, ref, slippage_pct, autoswap,
                               dex=pid_dex(chain_id, pid))
@@ -8629,6 +8809,14 @@ def rebalance_position(chain_id: int, pk: str, pid, mode: str, slippage_pct: flo
     tier 5% ke 2%). Token meme harus sama; quote BOLEH beda — hasil close ditukar
     lewat `_convert_quote()` (sadar ETH native) sebelum mint, dan jumlah yang dipakai
     dibaca dari delta saldo NYATA, bukan estimasi."""
+    if is_solana(chain_id) or str(pid).startswith("dlmm:"):
+        # Rebalance = close + mint ulang, dan jalur mint DLMM memilih SHAPE
+        # (Spot/Curve/Bid-Ask) yang tidak punya padanan di mode EVM
+        # (wide/lower/upper). Menebak shape-nya berarti memindahkan dana user ke
+        # bentuk likuiditas yang tidak pernah ia pilih.
+        raise RuntimeError(
+            "Rebalance otomatis belum ada untuk Meteora DLMM — Close posisi ini "
+            "lalu buat posisi baru dengan range + shape yang Anda pilih sendiri.")
     ver, ref = parse_pid(pid)
     if ver == 2:
         raise RuntimeError("Posisi v2 full-range — tidak perlu rebalance.")

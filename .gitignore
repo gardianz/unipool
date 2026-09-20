@@ -38,3 +38,7 @@ lp-inbox.jsonl.taking
 # State scanner token trending (dibangun ulang otomatis)
 .scanner_state.json
 .scanner_state.json.tmp
+
+# Sidecar Meteora DLMM — dependensi npm, dipasang ulang dengan
+# `npm install --prefix meteora` (package.json & package-lock.json DI-commit)
+meteora/node_modules/

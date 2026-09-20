@@ -39,7 +39,11 @@ log = logging.getLogger("lp-bot")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("telegram").setLevel(logging.WARNING)
 
-ADDR_RE = re.compile(r"\b(0x[0-9a-fA-F]{40})\b")
+# CA EVM (0x + 40 hex) ATAU mint Solana (base58 32 byte). Base58 tidak punya
+# bentuk yang bisa dikenali regex sendirian — "So1111…" dan sebuah kata biasa
+# sama-sama cocok — jadi kecocokan base58 masih WAJIB diverifikasi
+# `sol.is_sol_address()` (dekode harus menghasilkan tepat 32 byte).
+ADDR_RE = re.compile(r"\b(0x[0-9a-fA-F]{40}|[1-9A-HJ-NP-Za-km-z]{32,44})\b")
 CUSTOM_RANGE_RE = re.compile(r"^r(?:ange)?\s+(\d+(?:\.\d+)?)(?:\s+(\d+(?:\.\d+)?))?$", re.I)
 CUSTOM_AMT_RE = re.compile(r"^a(?:mount)?\s+(\d*\.?\d+)\s*(%?)$", re.I)
 TX_LOCK = asyncio.Lock()   # serialisasi tx (nonce)
@@ -116,16 +120,67 @@ def active_wallet_idx() -> int:
         return 0
 
 
-def pk() -> str:
-    return all_pks()[active_wallet_idx()]
+def sol_pks() -> tuple[str, ...]:
+    """Secret key Solana dari `SOLANA_PRIVATE_KEY`/`SOLANA_PRIVATE_KEYS`.
+
+    SENGAJA terpisah dari `all_pks()`: key EVM itu secp256k1 dan Solana ed25519,
+    jadi dipakai silang bukan cuma gagal — ia menghasilkan alamat yang bukan
+    milik siapa pun, dan dana yang dikirim ke sana hilang."""
+    try:
+        import sol as _so
+        return tuple(_so.secret_keys())
+    except Exception:
+        return ()
+
+
+def pks_for(cid) -> tuple[str, ...]:
+    """Daftar wallet yang berlaku di chain ini."""
+    return sol_pks() if ch.is_solana(cid) else all_pks()
+
+
+def pk(cid=None) -> str:
+    """Key wallet aktif untuk chain ini. `wallet_idx` dipakai bersama, jadi
+    indeksnya dijepit ke panjang daftar chain yang bersangkutan — jumlah wallet
+    EVM dan Solana tidak harus sama."""
+    cid = store.load_settings()["chain"] if cid is None else cid
+    keys = pks_for(cid)
+    if not keys:
+        if ch.is_solana(cid):
+            raise RuntimeError(
+                "Belum ada wallet Solana. Isi SOLANA_PRIVATE_KEY di .env "
+                "(base58 ekspor Phantom/Solflare, atau array JSON 64 byte).")
+        raise RuntimeError("Belum ada wallet — isi PRIVATE_KEY di .env.")
+    return keys[min(active_wallet_idx(), len(keys) - 1)]
 
 
 def wallet_label(idx: int | None = None) -> str:
     return f"W{(active_wallet_idx() if idx is None else idx) + 1}"
 
 
+def _is_sol_key(key: str) -> bool:
+    """Secret Solana vs private key EVM, dari BENTUKNYA — bukan dari chain aktif.
+
+    `_addr_of` dipanggil untuk daftar wallet lintas chain, jadi ia tidak boleh
+    bergantung pada chain yang sedang aktif. Array JSON = solana-keygen; selain
+    itu secret Solana base58 mendekode jadi 64 byte, sedangkan key EVM 32 byte
+    dan hampir selalu ber-awalan 0x."""
+    t = str(key).strip()
+    if t.startswith("["):
+        return True
+    if t.startswith("0x"):
+        return False
+    try:
+        import sol as _so
+        return len(_so.b58decode(t)) == 64
+    except Exception:
+        return False
+
+
 @functools.lru_cache(maxsize=16)
 def _addr_of(key: str) -> str:
+    if _is_sol_key(key):
+        import sol as _so
+        return _so.address_of(key)
     from web3 import Web3
     return Web3().eth.account.from_key(key).address
 
@@ -406,6 +461,19 @@ async def with_progress(status, head: str, work):
 
 
 def range_str(p: dict) -> str:
+    # DLMM: batas range sudah dihitung dari BIN (`(1+bin_step/1e4)^id`), bukan
+    # dari tick (`1,0001^tick`). Menjalankannya lewat matematika tick meleset
+    # sebesar pangkat bin_step — terukur pada posisi SOL/USDC bin step 4:
+    # range 104,44–110,98 dilaporkan sebagai 568,43–577,08.
+    if p.get("ver") == 5:
+        lo, hi = p.get("price_lower") or 0, p.get("price_upper") or 0
+        now = p.get("price_now")
+        if now is None:
+            bs, d0, d1 = p.get("bin_step") or 0, p.get("dec0") or 0, p.get("dec1") or 0
+            raw = (1.0 + bs / 10_000.0) ** int(p.get("cur_tick") or 0) * 10 ** (d0 - d1)
+            now = raw if p.get("quote_is_token1") else (1 / raw if raw else 0)
+        return (f"{ch.fmt_price(lo)}–{ch.fmt_price(hi)} (now {ch.fmt_price(now)}) "
+                f"· {p.get('n_bins')} bin")
     # tampil market cap kalau ada (lebih gampang dibaca daripada harga 0.0₆xx)
     if p.get("mc_now"):
         return (f"MC {ch.fmt_usd(p['mc_lower'])}–{ch.fmt_usd(p['mc_upper'])} "
@@ -426,9 +494,10 @@ def range_str(p: dict) -> str:
 # ---------- Commands & menu utama ----------
 HELP = (
     "<b>unipool — LP concentrated liquidity</b>\n"
-    "<i>Uniswap v2/v3/v4 di Robinhood &amp; Base · PancakeSwap+Uniswap di BSC · "
-    "HyperSwap di HyperEVM</i>\n\n"
-    "Paste alamat token (0x...) → bot cari pool → pilih → atur strategi → mint.\n"
+    "<i>Uniswap v2/v3/v4 di Robinhood, Base &amp; Arc · PancakeSwap+Uniswap di BSC · "
+    "HyperSwap di HyperEVM · Meteora DLMM di Solana</i>\n\n"
+    "Paste alamat token (<code>0x…</code> EVM atau mint Solana base58) → bot cari "
+    "pool → pilih → atur strategi → mint.\n"
     "/start membuka menu utama (dashboard saldo + tombol navigasi).\n\n"
     "<b>Perintah:</b>\n"
     "/start — menu utama\n"
@@ -491,29 +560,47 @@ def build_main_menu() -> str:
     s = store.load_settings()
     cid = s["chain"]
     cfg = ch.CHAINS[cid]
-    w3 = ch.get_w3(cid)
-    addr = wallet_address()
-    eth_usd = ch.quote_usd_price(w3, cid, cfg["wrapped_symbol"])
-    native = w3.eth.get_balance(addr) / 1e18
-    total = native * eth_usd
-    # Di chain ber-native_erc20 (Arc), saldo native DAN saldo ERC20-nya itu kantong
-    # yang sama — menampilkan keduanya membuat dashboard menulis USDC dua kali dan
-    # Total-nya dua kali lipat dari uang yang benar-benar ada.
-    ne = ch.native_erc20(cid)
-    ne_note = " (native = ERC20)" if ne else ""
-    bal_lines = [f"· {esc(cfg['native_symbol'])}{ne_note}: {ch.fmt_amount(native)} "
-                 f"({ch.fmt_usd(native * eth_usd)})"]
-    for sym, a in cfg["quotes"].items():
-        if ne and str(a).lower() == ne:
-            continue
-        c = ch.erc20(w3, a)
-        bal = c.functions.balanceOf(addr).call() / 10 ** c.functions.decimals().call()
-        usd = bal * (1.0 if sym in cfg["stable_syms"] else eth_usd)
-        total += usd
-        bal_lines.append(f"· {esc(sym)}: {ch.fmt_amount(bal)} ({ch.fmt_usd(usd)})")
+    if ch.is_solana(cid):
+        # Solana tidak punya native+wrapped yang harus dipisah, dan tidak ada
+        # "quote lain yang bisa ditukar" — saldo quote-nya dibaca apa adanya.
+        import sol as so
+        addr = wallet_address()
+        sol_usd = so.token_usd_price(so.SOL_MINT)
+        native = so.sol_balance(addr)
+        total = native * sol_usd
+        eth_usd = sol_usd          # baris "1 <wrapped> = $x" di bawah memakainya
+        bal_lines = [f"· SOL: {ch.fmt_amount(native)} ({ch.fmt_usd(native * sol_usd)})"]
+        for sym, mint in cfg["quotes"].items():
+            if mint == so.SOL_MINT:
+                continue          # sudah dihitung sebagai native di atas
+            bal = so.token_balance(addr, mint)
+            usd = bal * (1.0 if sym in cfg["stable_syms"] else so.token_usd_price(mint))
+            total += usd
+            bal_lines.append(f"· {esc(sym)}: {ch.fmt_amount(bal)} ({ch.fmt_usd(usd)})")
+    else:
+        w3 = ch.get_w3(cid)
+        addr = wallet_address()
+        eth_usd = ch.quote_usd_price(w3, cid, cfg["wrapped_symbol"])
+        native = w3.eth.get_balance(addr) / 1e18
+        total = native * eth_usd
+        # Di chain ber-native_erc20 (Arc), saldo native DAN saldo ERC20-nya itu
+        # kantong yang sama — menampilkan keduanya membuat dashboard menulis USDC
+        # dua kali dan Total-nya dua kali lipat dari uang yang benar-benar ada.
+        ne = ch.native_erc20(cid)
+        ne_note = " (native = ERC20)" if ne else ""
+        bal_lines = [f"· {esc(cfg['native_symbol'])}{ne_note}: {ch.fmt_amount(native)} "
+                     f"({ch.fmt_usd(native * eth_usd)})"]
+        for sym, a in cfg["quotes"].items():
+            if ne and str(a).lower() == ne:
+                continue
+            c = ch.erc20(w3, a)
+            bal = c.functions.balanceOf(addr).call() / 10 ** c.functions.decimals().call()
+            usd = bal * (1.0 if sym in cfg["stable_syms"] else eth_usd)
+            total += usd
+            bal_lines.append(f"· {esc(sym)}: {ch.fmt_amount(bal)} ({ch.fmt_usd(usd)})")
     amount = f"{s['amount_fixed']:g} fix" if s["amount_fixed"] else f"{s['amount_pct']:g}%"
     alert = f"{int(s.get('alert_secs', 60))}s" if s.get("alert_secs") else "off"
-    pks = all_pks()
+    pks = pks_for(cid)
     wallets_line = ""
     if len(pks) > 1:
         cur = active_wallet_idx()
@@ -524,7 +611,10 @@ def build_main_menu() -> str:
             parts.append(f"{mark}W{i + 1} {ch.fmt_amount(bal)}")
         wallets_line = f"👛 {' · '.join(parts)} {esc(cfg['native_symbol'])}\n"
     return (
-        f"🦄 <b>unipool</b> — LP {esc(ch.dex_name(cid))} {esc(ch.versions_label(cid))}\n"
+        # Di Solana nama DEX-nya SUDAH "Meteora DLMM", jadi menempelkan
+        # versions_label ("DLMM") lagi menghasilkan "Meteora DLMM DLMM".
+        f"🦄 <b>unipool</b> — LP {esc(ch.dex_name(cid))}"
+        f"{'' if ch.is_solana(cid) else ' ' + esc(ch.versions_label(cid))}\n"
         f"⛓ {esc(cfg['name'])} (chain {cid})\n"
         f"{wallets_line}"
         f"{esc(wallet_label())}: <code>{esc(addr)}</code>\n\n"
@@ -532,7 +622,9 @@ def build_main_menu() -> str:
         f"<b>Total: {ch.fmt_usd(total)}</b> · 1 {esc(cfg['wrapped_symbol'])} = ${eth_usd:,.0f}\n\n"
         f"⚙️ amount {esc(amount)} · slippage {s['slippage_pct']:g}% · gap {s.get('gap', 1)} · "
         f"alert {alert} · autoswap {'ON' if s['autoswap'] else 'OFF'}\n\n"
-        f"📥 Paste alamat token (<code>0x...</code>) untuk buka posisi baru."
+        f"📥 Paste alamat token "
+        f"(<code>{'mint Solana' if ch.is_solana(cid) else '0x...'}</code>) "
+        f"untuk buka posisi baru."
     )
 
 
@@ -1277,12 +1369,60 @@ async def cmd_chain(update: Update, context: ContextTypes.DEFAULT_TYPE):
 WAL_PAGE = 6  # token ERC20 per halaman
 
 
+def wallet_text_sol(page: int = 0) -> tuple[str, int, int]:
+    """Saldo wallet Solana. Dipanggil di thread.
+
+    Token SPL lain TIDAK dipaginasi seperti jalur EVM: `getTokenAccountsByOwner`
+    mengembalikan semua akun token sekaligus dalam SATU request, jadi tidak ada
+    ongkos per-token yang perlu dibatasi. Yang saldonya nol dilewati — wallet
+    Solana menyimpan akun token kosong seumur hidup setelah sekali dipakai."""
+    import sol as so
+    cid = ch.SOL_CHAIN
+    cfg = ch.CHAINS[cid]
+    addr = wallet_address()
+    lines = [f"<b>Wallet {esc(wallet_label())}</b> <code>{esc(addr)}</code> — "
+             f"{esc(cfg['name'])}"]
+    total = 0.0
+    native = so.sol_balance(addr)
+    sol_usd = so.token_usd_price(so.SOL_MINT)
+    total += native * sol_usd
+    lines.append(f"SOL: {ch.fmt_amount(native)} ({ch.fmt_usd(native * sol_usd)})")
+    lines.append(f"<i>cadangan {cfg['gas_reserve']:g} SOL disisihkan untuk fee tx "
+                 f"dan sewa akun posisi (~{so.POSITION_RENT_SOL:g} SOL per posisi, "
+                 f"kembali saat Close).</i>")
+    v = so.rpc("getTokenAccountsByOwner",
+               [addr, {"programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"},
+                {"encoding": "jsonParsed"}]) or {}
+    toks = []
+    for acc in v.get("value") or []:
+        info = (((acc.get("account") or {}).get("data") or {}).get("parsed") or {}).get("info") or {}
+        amt = (info.get("tokenAmount") or {})
+        bal = float(amt.get("uiAmount") or 0)
+        mint = str(info.get("mint") or "")
+        if bal <= 0 or not mint:
+            continue
+        meta = so.token_meta(mint)
+        usd = bal * float(meta.get("price") or 0)
+        total += usd
+        toks.append((usd, bal, meta.get("symbol") or mint[:4], mint))
+    toks.sort(key=lambda x: -x[0])
+    if toks:
+        lines.append(f"\n🪙 <b>Token ({len(toks)})</b>:")
+        for usd, bal, sym, mint in toks[:WAL_PAGE]:
+            lines.append(f"· {esc(sym)}: {ch.fmt_amount(bal)} ({ch.fmt_usd(usd)}) "
+                         f"<code>{esc(mint)}</code>")
+    lines.append(f"\n<b>Total ≈ {ch.fmt_usd(total)}</b>")
+    return "\n".join(lines), 0, 1
+
+
 def wallet_text(page: int = 0) -> tuple[str, int, int]:
     """Saldo semua token + USD, token ERC20 dipaginasi.
     Return (text, page, pages). Dipanggil di thread."""
     s = store.load_settings()
     cid = s["chain"]
     cfg = ch.CHAINS[cid]
+    if ch.is_solana(cid):
+        return wallet_text_sol(page)
     w3 = ch.get_w3(cid)
     addr = wallet_address()
     eth_usd = ch.quote_usd_price(w3, cid, cfg["wrapped_symbol"])
@@ -1525,6 +1665,13 @@ async def on_address(update: Update, _):
     if not m:
         return
     token = m.group(1)
+    # Cabang base58 ADDR_RE juga cocok dengan kata biasa yang panjangnya kebetulan
+    # 32–44 huruf. Yang memisahkan cuma dekode base58-nya: alamat Solana HARUS
+    # menghasilkan tepat 32 byte. Tanpa cek ini, kalimat biasa memicu discovery.
+    if not token.startswith("0x"):
+        import sol as _so
+        if not _so.is_sol_address(token):
+            return
     s = store.load_settings()
     cid = s["chain"]
     # Paste alamat = mulai dari nol. Status alur lain (mis. pindah pool yang
@@ -1616,13 +1763,17 @@ async def show_pools_for(status, cid: int, token: str, extra: dict | None = None
         # tanda DEX cuma muncul di chain ber-DEX ganda (BSC: P=PancakeSwap, U=Uniswap)
         dtag = (p.get("dex") or "")[:1] if len(ch.dex_names(cid)) > 1 else ""
         warn = "!" if p.get("deviation") else ""
+        # DLMM: yang menentukan presisi range adalah BIN STEP, bukan nomor versi —
+        # jadi itu yang ditulis di kolom kiri. "v5" tidak berarti apa pun bagi user.
+        tag = f"b{p.get('bin_step')}" if ver == 5 else f"v{ver}{dtag}"
         rows.append(
-            f"{i:>2} {f'v{ver}{dtag}{warn} ' + p['quote_sym'][:5]:<7} {p['fee'] / 10000:>5.2f}% "
+            f"{i:>2} {f'{tag}{warn} ' + p['quote_sym'][:5]:<8} {p['fee'] / 10000:>5.2f}% "
             f"{fmt_short(p['tvl_usd']):>6} {fmt_pct_short(p.get('apr_pct')):>5} "
             f"{fmt_short(p.get('vol24_usd')):>5} {fmt_ratio(p.get('vol24_usd'), p.get('tvl_usd')):>6}")
+        lbl = (f"{i}. [DLMM bin {p.get('bin_step')}] " if ver == 5
+               else f"{i}. [{esc(p.get('dex') or '')} v{ver}] ")
         buttons.append([InlineKeyboardButton(
-            f"{i}. [{esc(p.get('dex') or '')} v{ver}] {p['quote_sym']} "
-            f"{p['fee'] / 10000:.2f}% · {ch.fmt_usd(p['tvl_usd'])}",
+            f"{lbl}{p['quote_sym']} {p['fee'] / 10000:.2f}% · {ch.fmt_usd(p['tvl_usd'])}",
             callback_data=f"pool|{key}")])
     # Buat pool v4 ber-fee/spacing custom. Cuma muncul kalau chain ini punya v4 DAN
     # sudah ada pool rujukan — harga awal pool baru disalin dari pool terdalam yang
@@ -1662,12 +1813,16 @@ async def show_pools_for(status, cid: int, token: str, extra: dict | None = None
     # menulis "scan sendiri … Krystal tidak punya token ini" padahal Krystal yang
     # menyumbang mayoritas daftar.
     _SRC_NAMA = {"krystal": "Krystal", "uniswap": "indexer Uniswap",
-                 "gecko": "GeckoTerminal", "scan": "scan sendiri"}
+                 "gecko": "GeckoTerminal", "scan": "scan sendiri",
+                 "meteora": "Data API Meteora"}
     parts = [p for p in str(res.get("source") or "").split("+") if p]
     if parts:
         nm = " + ".join(_SRC_NAMA.get(p, p) for p in parts)
         src_line = f"\U0001F4DA sumber: {esc(nm)}"
-        if "krystal" not in parts:
+        # Krystal tidak melayani Solana sama sekali, jadi menyebut "Krystal tidak
+        # punya token ini" di sana menyesatkan — bukan kegagalan, memang bukan
+        # sumber untuk chain itu.
+        if "krystal" not in parts and not ch.is_solana(cid):
             src_line += (f" (Krystal gagal: {esc(ch.krystal_last_error())})"
                          if ch.krystal_last_error() else " (Krystal tidak punya token ini)")
     else:
@@ -1675,9 +1830,14 @@ async def show_pools_for(status, cid: int, token: str, extra: dict | None = None
                     "& harga menyimpang"
                     + (f" (Krystal gagal: {esc(ch.krystal_last_error())})"
                        if ch.krystal_last_error() else " (Krystal tidak punya token ini)"))
+    # Keterangan kolom mengikuti chain: "P=PancakeSwap · U=Uniswap" tidak ada
+    # artinya di Solana, dan yang justru perlu dijelaskan di sana adalah kolom
+    # `b<n>` — bin step, knob yang menentukan serapat apa range bisa disetel.
+    legend = ("bNN = bin step (basis point per bin; makin kecil makin rapat) · "
+              if ch.is_solana(cid) else "P=PancakeSwap · U=Uniswap · ")
     text = (f"Found {len(pools)} pool(s) untuk <b>{esc(tsym)}</b> ({_t.time() - t0:.1f}s):\n"
             f"<pre>{esc(chr(10).join(rows))}</pre>\n"
-            f"<i>P=PancakeSwap · U=Uniswap · ! = harga menyimpang · TVL/volume USD · "
+            f"<i>{legend}! = harga menyimpang · TVL/volume USD · "
             f"APR estimasi · V/TVL = volume 24j ÷ TVL (makin tinggi makin produktif) "
             f"· – = belum terindeks</i>\n<i>{src_line}</i>{off_line}")
     if extra:
@@ -1722,6 +1882,17 @@ def compute_amount(ctx_data: dict, sqrtp: int | None = None,
     p = ctx_data["pool_info"]
     if ctx_data["amount_fixed"]:
         return float(ctx_data["amount_fixed"])
+    # Solana: tidak ada Web3, tidak ada wrapped/quote-lain yang perlu ditukar —
+    # modalnya saldo quote apa adanya, dikurangi cadangan SOL untuk fee tx DAN
+    # sewa akun posisi. `amount_src="meme"` memakai saldo meme langsung.
+    if ch.is_solana(cid):
+        import sol as _so
+        addr = wallet_address()
+        if ctx_data.get("amount_src") == "meme" and ctx_data["mode"] != "upper":
+            return _so.meme_balance(addr, p) * ctx_data["amount_pct"] / 100
+        if ctx_data["mode"] == "upper":
+            return _so.meme_balance(addr, p) * ctx_data["amount_pct"] / 100
+        return _so.capital(addr, p) * ctx_data["amount_pct"] / 100
     w3 = ch.get_w3(cid)
     addr = wallet_address()
     mode = ctx_data["mode"]
@@ -1984,6 +2155,96 @@ def build_preview_v2(ctx_data: dict) -> str:
     )
 
 
+# Shape likuiditas DLMM. Tidak ada padanannya di Uniswap — di sana likuiditas
+# selalu rata di seluruh range — jadi ia knop TERSENDIRI, bukan mode range.
+SHAPE_LABEL = {"Spot": "▬ Spot", "Curve": "▲ Curve", "BidAsk": "▼ Bid-Ask"}
+SHAPE_DESC = {
+    "Spot": "rata di seluruh range — serbaguna",
+    "Curve": "menumpuk di tengah — untuk harga yang diperkirakan diam",
+    "BidAsk": "menumpuk di kedua tepi — untuk volatil / DCA",
+}
+
+
+def build_preview_dlmm(ctx_data: dict) -> str:
+    """Kartu konfirmasi posisi Meteora DLMM (dipanggil di thread)."""
+    import sol as so
+    cid = ctx_data["chain"]
+    p = ctx_data["pool_info"]
+    tsym = ctx_data["token"]["symbol"]
+    mode = ctx_data["mode"]
+    shape = ctx_data.get("shape") or "Spot"
+    amount = compute_amount(ctx_data)
+    if amount <= 0:
+        raise RuntimeError(no_funds_msg(ctx_data, p["quote_sym"]))
+    plan = so.plan_mint(p["pool"], ctx_data["low_pct"], ctx_data["up_pct"],
+                        mode, shape, amount)
+    qsym = p["quote_sym"]
+    L = [f"<b>{esc(tsym)}/{esc(qsym)}</b> · {esc(p['dex'])} · "
+         f"bin step <b>{p.get('bin_step')}</b> (kisi {p.get('bin_step', 0) / 100:.2f}%)",
+         f"fee dasar <b>{p.get('base_fee_pct', 0):g}%</b> · "
+         f"fee sekarang {p.get('dynamic_fee_pct', 0):g}% · "
+         f"TVL {ch.fmt_usd(p.get('tvl_usd'))} · vol 24j {ch.fmt_usd(p.get('vol24_usd'))}",
+         f"<code>{esc(p['pool'])}</code>",
+         "",
+         f"Mode <b>{esc(STRAT_LABEL.get(mode, mode))}</b> · shape "
+         f"<b>{esc(SHAPE_LABEL.get(shape, shape))}</b> — {esc(SHAPE_DESC.get(shape, ''))}",
+         f"Range: <b>{ch.fmt_price(plan['price_lower'])} … "
+         f"{ch.fmt_price(plan['price_upper'])}</b> {esc(qsym)}/{esc(tsym)}",
+         f"<i>bin {plan['lower_bin']} … {plan['upper_bin']} "
+         f"({plan['n_bins']} bin, bin aktif {plan['active_bin']}) · "
+         f"harga sekarang {ch.fmt_price(plan['price'] if plan['quote_is_token1'] else (1 / plan['price'] if plan['price'] else 0))}</i>",
+         ""]
+    if plan["n_bins"] >= so.MAX_BINS_PER_POSITION:
+        L.append(f"⚠️ Range dipangkas ke batas satu posisi "
+                 f"({so.MAX_BINS_PER_POSITION} bin) dan DIPUSATKAN di bin aktif. "
+                 f"Bin step {p.get('bin_step')} memang terlalu rapat untuk lebar ini — "
+                 f"pilih pool ber-bin step lebih besar kalau mau range selebar itu.")
+    side = plan.get("side")
+    if side == "y_only":
+        L.append(f"Seluruh range DI BAWAH harga sekarang → setoran <b>100% "
+                 f"{esc(qsym)}</b>. Posisi baru menghasilkan {esc(tsym)} kalau harga turun "
+                 f"melintasinya — persis limit buy bertingkat.")
+    elif side == "x_only":
+        L.append(f"Seluruh range DI ATAS harga sekarang → setoran <b>100% "
+                 f"{esc(tsym)}</b>. Posisi baru menghasilkan {esc(qsym)} kalau harga naik "
+                 f"melintasinya — persis limit sell bertingkat.")
+    L.append(f"Setoran: <b>{ch.fmt_amount(plan['quote_in'])} {esc(qsym)}</b> + "
+             f"<b>{ch.fmt_amount(plan['meme_in'])} {esc(tsym)}</b> "
+             f"(≈{ch.fmt_usd(plan['usd'])})")
+    if plan.get("unusable_quote"):
+        L.append(f"⚠️ {ch.fmt_amount(plan['unusable_quote'])} {esc(qsym)} TIDAK bisa masuk "
+                 f"range ini dan tetap di wallet.")
+    # Sisi meme harus SUDAH ada di wallet: jalur ini tidak menukar apa pun sendiri.
+    try:
+        have_m = so.meme_balance(wallet_address(), p)
+        if plan["meme_in"] > have_m + 1e-12:
+            L.append(f"❌ Saldo {esc(tsym)} kurang: butuh {ch.fmt_amount(plan['meme_in'])}, "
+                     f"ada {ch.fmt_amount(have_m)}. Bot ini TIDAK menukar otomatis di "
+                     f"Solana — beli dulu sisi itu, atau pakai mode Lower "
+                     f"(100% {esc(qsym)}).")
+    except Exception:
+        pass
+    L.append(f"<i>Sewa akun posisi ~{so.POSITION_RENT_SOL:g} SOL dikunci selama posisi "
+             f"hidup dan KEMBALI saat Close — bukan biaya.</i>")
+    return "\n".join(L)
+
+
+def mint_card_dlmm(cid: int, p: dict, res: dict) -> str:
+    """Kartu hasil mint DLMM: sebut yang NYATA masuk, bukan budget."""
+    import sol as so
+    L = [f"✅ <b>Posisi DLMM dibuat</b> · {esc(p.get('name') or '')}",
+         f"Masuk: <b>{ch.fmt_amount(res.get('in_quote') or 0)} {esc(res.get('quote_sym') or '')}</b>"
+         f" + <b>{ch.fmt_amount(res.get('in_meme') or 0)} {esc(res.get('meme_sym') or '')}</b>"
+         f" (≈{ch.fmt_usd(res.get('deposited_usd'))})",
+         f"Range: bin {res.get('lower_bin')} … {res.get('upper_bin')} "
+         f"({res.get('n_bins')} bin) · shape {esc(SHAPE_LABEL.get(res.get('shape'), res.get('shape') or ''))}",
+         f"<code>{esc(res.get('position') or '')}</code>"]
+    for st in res.get("steps") or []:
+        L.append(f"• {esc(st)}")
+    L.append(f"<i>Sewa {so.POSITION_RENT_SOL:g} SOL terkunci di akun posisi — kembali saat Close.</i>")
+    return "\n".join(L)
+
+
 def build_preview(ctx_data: dict) -> str:
     """Kartu konfirmasi mint (dipanggil di thread)."""
     cid = ctx_data["chain"]
@@ -1991,6 +2252,8 @@ def build_preview(ctx_data: dict) -> str:
     p = ctx_data["pool_info"]
     if p.get("ver") == 2:
         return build_preview_v2(ctx_data)
+    if p.get("ver") == 5:
+        return build_preview_dlmm(ctx_data)
     tsym = ctx_data["token"]["symbol"]
     tdec = ctx_data["token"]["decimals"]
     mode = ctx_data["mode"]
@@ -2662,7 +2925,14 @@ async def show_newpool(msg, key: str):
 
 def box_pct(pool_info: dict) -> float:
     """Lebar satu kotak tick-spacing dalam persen — presisi terbaik pool ini.
-    Pool fee 5% biasanya spacing 1000 (≈10,5%), fee 0,05% spacing 10 (≈0,1%)."""
+    Pool fee 5% biasanya spacing 1000 (≈10,5%), fee 0,05% spacing 10 (≈0,1%).
+
+    DLMM memakai rumusnya sendiri: satu bin = `bin_step` basis point PERSIS
+    (`(1+bin_step/1e4)`), bukan `exp(0,0001×spacing)`. Kebetulan hampir sama
+    untuk bin step kecil (4 → 0,040% vs 0,040%), tapi melenceng makin jauh
+    makin besar bin step-nya (400 → 4,00% vs 4,08%)."""
+    if pool_info.get("ver") == 5:
+        return round(float(pool_info.get("bin_step") or 0) / 100.0, 4)
     sp = int(pool_info.get("tick_spacing") or ch.TICK_SPACING.get(pool_info.get("fee"), 60) or 60)
     return round((math.exp(0.0001 * sp) - 1) * 100, 4)
 
@@ -2819,8 +3089,17 @@ def confirm_kb(key: str, ctx_data: dict) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("⬅️ Pool lain", callback_data=f"pools|{key}")],
         [sbtn(m) for m in ("stable", "wide", "lower", "upper")],
         [wbtn(lo, up) for lo, up in STRAT_PRESETS[mode]],
-        [InlineKeyboardButton("🎯 Rapat — langsung aktif (2 sisi)", callback_data=f"tight|{key}")],
     ]
+    if ctx_data["pool_info"].get("ver") == 5:
+        # Shape hanya ada di DLMM. Tombol "Rapat" dilewati: padanannya di sini
+        # adalah memilih pool ber-bin step besar, bukan menyempitkan tick.
+        cur_shape = ctx_data.get("shape") or "Spot"
+        rows.append([InlineKeyboardButton(
+            ("✓ " if sh == cur_shape else "") + SHAPE_LABEL[sh],
+            callback_data=f"shape|{key}|{sh}") for sh in ("Spot", "Curve", "BidAsk")])
+    else:
+        rows.append([InlineKeyboardButton("🎯 Rapat — langsung aktif (2 sisi)",
+                                          callback_data=f"tight|{key}")])
     if mode != "upper":
         rows.append([srcbtn("quote", f"💰 {ctx_data['pool_info']['quote_sym']}"),
                      srcbtn("meme", f"🪙 {ctx_data['token']['symbol']}")])
@@ -3261,6 +3540,37 @@ async def do_mint(update: Update, ctx_data: dict):
     # Sama persis dengan kartu konfirmasi: untuk `amount_src="meme"` budget-nya
     # bergantung rasio range, jadi tick harus ikut dihitung — kalau tidak, jumlah
     # yang dieksekusi beda dari yang ditampilkan.
+    # DLMM: range-nya BIN, bukan tick, dan komposisinya dihitung sidecar lewat
+    # fungsi yang sama dengan yang dipakai saat deposit. Jalur tick EVM di bawah
+    # tidak berlaku sama sekali.
+    if ver == 5:
+        strategy["shape"] = ctx_data.get("shape") or "Spot"
+        amount = await asyncio.to_thread(compute_amount, ctx_data)
+        if amount <= 0:
+            await reply(update, "❌ " + esc(await asyncio.to_thread(
+                no_funds_msg, ctx_data, p["quote_sym"])))
+            return
+        status = await reply(update, (
+            f"⏳ Membuat posisi DLMM ({STRAT_LABEL.get(mode, mode)} · "
+            f"{esc(strategy['shape'])})…\n"
+            f"<i>{esc(tsym)}/{esc(p['quote_sym'])} bin step {p.get('bin_step')} · "
+            f"fee {p['fee'] / 10000:.2f}% · deposit {ch.fmt_amount(amount)} "
+            f"{esc(p['quote_sym'])}</i>"))
+
+        def work_sol():
+            return ch.mint_dlmm(cid, pk(cid), p, amount, strategy, s["slippage_pct"])
+
+        async with TX_LOCK:
+            try:
+                res = await with_progress(status, work_sol)
+            except Exception as e:
+                await edit(status, f"❌ Mint DLMM gagal: {esc(e)}")
+                return
+        pos_cache_drop(cid)
+        await edit(status, await asyncio.to_thread(mint_card_dlmm, cid, p, res),
+                   NAV_KB)
+        return
+
     def _amt():
         p_ = ctx_data["pool_info"]
         sq, ct = ctx_slot0(ctx_data)
@@ -3559,8 +3869,13 @@ async def cmd_list(update: Update, _, status_msg=None):
 
 
 def _pos_disp(p: dict) -> str:
-    """Label pendek posisi: '#183469' (v3) · '#12 [v4]' · '[v2]'."""
+    """Label pendek posisi: '#183469' (v3) · '#12 [v4]' · '[v2]' · 'ABcd…WXyz [DLMM]'."""
     ver = p.get("ver", 3)
+    if ver == 5:
+        # Alamat posisi Solana 44 karakter — ditulis utuh ia menenggelamkan
+        # seluruh baris judul kartu.
+        a = str(p.get("position") or "")
+        return f"{a[:4]}…{a[-4:]} [DLMM]"
     if ver == 2:
         return "[v2]"
     if ver == 4:
@@ -3696,7 +4011,10 @@ def _pool_info_line(cid: int, p: dict, ver: int) -> str:
     Sengaja cuma di kartu detail (satu posisi), tidak di //list — pool_stats
     memanggil StateView + dexscreener, jadi biayanya per-posisi."""
     try:
-        s = ch.pool_stats(ch.get_w3(cid), cid, p)
+        # `get_w3` MENOLAK chain Solana, dan panggilannya ada di dalam argumen —
+        # jadi tanpa cabang ini seluruh baris info pool DLMM ditelan `except` dan
+        # kartunya kehilangan TVL, volume, dan porsi kita tanpa gejala apa pun.
+        s = ch.pool_stats(None if ch.is_solana(cid) else ch.get_w3(cid), cid, p)
     except Exception:
         s = {}
     dex = s.get("dex") or p.get("dex") or ""
@@ -4847,7 +5165,7 @@ async def _route_callback(update: Update):
         ctx["amount_fixed"] = float(val)     # satuan budget kartu ini, bukan persen
         await show_confirm(q.message, key)
         return
-    if data.startswith(("wd|", "amt|", "st|", "amtsrc|")):
+    if data.startswith(("wd|", "amt|", "st|", "amtsrc|", "shape|")):
         parts = data.split("|")
         kind, key = parts[0], parts[1]
         ctx = PENDING.get(key)
@@ -4861,6 +5179,9 @@ async def _route_callback(update: Update):
             # default lebar per mode
             defaults = {"stable": (6.18, 6.18), "wide": (50, 100), "lower": (50, 100), "upper": (50, 100)}
             ctx["low_pct"], ctx["up_pct"] = defaults[ctx["mode"]]
+        elif kind == "shape":
+            # Bentuk sebaran likuiditas DLMM — knop yang tidak ada di Uniswap.
+            ctx["shape"] = parts[2]
         elif kind == "amtsrc":
             # Saldo mana yang dipersenkan: sisi quote (lama) atau token meme.
             ctx["amount_src"] = parts[2]
