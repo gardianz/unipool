@@ -4156,6 +4156,13 @@ async def cmd_list(update: Update, _, status_msg=None):
     open_value = unclaimed = deposits = 0.0
     withdrawals = fees_claimed = 0.0
     churn = 0
+    # PnL dan penyebutnya dijumlah PER CHAIN, bukan dihitung sekali dari total.
+    # Solana memakai pembukuan Meteora yang tidak bisa dipecah jadi
+    # withdrawals/fees_claimed, jadi satu rumus global tidak bisa melayani
+    # keduanya — dan memaksakan selisihnya masuk `withdrawals` akan merusak
+    # modal bersih chain EVM yang ikut dihitung dari angka itu.
+    pnl = base = 0.0
+    met_pools: dict[int, dict] = {}
     for c, (pos, _errs) in per_chain.items():
         # Alamat wallet per CHAIN: alamat EVM dan Solana berbeda, jadi memakai
         # alamat chain aktif untuk chain lain membuat riwayat menempel ke wallet
@@ -4163,6 +4170,27 @@ async def cmd_list(update: Update, _, status_msg=None):
         if not pks_for(c):
             continue                 # chain tanpa wallet: tidak ada yang dibukukan
         wc = wallet_address(c)
+        ov = sum(p["value_usd"] for p in pos)
+        un = sum(p["unclaimed_usd"] for p in pos)
+        open_value += ov
+        unclaimed += un
+        # Solana: PnL-nya dari METEORA. `history.json` cuma tahu posisi yang lahir
+        # di bot, sedangkan DLMM bisa dienumerasi dari owner-nya sehingga posisi
+        # yang dibuat di meteora.ag ikut muncul di daftar — menambah open_value
+        # TANPA deposit pembanding, dan PnL portfolio menggelembung sebesar itu.
+        # Angkanya per POOL, jadi dijumlah per pool (dua posisi sepool berbagi
+        # satu angka; menjumlah per POSISI akan menghitungnya dua kali).
+        mp = {p["pool"]: p for p in pos if p.get("pnl_src") == "meteora"
+              and p.get("deposit_usd")}
+        if mp and len(mp) == len({p["pool"] for p in pos}):
+            met_pools[c] = mp
+            dep_m = sum(v["deposit_usd"] for v in mp.values())
+            deposits += dep_m
+            pnl += sum(v["pnl_usd"] for v in mp.values())
+            # Penyebutnya setoran kumulatif Meteora — penyebut yang SAMA dengan
+            # persen di meteora.ag, jadi kedua layar tidak saling membantah.
+            base += dep_m
+            continue
         # klaim event riwayat lama (tanpa tag wallet) yang posisinya milik wallet ini
         store.adopt_orphans(c, wc, [p["token_id"] for p in pos])
         sm = store.portfolio_summary(c, wc)
@@ -4170,18 +4198,16 @@ async def cmd_list(update: Update, _, status_msg=None):
         withdrawals += sm["withdrawals"]
         fees_claimed += sm["fees_claimed"]
         churn += store.churn_count(c, wc)
-        open_value += sum(p["value_usd"] for p in pos)
-        unclaimed += sum(p["unclaimed_usd"] for p in pos)
+        pnl += sm["withdrawals"] + sm["fees_claimed"] + ov + un - sm["deposits"]
+        # Persennya HARUS terhadap modal bersih (deposits − withdrawals), bukan
+        # deposits kumulatif. Tiap rebalance/pindah pool/compound mencatat close +
+        # mint baru, jadi deposits menggelembung oleh dana yang sama didaur ulang
+        # berkali-kali dan persentasenya jadi terlihat jauh lebih kecil dari yang
+        # benar-benar dirasakan (terukur: −3,19% terhadap deposit kumulatif $67,4k
+        # vs −26,48% terhadap modal bersih $8,1k, dari 541 siklus).
+        base += max(0.0, sm["deposits"] - sm["withdrawals"]) or sm["deposits"]
     summary = {"deposits": deposits, "withdrawals": withdrawals, "fees_claimed": fees_claimed}
-    pnl = summary["withdrawals"] + summary["fees_claimed"] + open_value + unclaimed - deposits
-    # Persennya HARUS terhadap modal bersih (deposits − withdrawals), bukan deposits
-    # kumulatif. Tiap rebalance/pindah pool/compound mencatat close + mint baru,
-    # jadi deposits menggelembung oleh dana yang sama didaur ulang berkali-kali dan
-    # persentasenya jadi terlihat jauh lebih kecil dari yang benar-benar dirasakan
-    # (terukur: −3,19% terhadap deposit kumulatif $67,4k vs −26,48% terhadap modal
-    # bersih $8,1k, dari 541 siklus).
-    net_in = max(0.0, deposits - summary["withdrawals"])
-    base = net_in or deposits
+    net_in = base
     pnl_pct = (pnl / base * 100) if base else 0.0
 
     lines = []
@@ -4190,7 +4216,9 @@ async def cmd_list(update: Update, _, status_msg=None):
         waddr = wallet_address(_cid)
         lines.append(f"👛 {esc(wallet_label(cid=_cid))} "
                      f"<code>{esc(waddr[:6])}…{esc(waddr[-4:])}</code>")
-    lines += [
+    # Baris kondisional yang kosong dibuang, bukan dikirim sebagai baris hampa —
+    # dengan dua di antaranya, header bisa punya tiga baris kosong berturut-turut.
+    lines += [l for l in [
         f"<b>Portfolio PnL {ch.fmt_usd(pnl)} ({pnl_pct:+.2f}% dari modal bersih "
         f"{ch.fmt_usd(net_in)})</b>",
         (f"deposits {ch.fmt_usd(deposits)} | withdrawals {ch.fmt_usd(summary['withdrawals'])} | "
@@ -4198,8 +4226,13 @@ async def cmd_list(update: Update, _, status_msg=None):
         (f"<i>deposits/withdrawals termasuk {churn} siklus rebalance — dana yang sama "
          f"didaur ulang, bukan modal segar.</i>" if churn else ""),
         f"open value {ch.fmt_usd(open_value)} | unclaimed fees {ch.fmt_usd(unclaimed)}",
-        "",
-    ]
+        # Tanpa baris ini, "withdrawals 0" terbaca seolah-olah belum pernah ada
+        # penarikan di Solana — padahal Meteora memang tidak merincinya, ia cuma
+        # memberi hasil akhirnya.
+        ("<i>Solana memakai pembukuan Meteora: penarikan + fee terklaim sudah "
+         "termasuk di dalam PnL-nya, tidak dirinci terpisah.</i>" if met_pools else ""),
+    ] if l]
+    lines.append("")
     buttons = []
     # Posisi yang GAGAL dibaca wajib disebut. Kalau tidak, RPC sibuk terlihat sama
     # persis dengan dana yang hilang — dan nilai portfolio di atas ikut kelihatan
@@ -4249,8 +4282,11 @@ async def cmd_list(update: Update, _, status_msg=None):
     # Posisi tanpa event mint (mis. hasil /recover, atau mint yang sempat dilaporkan
     # gagal) menambah open_value TANPA deposit pembanding — PnL jadi terlalu bagus.
     # Sebut jumlahnya, jangan diam-diam.
+    # Posisi yang PnL-nya datang dari Meteora tidak ikut: deposit-nya justru
+    # diketahui, cuma bukan dari `history.json`.
     tanpa_deposit = [p for c, (pos, _e) in per_chain.items() for p in pos
-                     if store.mint_usd(c, p["token_id"]) is None]
+                     if store.mint_usd(c, p["token_id"]) is None
+                     and p["pool"] not in met_pools.get(c, {})]
     if tanpa_deposit:
         nilai = sum(p["value_usd"] for p in tanpa_deposit)
         lines.insert(len(lines) - 1,
@@ -4317,16 +4353,36 @@ def _pos_metrics(cid: int, p: dict) -> dict:
     earned = p["unclaimed_usd"] + claimed
     if p.get("ver") == 2:
         earned = v2_earned_usd(cid, p) + claimed
-    if dep:
+    # Solana: PnL dari METEORA, bukan `history.json`. Mayoritas posisi DLMM lahir
+    # di meteora.ag sehingga bot tidak punya satu pun event mint-nya, dan tanpa
+    # deposit pembanding `/list` cuma bisa menulis "?" — persis yang terlihat untuk
+    # SELURUH posisi Solana wallet ini. Meteora membukukan sendiri seluruh riwayat
+    # setoran/penarikan/fee terklaim tiap pool, jadi angkanya justru lebih lengkap
+    # daripada yang bisa disusun bot. Terukur cocok dengan meteora.ag/portfolio.
+    src = note = None
+    if p.get("pnl_src") == "meteora" and p.get("deposit_usd"):
+        src, dep = "Meteora", p["deposit_usd"]
+        pnl, pnl_pct = p.get("pnl_usd"), p.get("pnl_pct")
+        # `pnl` Meteora SUDAH memuat penarikan + fee terklaim dan tidak bisa
+        # dipecah lagi (terbukti di EMBER/SOL: deposit $407,02, nilai $167,66,
+        # fee $18,48, tapi pnl +$40,84). Angka "Ditarik"/"Fee terklaim" dari
+        # `history.json` karena itu TIDAK boleh ikut ditampilkan di sebelahnya —
+        # user akan membacanya sebagai komponen yang menyusun pnl itu.
+        claimed = withdrawn = 0.0
+        if (p.get("pnl_shared") or 1) > 1:
+            note = (f"PnL di atas milik POOL — digabung {p['pnl_shared']} posisi "
+                    f"wallet ini di pool yang sama (Meteora tidak memecahnya)")
+    elif dep:
         pnl = cur_total + claimed + withdrawn - dep
         pnl_pct = pnl / dep * 100
-        if mts:
-            age_days = max((int(time.time()) - mts) / 86400, 0.01)
-            apr = earned / dep / age_days * 365 * 100
+    if dep and mts:
+        age_days = max((int(time.time()) - mts) / 86400, 0.01)
+        apr = earned / dep / age_days * 365 * 100
     return {
         "meme_sym": p["sym0"] if p["quote_is_token1"] else p["sym1"],
         "dep": dep, "claimed": claimed, "withdrawn": withdrawn, "cur_total": cur_total,
         "pnl": pnl, "pnl_pct": pnl_pct, "apr": apr, "earned": earned,
+        "pnl_src": src, "pnl_note": note,
         "age": store.fmt_age(mts),
     }
 
@@ -4453,6 +4509,12 @@ def position_card(cid: int, p: dict) -> str:
     if m["pnl"] is not None:
         pnl_line = (f"{'🟩 Untung' if m['pnl'] >= 0 else '🟥 Rugi'}: "
                     f"{'+' if m['pnl'] >= 0 else '−'}${abs(m['pnl']):.2f} ({m['pnl_pct']:+.1f}%)")
+        # Sumbernya disebut karena dua jalur ini menghitung hal yang BERBEDA:
+        # `history.json` cuma tahu yang lewat bot, Meteora tahu seluruh riwayat
+        # pool itu. Tanpa label, angka yang berubah setelah posisi disentuh di
+        # meteora.ag terlihat seperti bot salah hitung.
+        if m.get("pnl_src"):
+            pnl_line += f" <i>· sumber {esc(m['pnl_src'])}</i>"
     else:
         pnl_line = "PnL: ? (mint di luar bot)"
     range_line = ("📊 Full range (v2, selalu aktif)" if ver == 2
@@ -4488,7 +4550,8 @@ def position_card(cid: int, p: dict) -> str:
     ]
     stat = []
     if m["dep"]:
-        stat.append(f"Deposit {ch.fmt_usd(m['dep'])}")
+        stat.append(f"Deposit {ch.fmt_usd(m['dep'])}"
+                    + (" (kumulatif)" if m.get("pnl_src") == "Meteora" else ""))
     if m["withdrawn"]:
         stat.append(f"Ditarik {ch.fmt_usd(m['withdrawn'])}")
     if m["claimed"]:
@@ -4497,6 +4560,8 @@ def position_card(cid: int, p: dict) -> str:
         stat.append(f"APR ~{m['apr']:,.0f}%")
     if stat:
         L.append(" · ".join(stat))
+    if m.get("pnl_note"):
+        L.append(f"<i>{esc(m['pnl_note'])}</i>")
     L.append(ch.pos_link_any(cid, p["pid"]))
     return "\n".join(L)
 

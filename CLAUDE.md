@@ -755,6 +755,60 @@ masih di atas anggaran, jadi klik pertama menandai Solana "masih dimuat" dan
 klik kedua lengkap — perilaku yang sama dengan chain EVM yang lambat, dan
 task-nya sengaja tidak dibatalkan supaya cache-nya terisi.
 
+#### PnL Solana dibaca dari METEORA, bukan `history.json`
+
+Posisi DLMM bisa dienumerasi dari owner-nya, jadi posisi yang dibuat di
+**meteora.ag** ikut muncul di `/list` — dan bot tidak punya satu pun event
+mint untuknya. Akibatnya `_pos_metrics` tidak punya deposit pembanding dan
+SELURUH baris Solana berakhir "?" (terukur: 5 dari 5 posisi), sementara
+`open_value`-nya tetap masuk ke header portfolio tanpa deposit lawan sehingga
+PnL keseluruhan menggelembung palsu.
+
+`/portfolio/open` — endpoint yang SAMA yang sudah dipakai sebagai indeks
+posisi — ternyata sudah membawa pembukuannya: `pnl`, `pnlPctChange`,
+`totalDeposit`, `balances`, `unclaimedFees` (plus varian `*Sol`). Terukur
+cocok dengan meteora.ag/portfolio sampai sen terakhir: 6 pool, deposit
+$2.160,23, **PnL +$18,63 (+0,86%)** — identik dengan blok `total` API-nya.
+
+`sol.portfolio_stats()` membacanya dan `_attach_pnl()` menempelkannya ke tiap
+posisi (`pnl_usd`/`pnl_pct`/`deposit_usd`/`pnl_shared`/`pnl_src`).
+**Ongkosnya nol di jalur daftar**: `portfolio_index()` sudah memanggil URL
+yang sama dengan param yang sama, jadi `_api` (ttl 30 detik) menjawab dari
+cache — terukur 0,206 detik dingin, **0,000 detik** berikutnya.
+
+Empat hal yang WAJIB dipegang, semuanya sudah diukur:
+
+- **Angkanya PER POOL, bukan per posisi.** Sepuluh varian endpoint dicoba
+  (`/positions/<addr>`, `/portfolio/<user>`, `/portfolio/position`,
+  `/pools/<pool>/positions`, …) — **semuanya 404**. Dua posisi di pool yang
+  sama karena itu berbagi satu angka; `pnl_shared` menyebutkan jumlahnya dan
+  UI mengatakannya. Penjumlahan (header `/list`, ringkasan web) karena itu
+  **dedupe per POOL** — menjumlah per posisi menghitungnya dua kali.
+- **`pnl` TIDAK bisa dihitung ulang dari `balances + fee − totalDeposit`.**
+  Ia sudah memuat penarikan dan fee terklaim, dan keduanya tidak dirinci.
+  Terbukti di EMBER/SOL: deposit $407,02, nilai $167,66, fee unclaimed
+  $18,48, tapi `pnl` **+$40,84** — rumus naif memberi **−$220,88**. Karena
+  itu `claimed`/`withdrawn` dari `history.json` DINOLKAN di jalur ini, bukan
+  ditampilkan di sebelahnya seolah-olah komponennya.
+- **`pnl` (USD) dan `pnlSol` bisa BERLAWANAN TANDA** dan itu bukan
+  ketidakcocokan — terukur PAID/SOL `pnl` +$0,43 sementara `pnlSol`
+  −0,0056 SOL. Bot memakai yang USD, sama seperti seluruh angka lain.
+- **Nilainya STRING** (`"0.8788…"`), jadi `_f()` yang mengonversinya.
+
+Header `/list` karena itu menjumlah **PnL dan penyebutnya PER CHAIN**, bukan
+sekali dari total: Solana memakai `pnl` + `totalDeposit` Meteora (penyebut
+yang sama dengan persen di meteora.ag, jadi kedua layar tidak saling
+membantah), chain EVM tetap `withdrawals + fees_claimed + open + unclaimed −
+deposits` terhadap modal bersih. Memaksakan Solana ke rumus global berarti
+menaruh selisihnya di `withdrawals`, dan itu merusak modal bersih chain EVM
+yang dihitung dari angka yang sama. Posisi ber-PnL Meteora juga dikecualikan
+dari peringatan "tidak punya catatan deposit" — deposit-nya justru diketahui,
+cuma bukan dari `history.json`.
+
+Umur posisi tetap "?": payload ini tidak memuat waktu mint (`updatedAt` itu
+perubahan terakhir), dan `lastUpdatedAt` dari SDK juga bukan waktu lahirnya.
+Jadi APR posisi Solana juga tidak dihitung — bukan diisi tebakan.
+
 #### Yang belum ada untuk Solana
 
 Swap komposisi otomatis, pindah pool, revoke approval (Solana tidak punya

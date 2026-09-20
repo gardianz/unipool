@@ -697,6 +697,101 @@ def portfolio_index(address: str) -> list[tuple[str, list[str]]]:
     return out
 
 
+def _f(v) -> float:
+    """Angka Data API datang sebagai STRING ("0.8788…"). Kosong = 0."""
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def portfolio_stats(address: str) -> dict:
+    """PnL per POOL dari Data API Meteora + peta posisi → pool.
+
+    Meteora yang membukukannya, bukan bot: ia melihat SELURUH riwayat setoran,
+    penarikan, dan fee terklaim — termasuk posisi yang dibuat di meteora.ag,
+    yang di `history.json` bot tidak punya satu event pun. Tanpa ini `/list`
+    menulis "?" untuk setiap posisi Solana yang tidak lahir di bot, dan itu
+    justru mayoritasnya.
+
+    Terukur cocok dengan meteora.ag/portfolio sampai sen terakhir: total
+    +$20,53 / +1,00% dari 5 pool, `unclaimedFees` $34,94.
+
+    **Angkanya PER POOL, bukan per posisi.** Data API tidak memecahnya —
+    `/positions/<addr>`, `/portfolio/<user>`, `/portfolio/position`, dan
+    delapan varian lain semuanya dijawab 404. Dua posisi di pool yang sama
+    karena itu BERBAGI satu angka, dan `shared` menyebutkan jumlahnya supaya
+    UI bisa mengatakannya alih-alih menampilkan angka yang sama dua kali
+    seolah-olah masing-masing.
+
+    `deposit` itu setoran KUMULATIF, dan `pnl` sudah memasukkan penarikan +
+    fee terklaim di dalamnya — keduanya tidak bisa dipisah lagi. Terbukti di
+    EMBER/SOL: deposit $407,02, nilai sekarang $167,66, fee unclaimed $18,48,
+    tapi `pnl` **+$40,84**. Jadi jangan pernah menghitung ulang
+    `nilai + fee − deposit` dari angka-angka ini; itu memberi −$220,88.
+
+    Satuannya USD (`pnlSol`/`totalDepositSol` versi SOL-nya). Untuk pool
+    ber-quote SOL keduanya bisa berlawanan tanda — terukur PAID/SOL
+    `pnl` +$0,43 sementara `pnlSol` −0,0056 SOL — dan itu bukan
+    ketidakcocokan, melainkan dua denominasi yang memang berbeda."""
+    d = _api("/portfolio/open", {"user": str(address)}, ttl=30)
+    pools: dict[str, dict] = {}
+    of_pos: dict[str, str] = {}
+    dep_sum = 0.0
+    for pl in (d.get("pools") if isinstance(d, dict) else None) or []:
+        a = pl.get("address") or pl.get("poolAddress")
+        if not a:
+            continue
+        keys = [str(k) for k in (pl.get("listPositions") or []) if k]
+        st = {
+            "pnl": _f(pl.get("pnl")),
+            "pnl_pct": _f(pl.get("pnlPctChange")),
+            "pnl_sol": _f(pl.get("pnlSol")),
+            "deposit": _f(pl.get("totalDeposit")),
+            "value": _f(pl.get("balances")),
+            "fees": _f(pl.get("unclaimedFees")),
+            "shared": len(keys) or int(pl.get("openPositionCount") or 1),
+        }
+        pools[str(a)] = st
+        dep_sum += st["deposit"]
+        for k in keys:
+            of_pos[k] = str(a)
+    tot = (d.get("total") if isinstance(d, dict) else None) or {}
+    total = {
+        "pnl": _f(tot.get("pnl")),
+        "pnl_pct": _f(tot.get("pnlPctChange")),
+        "value": _f(tot.get("balances")),
+        "fees": _f(tot.get("unclaimedFees")),
+        # `total` Data API tidak memuat setoran; dijumlah dari pool-nya, dan
+        # hasilnya memang penyebut `pnlPctChange` total (terukur $2.051,53
+        # untuk +1,0005%).
+        "deposit": dep_sum,
+    } if tot else {}
+    return {"pools": pools, "of_position": of_pos, "total": total}
+
+
+def _attach_pnl(out: list[dict], address: str) -> list[dict]:
+    """Tempelkan PnL Meteora ke tiap posisi. Gagal = posisi TETAP dikembalikan.
+
+    Ini angka tampilan dari sumber luar; kegagalannya tidak boleh menjatuhkan
+    daftar posisi — aturan yang sama dengan `_dex_pairs()` di jalur EVM."""
+    try:
+        st = portfolio_stats(address)
+    except Exception:
+        return out
+    for p in out:
+        row = st["pools"].get(p.get("pool"))
+        if not row or not row["deposit"]:
+            continue
+        p["pnl_usd"] = row["pnl"]
+        p["pnl_pct"] = row["pnl_pct"]
+        p["pnl_sol"] = row["pnl_sol"]
+        p["deposit_usd"] = row["deposit"]
+        p["pnl_shared"] = row["shared"]
+        p["pnl_src"] = "meteora"
+    return out
+
+
 def portfolio_pools(address: str) -> list[str]:
     """Alamat pool tempat wallet ini PUNYA posisi terbuka, dari Data API.
 
@@ -767,7 +862,7 @@ def list_positions(address: str) -> list[dict]:
             # Sama seperti `list_all_positions` EVM: satu posisi yang gagal
             # dibaca tidak boleh menjatuhkan seluruh daftar.
             continue
-    return out
+    return _attach_pnl(out, address)
 
 
 def position_one(address: str, position: str, pool: str | None = None) -> dict | None:
@@ -786,7 +881,8 @@ def position_one(address: str, position: str, pool: str | None = None) -> dict |
         raw = next(iter(d.get("positions") or []), None)
         if raw is None:
             return None
-        return _position_detail(raw, pool_info(pool), d.get("active_bin"))
+        det = _position_detail(raw, pool_info(pool), d.get("active_bin"))
+        return _attach_pnl([det], address)[0]
     # Tanpa `pool`, pool-nya dicari dari akun posisinya sendiri (satu
     # `getAccountInfo`) — BUKAN dengan menyapu semua posisi wallet.
     try:

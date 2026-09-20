@@ -727,6 +727,16 @@ def _positions_build(cid: int, full: bool = False, with_basis: bool = True) -> d
                  basis="local" if dep else None,
                  age=store.fmt_age(store.mint_ts(cid, tid)),
                  link=ch.pos_link_any(cid, pid))
+        # Solana: PnL dari METEORA, bukan `history.json` — alasan yang sama dengan
+        # `_pos_metrics` di bot.py. Posisi DLMM bisa dienumerasi dari owner-nya,
+        # jadi yang dibuat di meteora.ag ikut muncul di daftar tanpa satu pun event
+        # mint; tanpa ini deposit-nya 0 dan `pnl_usd` None. `pnl` Meteora sudah
+        # memuat penarikan + fee terklaim dan tidak bisa dipecah, jadi kedua field
+        # itu DINOLKAN — kalau diisi dari history.json, UI akan menampilkannya
+        # seolah-olah komponen yang menyusun angka itu.
+        if p.get("pnl_src") == "meteora" and p.get("deposit_usd"):
+            d.update(deposit_usd=p["deposit_usd"], pnl_usd=p.get("pnl_usd"),
+                     fees_claimed_usd=0.0, withdrawn_usd=0.0, basis="meteora")
         cb = cbs.get(pid)
         if cb and d.get("price_now") and p.get("quote_sym"):
             # semua dinilai pada harga SEKARANG → PnL sudah termasuk impermanent loss
@@ -758,8 +768,16 @@ def _positions_build(cid: int, full: bool = False, with_basis: bool = True) -> d
     summ["unclaimed"] = sum(p.get("unclaimed_usd", 0) for p in out)
     summ["open"] = len(out)
     summ["in_range"] = sum(1 for p in out if p.get("in_range"))
-    known = [p for p in out if p.get("pnl_usd") is not None]
-    summ["pnl"] = sum(p["pnl_usd"] for p in known) if known else None
+    # PnL Meteora itu per POOL: dua posisi di pool yang sama membawa angka yang
+    # SAMA, jadi menjumlahkannya per posisi akan menghitungnya dua kali.
+    met = {p["pool"]: p for p in out if p.get("basis") == "meteora"}
+    if met:
+        summ["deposits"] = summ.get("deposits", 0.0) + sum(
+            v["deposit_usd"] for v in met.values())
+    known = [p for p in out if p.get("basis") != "meteora"
+             and p.get("pnl_usd") is not None]
+    summ["pnl"] = (sum(p["pnl_usd"] for p in known)
+                   + sum(v["pnl_usd"] for v in met.values())) if (known or met) else None
     return {"positions": out, "summary": summ, "ts": int(time.time()), "source": src}
 
 
