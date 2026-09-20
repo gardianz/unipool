@@ -48,22 +48,85 @@ function strategyOf(name) {
   return StrategyType.Spot;
 }
 
+/* Jumlah tx yang SUDAH disiarkan pada proses ini. Dipakai main() untuk
+ * memutuskan boleh-tidaknya mengulang perintah di endpoint lain: selama nol,
+ * mengulang dari awal mustahil menyetor/menarik dua kali. Dinaikkan SEBELUM
+ * `await`, karena tx yang timeout pun bisa tetap mendarat. */
+let SENT = 0;
+
 /* Semua tx dikirim lewat sini supaya priority fee + compute limit seragam.
  * Tanpa priority fee, tx DLMM rutin tertinggal saat jaringan ramai — dan yang
  * dilihat user cuma "timeout", bukan sebab yang bisa ditindaklanjuti. */
+const CONFIRM_TIMEOUT_MS = 90_000;
+const REBROADCAST_MS = 4_000;
+
+/* Kirim SATU tx lalu tunggu sampai benar-benar pasti.
+ *
+ * `sendAndConfirmTransaction` TIDAK dipakai, dan alasannya kejadian sungguhan:
+ * ia melempar *"Signature … has expired: block height exceeded"* untuk tx yang
+ * ternyata **sukses dan finalized**. Alur rebalance lalu berhenti di tengah —
+ * satu potong `removeLiquidity` sudah mendarat sementara sisanya tidak pernah
+ * dikirim, dan posisinya tertinggal setengah terkuras. Kelas kegagalan yang
+ * sama persis dengan "mint sukses tapi dilaporkan gagal" di jalur EVM.
+ *
+ * Karena itu: tanda tangan dipegang SENDIRI, status diperiksa berkala, dan
+ * begitu kedaluwarsa statusnya diperiksa SEKALI LAGI sebelum menyerah. Raw tx
+ * yang sama disiarkan ulang tiap beberapa detik — tanda tangannya identik jadi
+ * mustahil dobel, aturan yang sama dengan `_rebroadcast` di EVM. */
+async function sendOne(conn, tx, signers, microLamports) {
+  if (microLamports > 0) {
+    tx.instructions.unshift(
+      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: Number(microLamports) }));
+  }
+  const bh = await conn.getLatestBlockhash("confirmed");
+  tx.recentBlockhash = bh.blockhash;
+  tx.lastValidBlockHeight = bh.lastValidBlockHeight;
+  tx.feePayer = signers[0].publicKey;
+  tx.sign(...signers);
+  const raw = tx.serialize();
+  SENT += 1;                       // sebelum kirim: tx yang timeout pun bisa mendarat
+  const sig = await conn.sendRawTransaction(raw, { skipPreflight: false, maxRetries: 5 });
+
+  const check = async () => {
+    const st = await conn.getSignatureStatuses([sig], { searchTransactionHistory: true });
+    const v = (st && st.value && st.value[0]) || null;
+    if (!v) return null;
+    if (v.err) throw new Error(`Tx ${sig} gagal di chain: ${JSON.stringify(v.err)}`);
+    return (v.confirmationStatus === "confirmed" || v.confirmationStatus === "finalized")
+      ? sig : null;
+  };
+
+  const t0 = Date.now();
+  let lastSend = t0;
+  while (Date.now() - t0 < CONFIRM_TIMEOUT_MS) {
+    await new Promise((r) => setTimeout(r, 1200));
+    const ok = await check();
+    if (ok) return ok;
+    if (Date.now() - lastSend > REBROADCAST_MS) {
+      lastSend = Date.now();
+      try { await conn.sendRawTransaction(raw, { skipPreflight: true }); } catch (_) {}
+    }
+    let h = 0;
+    try { h = await conn.getBlockHeight("confirmed"); } catch (_) {}
+    if (h && h > bh.lastValidBlockHeight) {
+      // Kedaluwarsa BUKAN bukti gagal — periksa sekali lagi sebelum menyerah.
+      const last = await check();
+      if (last) return last;
+      throw new Error(`Tx ${sig} kedaluwarsa tanpa masuk chain (blockhash lewat).`);
+    }
+  }
+  const last = await check();
+  if (last) return last;
+  throw new Error(`Tx ${sig} belum terkonfirmasi setelah ${CONFIRM_TIMEOUT_MS / 1000}s — `
+                  + "JANGAN langsung mengulang, cek dulu di solscan.");
+}
+
 async function sendAll(conn, txs, kp, microLamports) {
   const list = Array.isArray(txs) ? txs : [txs];
   const out = [];
   for (const tx of list) {
     if (!tx) continue;
-    if (microLamports > 0) {
-      tx.instructions.unshift(
-        ComputeBudgetProgram.setComputeUnitPrice({ microLamports: Number(microLamports) }));
-    }
-    const sig = await web3.sendAndConfirmTransaction(conn, tx, [kp], {
-      commitment: "confirmed", skipPreflight: false, maxRetries: 5,
-    });
-    out.push(sig);
+    out.push(await sendOne(conn, tx, [kp], microLamports));
   }
   return out;
 }
@@ -362,12 +425,8 @@ const CMDS = {
     const list = Array.isArray(txs) ? txs : [txs];
     const sigs = [];
     for (const tx of list) {
-      if (Number(req.priority_micro_lamports) > 0) {
-        tx.instructions.unshift(ComputeBudgetProgram.setComputeUnitPrice({
-          microLamports: Number(req.priority_micro_lamports) }));
-      }
-      sigs.push(await web3.sendAndConfirmTransaction(conn, tx, [kp, posKp],
-        { commitment: "confirmed", maxRetries: 5 }));
+      sigs.push(await sendOne(conn, tx, [kp, posKp],
+                              req.priority_micro_lamports));
     }
     return { signatures: sigs, position: posKp.publicKey.toBase58(),
              active_bin: active.binId, lower_bin: lower, upper_bin: upper };
@@ -395,10 +454,15 @@ const CMDS = {
   async remove(req, conn, kp) {
     const { inst } = await poolState(conn, req.pool);
     const owner = kp.publicKey;
-    const r = await inst.getPositionsByUserAndLbPair(owner);
-    const p = (r.userPositions || []).find(
-      (x) => x.publicKey.toBase58() === String(req.position));
-    if (!p) throw new Error("Posisi tidak ditemukan / bukan milik wallet ini");
+    // `getPosition` membaca akun yang ditunjuk saja. Jangan diganti
+    // `getPositionsByUserAndLbPair`: itu memindai seluruh akun program DLMM dan
+    // Alchemy menolaknya 429 — terukur menggagalkan rebalance SEBELUM satu pun
+    // tx sempat jalan.
+    const p = await inst.getPosition(new PublicKey(String(req.position)));
+    if (p.positionData.owner && p.positionData.owner.toBase58
+        && p.positionData.owner.toBase58() !== owner.toBase58()) {
+      throw new Error("Posisi bukan milik wallet ini");
+    }
     const d = p.positionData;
     const bps = Number(req.bps_to_remove || 10000);
     const txs = await inst.removeLiquidity({
@@ -420,10 +484,13 @@ const CMDS = {
 
   async claim(req, conn, kp) {
     const { inst } = await poolState(conn, req.pool);
-    const r = await inst.getPositionsByUserAndLbPair(kp.publicKey);
-    const wanted = req.position ? String(req.position) : null;
-    const list = (r.userPositions || []).filter(
-      (x) => !wanted || x.publicKey.toBase58() === wanted);
+    let list;
+    if (req.position) {
+      list = [await inst.getPosition(new PublicKey(String(req.position)))];
+    } else {
+      const r = await inst.getPositionsByUserAndLbPair(kp.publicKey);
+      list = r.userPositions || [];
+    }
     if (!list.length) throw new Error("Tidak ada posisi untuk diklaim");
     const txs = await inst.claimAllSwapFee({ owner: kp.publicKey, positions: list });
     return {
@@ -501,10 +568,7 @@ const CMDS = {
 
   async close(req, conn, kp) {
     const { inst } = await poolState(conn, req.pool);
-    const r = await inst.getPositionsByUserAndLbPair(kp.publicKey);
-    const p = (r.userPositions || []).find(
-      (x) => x.publicKey.toBase58() === String(req.position));
-    if (!p) throw new Error("Posisi tidak ditemukan / bukan milik wallet ini");
+    const p = await inst.getPosition(new PublicKey(String(req.position)));
     const before = posOut(p, req.pool, inst.lbPair.binStep,
                           inst.tokenX.mint.decimals, inst.tokenY.mint.decimals);
     const txs = await inst.removeLiquidity({
@@ -535,7 +599,6 @@ const CMDS = {
     // lambat. Perintah yang MENANDATANGANI tidak diulang ke endpoint lain:
     // mengirim ulang tx yang dibangun ulang bisa menyetor dua kali.
     const urls = (req.rpcs && req.rpcs.length ? req.rpcs : [req.rpc]).filter(Boolean);
-    const signing = !!req.secret;
     let out, lastErr;
     for (const url of urls) {
       const conn = new Connection(url, { commitment: "confirmed" });
@@ -549,7 +612,12 @@ const CMDS = {
         const retryable = m.includes("429") || m.includes("Too Many Requests")
           || m.includes("capacity") || m.includes("not enabled")
           || m.includes("fetch failed") || m.includes("ETIMEDOUT");
-        if (signing || !retryable) break;
+        // Perintah bertanda tangan BOLEH diulang di endpoint lain selama belum
+        // ada satu pun tx yang disiarkan — kegagalannya di situ selalu pembacaan
+        // (DLMM.create / getPosition), dan 429 di pembacaan itulah yang paling
+        // sering terjadi. Begitu ada tx terkirim, mengulang bisa menyetor dua
+        // kali, jadi berhenti apa pun sebabnya.
+        if (SENT > 0 || !retryable) break;
       }
     }
     if (lastErr) throw lastErr;

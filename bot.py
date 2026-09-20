@@ -4624,6 +4624,20 @@ async def ask_rebalance_shape(update: Update, pid: str, mode: str):
     if not p:
         await reply(update, f"❌ Posisi {disp_pid(pid)} tidak ditemukan.")
         return
+    import sol as _so
+    # Mode Lower/Upper menjual HABIS satu sisi. Di pool tipis itu bisa puluhan
+    # persen, jadi angkanya ditampilkan SEBELUM tombol ditekan — bukan ditolak
+    # diam-diam saat eksekusi (aturan yang sama dengan kartu mint EVM).
+    imp = await asyncio.to_thread(_so.rebalance_impact, wallet_address(),
+                                  ch.parse_pid(pid)[1], mode)
+    lim = impact_limit()
+    warn = ""
+    if imp is not None:
+        warn = (f"\n⚠️ Seluruh sisi {'meme' if mode == 'lower' else 'quote'} dijual — "
+                f"price impact swap <b>{imp * 100:.1f}%</b>"
+                + (f" · DI ATAS batas {lim * 100:.0f}%, akan DITOLAK. "
+                   f"Pakai mode Wide atau naikkan batas di /settings."
+                   if imp > lim else " (dalam batas)") + "\n")
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton(SHAPE_LABEL[sh], callback_data=f"rebok|{pid}|{mode}:{sh}")
          for sh in ("Spot", "Curve", "BidAsk")],
@@ -4633,7 +4647,7 @@ async def ask_rebalance_shape(update: Update, pid: str, mode: str):
     await reply(update, (
         f"⚖️ <b>Rebalance {_pos_disp(p)} · {esc(STRAT_LABEL.get(mode, mode))}</b>\n"
         f"Lebar range dipertahankan: <b>{p.get('n_bins')} bin</b> "
-        f"(bin step {p.get('bin_step')}).\n\n"
+        f"(bin step {p.get('bin_step')}).\n{warn}\n"
         f"Pilih bentuk sebaran likuiditasnya:\n"
         + "\n".join(f"· <b>{esc(SHAPE_LABEL[k])}</b> — {esc(SHAPE_DESC[k])}"
                      for k in ("Spot", "Curve", "BidAsk"))), kb)
@@ -4663,7 +4677,7 @@ async def do_rebalance(update: Update, pid: str, mode: str):
             try:
                 r = await with_progress(status, head, lambda: ch.rebalance_position(
                     cid, pk(cid), pid, mode, s["slippage_pct"], int(s.get("gap", 1)),
-                    shape=shape))
+                    shape=shape, max_impact=impact_limit()))
             except Exception as e:
                 if isinstance(e, ch.AlreadyClosed):
                     await edit(status, f"✅ {esc(e)}", NAV_KB)

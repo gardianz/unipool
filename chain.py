@@ -8798,7 +8798,8 @@ def _convert_quote(w3: Web3, chain_id: int, pk: str, src_q: str, dst_q: str,
 
 def rebalance_position(chain_id: int, pk: str, pid, mode: str, slippage_pct: float,
                        gap: int = 1, target_pool: dict | None = None,
-                       shape: str | None = None) -> dict:
+                       shape: str | None = None,
+                       max_impact: float | None = None) -> dict:
     """Close posisi → swap komposisi sesuai mode → mint ulang dengan lebar range
     sama, dipusatkan di harga sekarang. Fee unclaimed ikut ter-reinvest.
     Hanya dana HASIL posisi ini yang dipakai (delta saldo, bukan seluruh wallet).
@@ -8821,10 +8822,14 @@ def rebalance_position(chain_id: int, pk: str, pid, mode: str, slippage_pct: flo
         # ia cuma bisa meniru mode `wide` — Lower/Upper (satu sisi) mustahil
         # dinyatakan di sana, padahal justru itu yang paling sering dipakai.
         # `shape` (Spot/Curve/BidAsk) knop tambahan yang tidak ada di Uniswap.
+        # `max_impact` WAJIB diteruskan: mode Lower/Upper menjual HABIS satu
+        # sisi, dan di pool tipis itu puluhan persen — terukur 21,99% pada
+        # WOJAK/SOL. minOut tidak menahannya (quoter sudah memasukkan impact).
         _, _ref = parse_pid(pid)
         return _sol().rebalance_any(pk, str(_ref), mode=mode,
                                     shape=(shape or "Spot"),
-                                    slippage_pct=slippage_pct)
+                                    slippage_pct=slippage_pct,
+                                    max_impact=max_impact)
     ver, ref = parse_pid(pid)
     if ver == 2:
         raise RuntimeError("Posisi v2 full-range — tidak perlu rebalance.")

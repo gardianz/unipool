@@ -791,12 +791,11 @@ def add_existing(secret: str, pool: str, position: str, amount_x: float,
     """Tambah dana ke posisi yang sudah ada — rangenya TIDAK berubah, jadi bin
     batasnya dibaca dari posisi itu sendiri, bukan dari pemanggil."""
     p = pool_info(pool)
-    cur = None
-    d = sidecar("positions", owner=address_of(secret), pool=pool)
-    for raw in d.get("positions") or []:
-        if raw["address"] == position:
-            cur = raw
-            break
+    # `positions_by_key` membaca akun yang ditunjuk saja. Jangan diganti
+    # `positions` (tanpa alamat): itu memindai seluruh akun program DLMM dan
+    # Alchemy menolaknya 429.
+    d = sidecar("positions_by_key", pool=pool, positions=[position])
+    cur = next(iter(d.get("positions") or []), None)
     if cur is None:
         raise SolanaError("Posisi tidak ditemukan di pool itu.")
     return sidecar("add_existing", secret=secret, pool=pool, position=position,
@@ -862,6 +861,7 @@ def explorer_addr(addr: str) -> str:
 # tiap aksi SDK butuh alamat POOL-nya juga. Empat fungsi di bawah yang
 # menjembatani, supaya `chain.add_any/reduce_any/collect_any/close_any` tidak
 # perlu tahu apa pun tentang Meteora.
+_PRIORITY_DEFAULT = 20_000      # µlamport per compute unit (~0,000004 SOL/tx)
 _pool_of: dict[str, tuple[str, float]] = {}
 _POOL_OF_TTL = 3600.0      # pool sebuah posisi TIDAK pernah berubah
 
@@ -884,13 +884,18 @@ def pool_of_position(position: str) -> str:
 def priority_fee() -> int:
     """Priority fee (micro-lamport per CU) dari `SOLANA_PRIORITY_FEE`.
 
-    Default 0 = tanpa priority fee. Saat jaringan ramai, tx DLMM tanpa priority
-    fee tertinggal dan yang dilihat user cuma "timeout" — angka yang bisa
-    ditindaklanjuti harus bisa disetel tanpa menyentuh kode."""
+    Default `_PRIORITY_DEFAULT`, bukan 0. Tanpa priority fee, tx DLMM
+    tertinggal dan blockhash-nya kedaluwarsa sebelum masuk chain — terukur
+    menggagalkan rebalance di tengah alur. Ongkosnya dapat diabaikan: 20.000
+    µlamport/CU × ~200k CU = 4.000 lamport = **0,000004 SOL** per tx.
+    `SOLANA_PRIORITY_FEE=0` mematikannya."""
+    raw = (os.environ.get("SOLANA_PRIORITY_FEE") or "").strip()
+    if not raw:
+        return _PRIORITY_DEFAULT
     try:
-        return max(0, int(float(os.environ.get("SOLANA_PRIORITY_FEE") or 0)))
+        return max(0, int(float(raw)))
     except ValueError:
-        return 0
+        return _PRIORITY_DEFAULT
 
 
 def _steps(sigs, what: str) -> list[str]:
@@ -910,9 +915,8 @@ def add_any(secret: str, position: str, budget_quote: float,
     p = pool_info(pool)
     q_is_y = bool(p["quote_is_token1"])
     qdec = p["dec1"] if q_is_y else p["dec0"]
-    cur = sidecar("positions", owner=address_of(secret), pool=pool)
-    raw = next((x for x in cur.get("positions") or []
-                if x["address"] == position), None)
+    cur = sidecar("positions_by_key", pool=pool, positions=[position])
+    raw = next(iter(cur.get("positions") or []), None)
     if raw is None:
         raise SolanaError("Posisi tidak ditemukan di pool itu (sudah ditutup?).")
     kw = {("amount_y_raw" if q_is_y else "amount_x_raw"): _amt_raw(budget_quote, qdec)}
@@ -1284,9 +1288,35 @@ def _plan_pair(pool: str, lower: int, upper: int, shape: str,
             "side": d.get("side"), "active_bin": int(d["active_bin"])}
 
 
+def _swap_guarded(secret: str, pool: str, amount: float, swap_for_y: bool,
+                  slippage_pct: float, max_impact: float, steps: list,
+                  out: dict) -> dict:
+    """Swap komposisi dengan penjagaan price impact.
+
+    `minOut` TIDAK melindungi dari price impact — quoter sudah memasukkannya,
+    jadi swap yang menggerakkan harga pool berapa pun tetap "sesuai quote" dan
+    tidak pernah gagal. Aturan yang sama dengan `v4_swap` di jalur EVM, dan di
+    sini justru lebih perlu: mode Lower/Upper menjual SELURUH satu sisi, dan di
+    pool tipis itu bisa puluhan persen. Terukur pada WOJAK/SOL: menjual 52.026
+    WOJAK memberi impact **21,99%** — ~$10 dari $46."""
+    q = swap_quote(pool, amount, swap_for_y, slippage_pct)
+    imp = float(q.get("price_impact") or 0) / 100.0
+    if max_impact is not None and imp > max_impact:
+        raise SolanaError(
+            f"Swap komposisi price impact {imp * 100:.1f}% (batas "
+            f"{max_impact * 100:.0f}%) — pool ini terlalu tipis untuk menukar "
+            f"sebanyak itu sekaligus. Pilih mode Wide (tidak perlu menjual habis "
+            f"satu sisi), atau setujui impact-nya secara eksplisit.")
+    r = swap(secret, pool, amount, swap_for_y, slippage_pct, priority_fee())
+    steps += _steps(r.get("signatures"), f"Swap komposisi ({imp * 100:.1f}% impact)")
+    out["impact"] = max(float(out.get("impact") or 0), imp)
+    return r
+
+
 def _compose(secret: str, pool: str, p: dict, lower: int, upper: int,
              shape: str, have_x: float, have_y: float, slippage_pct: float,
-             steps: list) -> tuple[float, float]:
+             steps: list, max_impact: float | None = None,
+             out: dict | None = None) -> tuple[float, float]:
     """Tukar sebagian sisi supaya komposisinya pas untuk range ini.
 
     Swapnya DI POOL POSISI ITU SENDIRI, sama seperti swap komposisi jalur EVM.
@@ -1305,18 +1335,19 @@ def _compose(secret: str, pool: str, p: dict, lower: int, upper: int,
     probe = _plan_pair(pool, lower, upper, shape, p,
                        y=have_y if have_y > 0 else None,
                        x=None if have_y > 0 else have_x)
+    out = out if out is not None else {}
     if probe["side"] == "y_only":
         # Range butuh Y saja: seluruh X ditukar.
         if have_x > 0:
-            r = swap(secret, pool, have_x, True, slippage_pct, priority_fee())
-            steps += _steps(r.get("signatures"), "Swap komposisi")
+            r = _swap_guarded(secret, pool, have_x, True, slippage_pct,
+                              max_impact, steps, out)
             have_y += int(r.get("amount_out_raw") or 0) / 10 ** p["dec1"]
             have_x = 0.0
         return have_x, have_y
     if probe["side"] == "x_only":
         if have_y > 0:
-            r = swap(secret, pool, have_y, False, slippage_pct, priority_fee())
-            steps += _steps(r.get("signatures"), "Swap komposisi")
+            r = _swap_guarded(secret, pool, have_y, False, slippage_pct,
+                              max_impact, steps, out)
             have_x += int(r.get("amount_out_raw") or 0) / 10 ** p["dec0"]
             have_y = 0.0
         return have_x, have_y
@@ -1330,23 +1361,53 @@ def _compose(secret: str, pool: str, p: dict, lower: int, upper: int,
         need_y = (want_x - have_x) * pr
         amt = min(need_y, have_y)
         if amt > 0:
-            r = swap(secret, pool, amt, False, slippage_pct, priority_fee())
-            steps += _steps(r.get("signatures"), "Swap komposisi")
+            r = _swap_guarded(secret, pool, amt, False, slippage_pct,
+                              max_impact, steps, out)
             have_x += int(r.get("amount_out_raw") or 0) / 10 ** p["dec0"]
             have_y -= amt
     elif want_y > have_y:
         need_x = (want_y - have_y) / pr
         amt = min(need_x, have_x)
         if amt > 0:
-            r = swap(secret, pool, amt, True, slippage_pct, priority_fee())
-            steps += _steps(r.get("signatures"), "Swap komposisi")
+            r = _swap_guarded(secret, pool, amt, True, slippage_pct,
+                              max_impact, steps, out)
             have_y += int(r.get("amount_out_raw") or 0) / 10 ** p["dec1"]
             have_x -= amt
     return have_x, have_y
 
 
+def rebalance_impact(address: str, position: str, mode: str) -> float | None:
+    """Perkiraan price impact swap komposisi untuk mode ini — TANPA tx.
+
+    Ditampilkan di kartu SEBELUM user menekan tombol, sama seperti
+    `swap_impact_v4()` di jalur EVM. Mode Wide tidak menjual habis satu sisi,
+    jadi perkiraannya cuma dihitung untuk Lower/Upper."""
+    if mode not in ("lower", "upper"):
+        return None
+    try:
+        pool = pool_of_position(position)
+        p = pool_info(pool)
+        d = sidecar("positions_by_key", pool=pool, positions=[position])
+        raw = next(iter(d.get("positions") or []), None)
+        if not raw:
+            return None
+        q_is_y = bool(p["quote_is_token1"])
+        # Lower = 100% quote → sisi MEME yang dijual; Upper sebaliknya.
+        sell_x = (mode == "lower") == q_is_y
+        dec = p["dec0"] if sell_x else p["dec1"]
+        amt = ((int(raw["amount_x_raw"]) + int(raw["fee_x_raw"])) if sell_x
+               else (int(raw["amount_y_raw"]) + int(raw["fee_y_raw"]))) / 10 ** dec
+        if amt <= 0:
+            return None
+        q = swap_quote(pool, amt, sell_x, 5.0)
+        return float(q.get("price_impact") or 0) / 100.0
+    except Exception:
+        return None
+
+
 def rebalance_any(secret: str, position: str, mode: str = "wide",
-                  shape: str = "Spot", slippage_pct: float = 5.0) -> dict:
+                  shape: str = "Spot", slippage_pct: float = 5.0,
+                  max_impact: float | None = 0.25) -> dict:
     """Close posisi → swap komposisi sesuai mode → mint ulang dengan LEBAR range
     yang sama, diletakkan menurut mode terhadap harga sekarang.
 
@@ -1395,8 +1456,9 @@ def rebalance_any(secret: str, position: str, mode: str = "wide",
     st = pool_state(pool)
     active = int(st["active_bin"])
     lo, hi = rebalance_bins(width, active, mode, q_is_y)
+    swp: dict = {}
     got_x, got_y = _compose(secret, pool, p, lo, hi, shape, got_x, got_y,
-                            slippage_pct, steps)
+                            slippage_pct, steps, max_impact, swp)
 
     # Sisi PROBE dipilih dari sisi mana yang BERISI, bukan dari nama mode.
     # Setelah swap komposisi, mode satu sisi menyisakan dana hanya di satu sisi
@@ -1443,4 +1505,5 @@ def rebalance_any(secret: str, position: str, mode: str = "wide",
             "in0": dep_x, "in1": dep_y,
             "added_usd": dep_x * px0 + dep_y * px1,
             "left0": max(0.0, got_x - dep_x), "left1": max(0.0, got_y - dep_y),
+            "swap_impact": swp.get("impact"),
             "pool_info": p, "signatures": d.get("signatures")}
