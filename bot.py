@@ -644,11 +644,50 @@ async def with_progress(status, head: str, work):
         ch.set_progress(None)
 
 
+def out_of_range_side(p: dict) -> tuple[str, str]:
+    """(arah menurut harga yang DITAMPILKAN, simbol yang kini mengisi posisi).
+
+    Dihitung dari tick/bin, BUKAN dari market cap. Alert dulu memakai
+    `mc_now < mc_lower`, dan `mc_*` posisi DLMM SELALU None (bug supply di
+    `sol._position_detail`) — cabang itu jadi permanen False sehingga posisi
+    yang JATUH dilaporkan "keluar ke ATAS" berikut token yang salah. Terukur
+    pada PONDER/SOL: harga 0.0₅191 di bawah batas bawah 0.0₅199, alert menulis
+    naik dan "posisi jadi penuh SOL" padahal isinya justru penuh PONDER.
+
+    Aturan sisinya SAMA untuk Uniswap dan DLMM:
+
+    - `cur < lower` → posisi 100% **token0**. v3/v4: harga di bawah range.
+      DLMM: seluruh bin posisi ada DI ATAS bin aktif, dan bin di atas memegang
+      token X = token0.
+    - `cur > upper` → posisi 100% **token1**.
+
+    Yang BERBEDA cuma arah yang ditulis: user membaca harga quote-per-meme,
+    jadi saat quote = token0 hubungannya terbalik terhadap tick/bin."""
+    cur = int(p.get("cur_tick") or 0)
+    lo = int(p.get("tick_lower") or 0)
+    below = cur < lo                      # sisi token0
+    sym = (p.get("sym0") if below else p.get("sym1")) or "?"
+    # naik menurut harga tampilan: tick naik = harga naik HANYA kalau quote token1
+    naik = (not below) == bool(p.get("quote_is_token1"))
+    return ("tembus ke ATAS" if naik else "tembus ke BAWAH"), sym
+
+
 def range_str(p: dict) -> str:
     # DLMM: batas range sudah dihitung dari BIN (`(1+bin_step/1e4)^id`), bukan
     # dari tick (`1,0001^tick`). Menjalankannya lewat matematika tick meleset
     # sebesar pangkat bin_step — terukur pada posisi SOL/USDC bin step 4:
     # range 104,44–110,98 dilaporkan sebagai 568,43–577,08.
+    # Market cap kalau ada — jauh lebih gampang dibaca daripada 0.0₅199, dan
+    # itu juga satuan yang dipakai TP/SL. Batasnya DIURUTKAN: saat quote =
+    # token0 (`quote_is_token1` False) harga dibalik, jadi `mc_lower` yang
+    # dihitung dari batas bawah tick/bin justru yang lebih BESAR.
+    if p.get("mc_now") and p.get("mc_lower") and p.get("mc_upper"):
+        a, b = sorted((p["mc_lower"], p["mc_upper"]))
+        ekor = f" · {p.get('n_bins')} bin" if p.get("ver") == 5 else ""
+        return (f"MC {ch.fmt_usd(a)}–{ch.fmt_usd(b)} "
+                f"(now {ch.fmt_usd(p['mc_now'])}){ekor}")
+    # DLMM tanpa market cap (supply token tidak terbaca): batas range sudah
+    # dihitung dari BIN, bukan dari tick.
     if p.get("ver") == 5:
         lo, hi = p.get("price_lower") or 0, p.get("price_upper") or 0
         now = p.get("price_now")
@@ -656,12 +695,10 @@ def range_str(p: dict) -> str:
             bs, d0, d1 = p.get("bin_step") or 0, p.get("dec0") or 0, p.get("dec1") or 0
             raw = (1.0 + bs / 10_000.0) ** int(p.get("cur_tick") or 0) * 10 ** (d0 - d1)
             now = raw if p.get("quote_is_token1") else (1 / raw if raw else 0)
+        if lo > hi:
+            lo, hi = hi, lo
         return (f"{ch.fmt_price(lo)}–{ch.fmt_price(hi)} (now {ch.fmt_price(now)}) "
                 f"· {p.get('n_bins')} bin")
-    # tampil market cap kalau ada (lebih gampang dibaca daripada harga 0.0₆xx)
-    if p.get("mc_now"):
-        return (f"MC {ch.fmt_usd(p['mc_lower'])}–{ch.fmt_usd(p['mc_upper'])} "
-                f"(now {ch.fmt_usd(p['mc_now'])})")
     def tick_price(t):
         raw = ch.tick_to_price(t)
         if p["quote_is_token1"]:
@@ -6559,10 +6596,8 @@ async def _emit_range_alerts(app, cid: int, positions: list[dict]):
         if now_in:
             head = f"🟢 <b>{esc(meme_sym)} {_pos_disp(p)} MASUK range</b> — fee mulai mengalir."
         else:
-            if p.get("mc_now") and p.get("mc_lower") and p["mc_now"] < p["mc_lower"]:
-                arah = f"tembus ke BAWAH — posisi jadi penuh {esc(meme_sym)}"
-            else:
-                arah = f"keluar ke ATAS — posisi jadi penuh {esc(p['quote_sym'] or 'quote')}"
+            gerak, isi = out_of_range_side(p)
+            arah = f"{gerak} — posisi jadi penuh {esc(isi)}"
             head = f"🔴 <b>{esc(meme_sym)} {_pos_disp(p)} KELUAR range</b> — {arah}. Fee berhenti."
         body = (f"{head}\n"
                 f"Val {ch.fmt_usd(p['value_usd'])} · Unclaimed {ch.fmt_usd(p['unclaimed_usd'])}\n"

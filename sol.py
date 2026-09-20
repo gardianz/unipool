@@ -642,7 +642,14 @@ def _position_detail(raw: dict, pinfo: dict, active_bin: int | None = None) -> d
         if not q_is_t1:
             pr = 1 / pr if pr else 0.0
         qusd = pinfo.get("quote_usd") or (px1 if q_is_t1 else px0)
-        supply = float((pinfo.get("supply") or 0)) or 0.0
+        # Supply-nya milik sisi MEME, dan `pool_info` menamainya per-sisi
+        # (`supply0`/`supply1`) — kunci "supply" polos TIDAK PERNAH ada, jadi
+        # seluruh mc_* posisi DLMM bernilai None. Akibatnya bukan cuma range
+        # yang tampil sebagai harga: alert range memakai `mc_now < mc_lower`
+        # untuk menentukan arah, dan None membuat cabang itu selalu False
+        # sehingga posisi yang JATUH dilaporkan "keluar ke ATAS" berikut token
+        # yang salah (terukur pada PONDER/SOL).
+        supply = float(pinfo.get("supply0" if q_is_t1 else "supply1") or 0) or 0.0
         return pr * qusd * supply if supply else None
 
     return {

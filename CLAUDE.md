@@ -815,11 +815,56 @@ Umur posisi tetap "?": payload ini tidak memuat waktu mint (`updatedAt` itu
 perubahan terakhir), dan `lastUpdatedAt` dari SDK juga bukan waktu lahirnya.
 Jadi APR posisi Solana juga tidak dihitung — bukan diisi tebakan.
 
+#### Market cap DLMM: satu kunci salah nama yang mematikan tiga hal
+
+`_mc()` di `_position_detail` membaca `pinfo.get("supply")` — kunci itu **tidak
+pernah ada**. `pool_info()` menamainya per sisi (`supply0`/`supply1`), jadi
+`mc_lower`/`mc_upper`/`mc_now` SELURUH posisi DLMM bernilai `None`, diam-diam,
+tanpa satu pun error.
+
+Akibatnya tiga, dan yang kedua yang paling berbahaya:
+
+- **Range tampil sebagai harga mentah** (`0.0₅199–0.0₅797`) padahal cabang
+  market cap di `range_str()` sudah ada — ia cuma tidak pernah kebagian data.
+- **Arah alert SELALU "keluar ke ATAS".** Alert memakai
+  `mc_now and mc_lower and mc_now < mc_lower` untuk memutuskan arah, dan `None`
+  membuat syarat itu permanen False. Terukur pada PONDER/SOL: harga
+  **0.0₅191 di bawah** batas bawah 0.0₅199, tapi alertnya menulis naik DAN
+  "posisi jadi penuh SOL" padahal isinya justru penuh PONDER — kebalikan
+  keduanya, untuk keputusan yang user pakai memilih rebalance.
+- **Order TP/SL Solana mati senyap.** Tidak ada penolakan di `ask_tpsl` (dan
+  tidak pernah ada) — kartunya tampil, order tersimpan, lalu `_check_orders`
+  melewatinya selamanya karena `if not mc: continue`.
+
+Supply-nya milik sisi **MEME**, jadi `supply0` kalau quote token1, `supply1`
+kalau sebaliknya. Sesudah diperbaiki, 6 posisi hidup semuanya punya MC —
+PAID $9,2jt–$16,1jt (now $16,4jt), PONDER $215,3k–$861,0k — dan
+**TP/SL Solana jadi benar-benar hidup**: `close_any` sudah punya cabang ver 5,
+`_check_orders` generik, jadi tidak ada kode baru yang perlu ditulis. Itu
+perubahan jalur DANA yang lahir dari perbaikan pembacaan, bukan dari fitur
+baru — sebut ke user, jangan biarkan ia menemukannya sendiri saat posisi
+tertutup otomatis.
+
+**Arah out-of-range dihitung dari TICK/BIN, bukan dari market cap**
+(`out_of_range_side()`), supaya ia tetap benar walau MC tak terbaca. Aturan
+sisinya SAMA untuk Uniswap dan DLMM:
+
+- `cur < lower` → posisi 100% **token0**. v3/v4: harga di bawah range. DLMM:
+  seluruh bin posisi ada DI ATAS bin aktif, dan bin di atas memegang token X.
+- `cur > upper` → posisi 100% **token1**.
+
+Yang berbeda cuma KATA arahnya: user membaca harga quote-per-meme, jadi saat
+quote = token0 hubungannya terbalik terhadap tick/bin. Diuji untuk keempat
+kombinasi (dua orientasi × dua sisi).
+
+**Batas MC harus DIURUTKAN sebelum ditulis.** Untuk quote = token0 harganya
+dibalik, jadi `mc_lower` (dari batas bawah tick/bin) justru yang lebih BESAR.
+
 #### Yang belum ada untuk Solana
 
 Swap komposisi otomatis, pindah pool, revoke approval (Solana tidak punya
-allowance), order TP/SL, dan `/cleanup`. Semuanya menolak dengan pesan yang
-menyebut alasannya, bukan gagal diam-diam.
+allowance), dan `/cleanup`. Semuanya menolak dengan pesan yang menyebut
+alasannya, bukan gagal diam-diam.
 
 ### Dispatch versi pool
 
