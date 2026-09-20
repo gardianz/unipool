@@ -121,6 +121,63 @@ async function sendOne(conn, tx, signers, microLamports) {
                   + "JANGAN langsung mengulang, cek dulu di solscan.");
 }
 
+/* Jupiter dipanggil lewat `lite-api` (tanpa key) atau `api` (dengan key).
+ * Node 24 punya `fetch` global, jadi tidak ada dependensi baru. */
+function jupBase(req) {
+  return req && req.jupiter_api_key
+    ? "https://api.jup.ag/swap/v1" : "https://lite-api.jup.ag/swap/v1";
+}
+
+async function jupFetch(path, init, req) {
+  const headers = { "content-type": "application/json", accept: "application/json" };
+  if (req && req.jupiter_api_key) headers["x-api-key"] = req.jupiter_api_key;
+  const r = await fetch(jupBase(req) + path, { ...(init || {}), headers });
+  const text = await r.text();
+  let body;
+  try { body = JSON.parse(text); } catch (_) { body = null; }
+  if (!r.ok) {
+    throw new Error(`Jupiter HTTP ${r.status}: ${(body && (body.error || body.message))
+                     || text.slice(0, 200)}`);
+  }
+  return body;
+}
+
+async function jupQuote(req) {
+  const q = new URLSearchParams({
+    inputMint: String(req.input_mint),
+    outputMint: String(req.output_mint),
+    amount: String(req.amount_in_raw),
+    slippageBps: String(Math.round(Number(req.slippage_bps || 100))),
+  });
+  // maxAccounts menjaga tx tetap muat: rute panjang bisa melewati batas akun.
+  if (req.max_accounts) q.set("maxAccounts", String(req.max_accounts));
+  return jupFetch(`/quote?${q.toString()}`, { method: "GET" }, req);
+}
+
+/* Kirim tx yang SUDAH ditandatangani (Jupiter membangunnya sendiri, lengkap
+ * dengan blockhash-nya), lalu tunggu dengan aturan yang sama: periksa status,
+ * siarkan ulang raw yang identik, dan periksa SEKALI LAGI sebelum menyerah. */
+async function sendSigned(conn, raw) {
+  SENT += 1;
+  const sig = await conn.sendRawTransaction(raw, { skipPreflight: false, maxRetries: 5 });
+  const t0 = Date.now();
+  let lastSend = t0;
+  while (Date.now() - t0 < CONFIRM_TIMEOUT_MS) {
+    await new Promise((r) => setTimeout(r, 1200));
+    const st = await conn.getSignatureStatuses([sig], { searchTransactionHistory: true });
+    const v = (st && st.value && st.value[0]) || null;
+    if (v && v.err) throw new Error(`Tx ${sig} gagal di chain: ${JSON.stringify(v.err)}`);
+    if (v && (v.confirmationStatus === "confirmed" || v.confirmationStatus === "finalized")) {
+      return sig;
+    }
+    if (Date.now() - lastSend > REBROADCAST_MS) {
+      lastSend = Date.now();
+      try { await conn.sendRawTransaction(raw, { skipPreflight: true }); } catch (_) {}
+    }
+  }
+  throw new Error(`Tx ${sig} belum terkonfirmasi — cek dulu di solscan sebelum mengulang.`);
+}
+
 async function sendAll(conn, txs, kp, microLamports) {
   const list = Array.isArray(txs) ? txs : [txs];
   const out = [];
@@ -365,6 +422,65 @@ const CMDS = {
       }
     }
     return { positions: out };
+  },
+
+  /* ── Jupiter: agregator SELURUH likuiditas Solana ────────────────────────
+   *
+   * Swap komposisi TIDAK boleh jalan di pool posisi sendiri. Pool DLMM satu
+   * pasangan itu satu venue tipis; Jupiter merutekan lintas Raydium, Orca,
+   * Whirlpool, HumidiFi, DAN pool DLMM lain yang lebih dalam. Terukur pada
+   * WOJAK/SOL, jumlah yang sama persis:
+   *
+   *   5.000 WOJAK  pool posisi 2,96% impact  ->  Jupiter 0,00%  (+6,1% SOL)
+   *  20.000        7,18%                        0,00%          (+9,3%)
+   *  33.290        9,97%                        0,24%          (+12,3%)
+   *  52.026       13,28%                        0,26%          (+16,5%)
+   *
+   * Bahkan saat Jupiter tetap lewat Meteora DLMM ia menang — ia memilih pool
+   * DLMM yang lebih dalam, bukan pool posisi. Pelajaran yang sama persis dengan
+   * "swap v4 dirutekan ke pool TERBAIK, bukan pool posisi" di jalur EVM. */
+  async jup_quote(req) {
+    return { quote: await jupQuote(req) };
+  },
+
+  async jup_swap(req, conn, kp) {
+    const quote = req.quote || await jupQuote(req);
+    const body = {
+      quoteResponse: quote,
+      userPublicKey: kp.publicKey.toBase58(),
+      // wSOL dibungkus/dibuka di dalam tx yang sama — tanpa ini sisi SOL native
+      // butuh akun wSOL yang diurus sendiri.
+      wrapAndUnwrapSol: true,
+      dynamicComputeUnitLimit: true,
+    };
+    if (Number(req.priority_micro_lamports) > 0) {
+      body.prioritizationFeeLamports = {
+        priorityLevelWithMaxLamports: { maxLamports: 2_000_000, priorityLevel: "high" },
+      };
+    }
+    const r = await jupFetch("/swap", { method: "POST", body: JSON.stringify(body) }, req);
+    if (!r.swapTransaction) throw new Error("Jupiter tidak mengembalikan transaksi");
+    const raw = Buffer.from(r.swapTransaction, "base64");
+    const tx = web3.VersionedTransaction.deserialize(raw);
+    tx.sign([kp]);
+    if (req.dry) {
+      // Verifikasi jalur tanpa mengirim: tx sudah dibangun Jupiter, sudah
+      // dideserialisasi, dan sudah ditandatangani wallet ini.
+      return { dry: true, signed_bytes: tx.serialize().length,
+               amount_in_raw: s(quote.inAmount), amount_out_raw: s(quote.outAmount),
+               min_amount_out_raw: s(quote.otherAmountThreshold),
+               price_impact: Number(quote.priceImpactPct || 0) * 100,
+               route: (quote.routePlan || []).map((x) => (x.swapInfo || {}).label).join("+") };
+    }
+    const sig = await sendSigned(conn, tx.serialize());
+    return {
+      signatures: [sig],
+      amount_in_raw: s(quote.inAmount),
+      amount_out_raw: s(quote.outAmount),
+      min_amount_out_raw: s(quote.otherAmountThreshold),
+      price_impact: Number(quote.priceImpactPct || 0) * 100,
+      route: (quote.routePlan || []).map((x) => (x.swapInfo || {}).label).join("+"),
+    };
   },
 
   async swap_quote(req, conn) {

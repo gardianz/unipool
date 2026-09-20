@@ -829,6 +829,100 @@ def close(secret: str, pool: str, position: str, priority: int = 0) -> dict:
                    priority_micro_lamports=int(priority))
 
 
+def jupiter_key() -> str | None:
+    return (os.environ.get("JUPITER_API_KEY") or "").strip() or None
+
+
+def best_quote(p: dict, amount_in: float, swap_for_y: bool,
+               slippage_pct: float = 1.0) -> dict:
+    """Quote swap TERBAIK: Jupiter (agregator) dulu, pool posisi cadangan.
+
+    Swap komposisi TIDAK boleh jalan di pool posisi sendiri — itu satu venue
+    tipis. Terukur pada WOJAK/SOL untuk jumlah yang sama persis:
+
+    | WOJAK | pool posisi | Jupiter | selisih |
+    |---|---|---|---|
+    | 5.000 | 2,96% impact | 0,00% | +6,1% SOL |
+    | 20.000 | 7,18% | 0,00% | +9,3% |
+    | 33.290 | 9,97% | 0,24% | +12,3% |
+    | 52.026 | 13,28% | 0,26% | **+16,5%** |
+
+    Bahkan saat Jupiter tetap lewat Meteora DLMM ia menang, karena ia memilih
+    pool DLMM yang lebih DALAM — bukan pool posisi. Pelajaran yang sama persis
+    dengan "swap v4 dirutekan ke pool TERBAIK, bukan pool posisi" di EVM.
+
+    Kegagalan Jupiter TIDAK membatalkan swap: jalur pool selalu jadi cadangan,
+    sama seperti "kegagalan routing tidak boleh membatalkan swap" di `v4_swap`."""
+    mint_in = p["token0"] if swap_for_y else p["token1"]
+    mint_out = p["token1"] if swap_for_y else p["token0"]
+    dec_in = p["dec0"] if swap_for_y else p["dec1"]
+    dec_out = p["dec1"] if swap_for_y else p["dec0"]
+    try:
+        d = sidecar("jup_quote", input_mint=mint_in, output_mint=mint_out,
+                    amount_in_raw=_amt_raw(amount_in, dec_in),
+                    slippage_bps=int(round(float(slippage_pct) * 100)),
+                    max_accounts=50, jupiter_api_key=jupiter_key())
+        q = d.get("quote") or {}
+        out = int(q.get("outAmount") or 0)
+        if out > 0:
+            jup = {"venue": "jupiter", "quote": q,
+                   "amount_out": out / 10 ** dec_out,
+                   "min_out": int(q.get("otherAmountThreshold") or 0) / 10 ** dec_out,
+                   # `priceImpactPct` Jupiter itu PECAHAN ("0.0264" = 2,64%),
+                   # bukan persen — dikalikan 100 lagi akan menampilkan 264%.
+                   "impact": float(q.get("priceImpactPct") or 0),
+                   "route": "+".join(dict.fromkeys(
+                       (x.get("swapInfo") or {}).get("label", "?")
+                       for x in q.get("routePlan") or []))}
+            # Jupiter mengoptimalkan HASIL, bukan impact, dan untuk jumlah kecil
+            # ia kadang memilih satu rute sederhana yang justru tipis. Pool
+            # posisi baru dibandingkan kalau impact-nya masih di atas 1% —
+            # supaya kartu tidak membayar dua quote untuk kasus yang lazim.
+            if jup["impact"] <= 0.01:
+                return jup
+            try:
+                pq = swap_quote(p["pool"], amount_in, swap_for_y, slippage_pct)
+                pool_out = int(pq.get("amount_out_raw") or 0) / 10 ** dec_out
+                if pool_out > jup["amount_out"]:
+                    return {"venue": "pool", "quote": None,
+                            "amount_out": pool_out,
+                            "min_out": int(pq.get("min_amount_out_raw") or 0) / 10 ** dec_out,
+                            "impact": float(pq.get("price_impact") or 0) / 100.0,
+                            "route": "Meteora DLMM (pool posisi)"}
+            except Exception:
+                pass
+            return jup
+    except Exception:
+        pass
+    q = swap_quote(p["pool"], amount_in, swap_for_y, slippage_pct)
+    return {"venue": "pool", "quote": None,
+            "amount_out": int(q.get("amount_out_raw") or 0) / 10 ** dec_out,
+            "min_out": int(q.get("min_amount_out_raw") or 0) / 10 ** dec_out,
+            "impact": float(q.get("price_impact") or 0) / 100.0,
+            "route": "Meteora DLMM (pool posisi)"}
+
+
+def best_swap(secret: str, p: dict, amount_in: float, swap_for_y: bool,
+              slippage_pct: float, q: dict | None = None) -> dict:
+    """Eksekusi swap lewat venue terbaik. `q` = hasil `best_quote` yang sudah
+    dihitung, supaya rutenya sama dengan yang ditampilkan di kartu."""
+    q = q or best_quote(p, amount_in, swap_for_y, slippage_pct)
+    dec_out = p["dec1"] if swap_for_y else p["dec0"]
+    if q["venue"] == "jupiter":
+        d = sidecar("jup_swap", secret=secret, quote=q["quote"],
+                    priority_micro_lamports=priority_fee(),
+                    jupiter_api_key=jupiter_key())
+        return {"signatures": d.get("signatures"),
+                "got": int(d.get("amount_out_raw") or 0) / 10 ** dec_out,
+                "impact": float(d.get("price_impact") or 0) / 100.0,
+                "route": d.get("route") or "Jupiter"}
+    d = swap(secret, p["pool"], amount_in, swap_for_y, slippage_pct, priority_fee())
+    return {"signatures": d.get("signatures"),
+            "got": int(d.get("amount_out_raw") or 0) / 10 ** dec_out,
+            "impact": float(d.get("price_impact") or 0) / 100.0,
+            "route": "Meteora DLMM (pool posisi)"}
+
+
 def swap_quote(pool: str, amount_in: float, swap_for_y: bool,
                slippage_pct: float = 1.0) -> dict:
     p = pool_info(pool)
@@ -1288,7 +1382,7 @@ def _plan_pair(pool: str, lower: int, upper: int, shape: str,
             "side": d.get("side"), "active_bin": int(d["active_bin"])}
 
 
-def _swap_guarded(secret: str, pool: str, amount: float, swap_for_y: bool,
+def _swap_guarded(secret: str, p: dict, amount: float, swap_for_y: bool,
                   slippage_pct: float, max_impact: float, steps: list,
                   out: dict) -> dict:
     """Swap komposisi dengan penjagaan price impact.
@@ -1299,18 +1393,21 @@ def _swap_guarded(secret: str, pool: str, amount: float, swap_for_y: bool,
     sini justru lebih perlu: mode Lower/Upper menjual SELURUH satu sisi, dan di
     pool tipis itu bisa puluhan persen. Terukur pada WOJAK/SOL: menjual 52.026
     WOJAK memberi impact **21,99%** — ~$10 dari $46."""
-    q = swap_quote(pool, amount, swap_for_y, slippage_pct)
-    imp = float(q.get("price_impact") or 0) / 100.0
+    q = best_quote(p, amount, swap_for_y, slippage_pct)
+    imp = float(q["impact"])
     if max_impact is not None and imp > max_impact:
         raise SolanaError(
-            f"Swap komposisi price impact {imp * 100:.1f}% (batas "
-            f"{max_impact * 100:.0f}%) — pool ini terlalu tipis untuk menukar "
-            f"sebanyak itu sekaligus. Pilih mode Wide (tidak perlu menjual habis "
-            f"satu sisi), atau setujui impact-nya secara eksplisit.")
-    r = swap(secret, pool, amount, swap_for_y, slippage_pct, priority_fee())
-    steps += _steps(r.get("signatures"), f"Swap komposisi ({imp * 100:.1f}% impact)")
-    out["impact"] = max(float(out.get("impact") or 0), imp)
-    return r
+            f"Swap komposisi price impact {imp * 100:.1f}% lewat {q['route']} "
+            f"(batas {max_impact * 100:.0f}%) — likuiditasnya terlalu tipis untuk "
+            f"menukar sebanyak itu sekaligus. Pilih mode Wide (tidak perlu menjual "
+            f"habis satu sisi), atau naikkan batas impact di /settings.")
+    r = best_swap(secret, p, amount, swap_for_y, slippage_pct, q)
+    steps += _steps(r.get("signatures"),
+                    f"Swap komposisi lewat {r['route']} ({r['impact'] * 100:.2f}% impact)")
+    out["impact"] = max(float(out.get("impact") or 0), r["impact"])
+    out["route"] = r["route"]
+    return {"amount_out_raw": _amt_raw(
+        r["got"], p["dec1"] if swap_for_y else p["dec0"])}
 
 
 def _compose(secret: str, pool: str, p: dict, lower: int, upper: int,
@@ -1339,14 +1436,14 @@ def _compose(secret: str, pool: str, p: dict, lower: int, upper: int,
     if probe["side"] == "y_only":
         # Range butuh Y saja: seluruh X ditukar.
         if have_x > 0:
-            r = _swap_guarded(secret, pool, have_x, True, slippage_pct,
+            r = _swap_guarded(secret, p, have_x, True, slippage_pct,
                               max_impact, steps, out)
             have_y += int(r.get("amount_out_raw") or 0) / 10 ** p["dec1"]
             have_x = 0.0
         return have_x, have_y
     if probe["side"] == "x_only":
         if have_y > 0:
-            r = _swap_guarded(secret, pool, have_y, False, slippage_pct,
+            r = _swap_guarded(secret, p, have_y, False, slippage_pct,
                               max_impact, steps, out)
             have_x += int(r.get("amount_out_raw") or 0) / 10 ** p["dec0"]
             have_y = 0.0
@@ -1361,7 +1458,7 @@ def _compose(secret: str, pool: str, p: dict, lower: int, upper: int,
         need_y = (want_x - have_x) * pr
         amt = min(need_y, have_y)
         if amt > 0:
-            r = _swap_guarded(secret, pool, amt, False, slippage_pct,
+            r = _swap_guarded(secret, p, amt, False, slippage_pct,
                               max_impact, steps, out)
             have_x += int(r.get("amount_out_raw") or 0) / 10 ** p["dec0"]
             have_y -= amt
@@ -1369,7 +1466,7 @@ def _compose(secret: str, pool: str, p: dict, lower: int, upper: int,
         need_x = (want_y - have_y) / pr
         amt = min(need_x, have_x)
         if amt > 0:
-            r = _swap_guarded(secret, pool, amt, True, slippage_pct,
+            r = _swap_guarded(secret, p, amt, True, slippage_pct,
                               max_impact, steps, out)
             have_y += int(r.get("amount_out_raw") or 0) / 10 ** p["dec1"]
             have_x -= amt
@@ -1399,8 +1496,7 @@ def rebalance_impact(address: str, position: str, mode: str) -> float | None:
                else (int(raw["amount_y_raw"]) + int(raw["fee_y_raw"]))) / 10 ** dec
         if amt <= 0:
             return None
-        q = swap_quote(pool, amt, sell_x, 5.0)
-        return float(q.get("price_impact") or 0) / 100.0
+        return float(best_quote(p, amt, sell_x, 5.0)["impact"])
     except Exception:
         return None
 

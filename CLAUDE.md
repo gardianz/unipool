@@ -389,11 +389,44 @@ Tiga hal lain yang gampang salah di jalur ini:
   dihitung ulang sesudah swap. Tanpa itu mode satu sisi bisa menyentuh bin aktif
   lagi dan menarik sisi lawan yang tidak diminta.
 
-Swap komposisinya memakai `swapQuote` pool itu sendiri, dan **rasio deposit
-untuk sebuah range+shape itu TETAP** sedangkan `autoFill*` linear terhadap
-jumlah — jadi satu probe cukup: dari `(y0, x0)` hasil probe, faktor skalanya
-`k = nilai_total / nilai_probe` dan target tiap sisi `k × sisi_probe`. Tanpa
-penskalaan itu sisa yang tidak terpakai bisa puluhan persen dari modal.
+**Swap komposisi dirutekan lewat JUPITER, bukan pool posisi.** Ini bukan
+optimasi — pool DLMM satu pasangan itu SATU venue tipis, dan menjual habis satu
+sisi di sana (yang memang arti mode Lower/Upper) membayar puluhan persen.
+Terukur pada WOJAK/SOL, jumlah yang sama persis pada saat yang sama:
+
+| WOJAK | pool posisi | Jupiter | selisih hasil |
+|---|---|---|---|
+| 5.000 | 0,040135 SOL · 2,90% | 0,042800 SOL · 1,91% | **+6,6%** |
+| 20.000 | 0,152736 · 6,84% | 0,171036 · 1,99% | **+12,0%** |
+| 33.290 | 0,246236 · 9,77% | 0,284821 · 1,96% | **+15,7%** |
+| 52.026 | 0,370336 · 13,17% | 0,444963 · 2,00% | **+20,2%** |
+
+Bahkan saat Jupiter tetap lewat Meteora DLMM ia menang, karena ia memilih pool
+DLMM yang lebih DALAM — bukan pool posisi. Pelajaran yang sama persis dengan
+"swap v4 dirutekan ke pool TERBAIK, dan patokannya quoter" di jalur EVM, dan
+alasannya sama: venue yang dipakai posisi belum tentu venue terbaik.
+
+`best_quote()` mencoba Jupiter dulu. **Kalau impact Jupiter masih di atas 1%,
+pool posisi ikut di-quote dan yang HASILNYA lebih besar yang menang** — Jupiter
+mengoptimalkan hasil, bukan impact, dan untuk jumlah kecil ia kadang memilih
+satu rute sederhana yang justru tipis. Kegagalan Jupiter TIDAK membatalkan
+swap; jalur pool selalu jadi cadangan, aturan yang sama dengan "kegagalan
+routing tidak boleh membatalkan swap" di `v4_swap`.
+
+**`priceImpactPct` Jupiter itu PECAHAN** (`"0.0264"` = 2,64%), bukan persen —
+mengalikannya 100 lagi menampilkan 264%.
+
+Selain venue, **rasio deposit untuk sebuah range+shape itu TETAP** sedangkan
+`autoFill*` linear terhadap jumlah — jadi satu probe cukup: dari `(y0, x0)`
+hasil probe, faktor skalanya `k = nilai_total / nilai_probe` dan target tiap
+sisi `k × sisi_probe`. Tanpa penskalaan itu sisa yang tidak terpakai bisa
+puluhan persen dari modal.
+
+**Price impact dijaga terpisah, karena `minOut` tidak menahannya** — quoter
+sudah memasukkan impact, jadi swap sebesar apa pun tetap "sesuai quote".
+`_swap_guarded()` menolak di atas `impact_limit()`, dan `rebalance_impact()`
+menghitungnya TANPA tx sehingga kartu langkah-2 menyebut angkanya SEBELUM
+tombol ditekan — aturan yang sama dengan `swap_impact_v4()` di EVM.
 
 **Hanya dana HASIL posisi ini yang dipakai**, sama seperti EVM. Jumlahnya dari
 snapshot tepat sebelum close (pokok + fee), lalu dijepit ke saldo NYATA —
