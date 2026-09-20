@@ -8585,11 +8585,11 @@ def assert_position_open(w3: Web3, chain_id: int, pid) -> None:
 def compound_any(chain_id: int, pk: str, pid, slippage_pct: float = 5.0) -> dict:
     """Reinvestasi fee unclaimed ke posisi yang SAMA. Tidak memakai saldo wallet lain.
 
-    **Belum ada untuk DLMM.** Bukan karena tidak mungkin, tapi karena fee DLMM
-    ditarik ke WALLET saat diklaim (tidak mengendap di posisi seperti v3, dan
-    tidak bisa dikreditkan terhadap tagihan seperti v4). Jadi "compound"-nya
-    adalah Claim lalu Add — dua aksi yang tombolnya SUDAH ada, dan menyatukannya
-    diam-diam akan menyembunyikan bahwa dananya sempat mampir ke wallet.
+    - **DLMM (Solana)** — fee DIKLAIM lalu langsung disetor kembali ke RANGE
+      YANG SAMA di dalam SATU simulasi `rebalancePosition`, jadi tidak ada jeda
+      di mana dana itu menganggur di wallet. Bin batasnya dinyatakan sebagai
+      delta terhadap bin aktif sehingga rangenya persis tidak bergeser, dan
+      pokoknya tidak disentuh (`withdraws: []`).
 
     Jalannya beda per versi karena perlakuan fee-nya memang beda:
 
@@ -8604,10 +8604,7 @@ def compound_any(chain_id: int, pk: str, pid, slippage_pct: float = 5.0) -> dict
     """
     ver, ref = parse_pid(pid)
     if ver == 5:
-        raise RuntimeError(
-            "Compound belum ada untuk Meteora DLMM. Fee DLMM ditarik ke WALLET "
-            "saat diklaim, jadi compound-nya = Claim fee lalu Add — dua tombol "
-            "yang sudah ada di kartu ini.")
+        return _sol().compound_bridge(pk, str(ref), slippage_pct=slippage_pct)
     if ver == 2:
         raise RuntimeError("Fee LP v2 sudah auto-compound ke dalam posisi — "
                            "tidak ada yang perlu di-compound.")
@@ -8800,7 +8797,8 @@ def _convert_quote(w3: Web3, chain_id: int, pk: str, src_q: str, dst_q: str,
 
 
 def rebalance_position(chain_id: int, pk: str, pid, mode: str, slippage_pct: float,
-                       gap: int = 1, target_pool: dict | None = None) -> dict:
+                       gap: int = 1, target_pool: dict | None = None,
+                       shape: str | None = None) -> dict:
     """Close posisi → swap komposisi sesuai mode → mint ulang dengan lebar range
     sama, dipusatkan di harga sekarang. Fee unclaimed ikut ter-reinvest.
     Hanya dana HASIL posisi ini yang dipakai (delta saldo, bukan seluruh wallet).
@@ -8810,13 +8808,22 @@ def rebalance_position(chain_id: int, pk: str, pid, mode: str, slippage_pct: flo
     lewat `_convert_quote()` (sadar ETH native) sebelum mint, dan jumlah yang dipakai
     dibaca dari delta saldo NYATA, bukan estimasi."""
     if is_solana(chain_id) or str(pid).startswith("dlmm:"):
-        # Rebalance = close + mint ulang, dan jalur mint DLMM memilih SHAPE
-        # (Spot/Curve/Bid-Ask) yang tidak punya padanan di mode EVM
-        # (wide/lower/upper). Menebak shape-nya berarti memindahkan dana user ke
-        # bentuk likuiditas yang tidak pernah ia pilih.
-        raise RuntimeError(
-            "Rebalance otomatis belum ada untuk Meteora DLMM — Close posisi ini "
-            "lalu buat posisi baru dengan range + shape yang Anda pilih sendiri.")
+        if target_pool:
+            # Pindah pool = posisi baru di pool lain; akun posisi DLMM terikat ke
+            # satu lbPair dan tidak bisa dipindahkan.
+            raise RuntimeError(
+                "Pindah pool belum ada untuk Meteora DLMM — Close posisi ini "
+                "lalu buat posisi baru di pool tujuan.")
+        # DLMM rebalance DI TEMPAT lewat SDK: akun posisinya tidak ditutup,
+        # sewanya tidak dilepas lalu dibayar lagi, dan pid-nya tetap sehingga
+        # riwayat PnL tidak terputus. Lebar range dipertahankan apa adanya dan
+        # selalu dipusatkan di bin aktif — arti yang sama dengan mode EVM
+        # wide/lower/upper ("lebar lama, dipusatkan di harga sekarang"), jadi
+        # `mode` dan `gap` tidak dipakai.
+        _, _ref = parse_pid(pid)
+        return _sol().rebalance_any(pk, str(_ref), mode=mode,
+                                    shape=(shape or "Spot"),
+                                    slippage_pct=slippage_pct)
     ver, ref = parse_pid(pid)
     if ver == 2:
         raise RuntimeError("Posisi v2 full-range — tidak perlu rebalance.")

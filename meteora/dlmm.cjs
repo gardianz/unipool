@@ -68,6 +68,22 @@ async function sendAll(conn, txs, kp, microLamports) {
   return out;
 }
 
+/* `rebalancePosition` mengembalikan INSTRUKSI, bukan Transaction — beda dengan
+ * jalur add/remove. Instruksi init bin array dipisah jadi tx sendiri: ia harus
+ * sudah masuk chain sebelum instruksi rebalance-nya jalan, dan menggabungnya
+ * bisa melewati batas ukuran tx. Kelompok kosong dilewati. */
+function buildTxs(payer, groups) {
+  const out = [];
+  for (const ixs of groups) {
+    if (!ixs || !ixs.length) continue;
+    const tx = new web3.Transaction();
+    tx.feePayer = payer;
+    for (const ix of ixs) tx.add(ix);
+    out.push(tx);
+  }
+  return out;
+}
+
 /* positionData SDK berisi BN + Decimal campur; JSON.stringify apa adanya
  * menghasilkan objek BN mentah yang tak terpakai di Python. */
 function posOut(p, pool, binStep, dx, dy) {
@@ -415,6 +431,130 @@ const CMDS = {
       claimed: list.map((p) => posOut(p, req.pool, inst.lbPair.binStep,
         inst.tokenX.mint.decimals, inst.tokenY.mint.decimals)),
     };
+  },
+
+  /* ── Rebalance IN-PLACE ──────────────────────────────────────────────────
+   *
+   * `simulateRebalancePositionWithBalancedStrategy` menarik SELURUH likuiditas
+   * + fee, lalu menyetornya kembali dengan lebar yang SAMA dan dipusatkan di
+   * bin aktif. Artinya sama persis dengan rebalance jalur EVM ("lebar lama,
+   * dipusatkan di harga sekarang") — dan fee ikut ter-reinvest, juga sama.
+   *
+   * Yang membuatnya lebih baik daripada close+mint ulang: akun posisinya TIDAK
+   * ditutup, jadi sewa ~0,057 SOL tidak dilepas lalu dibayar lagi, tidak ada
+   * posisi baru yang lahir, dan `pid`-nya tetap — riwayat PnL tidak terputus.
+   *
+   * `withdraw_bps` > 0 menarik sebagian ke wallet alih-alih menyetornya ulang;
+   * `topup_*` menambah dana baru dari wallet. Keduanya 0 = murni recenter. */
+  async rebalance(req, conn, kp) {
+    const { inst } = await poolState(conn, req.pool);
+    const owner = kp ? kp.publicKey : new PublicKey(req.owner);
+    const key = new PublicKey(String(req.position));
+    const p = await inst.getPosition(key);
+    const before = posOut(p, req.pool, inst.lbPair.binStep,
+                          inst.tokenX.mint.decimals, inst.tokenY.mint.decimals);
+    const sim = await inst.simulateRebalancePositionWithBalancedStrategy(
+      key, p.positionData, strategyOf(req.strategy),
+      bn(req.topup_x_raw), bn(req.topup_y_raw),
+      bn(req.withdraw_x_bps || 0), bn(req.withdraw_y_bps || 0));
+    const r = sim.simulationResult;
+    const rp = sim.rebalancePosition;
+    const out = {
+      position: req.position, before,
+      lower_bin: rp.lowerBinId.toNumber(), upper_bin: rp.upperBinId.toNumber(),
+      active_bin: inst.lbPair.activeId,
+      // DUA hal yang berbeda, dan menukarnya membuat kartu melapor "0 masuk"
+      // untuk rebalance yang sebenarnya menyetor ulang penuh:
+      //   amountXDeposited        = yang MENDARAT di bin (pokok lama + fee)
+      //   actualAmountXDeposited  = yang keluar dari WALLET (top-up saja)
+      //   actualAmountXWithdrawn  = yang kembali ke WALLET (sisa/penarikan)
+      in_position_x_raw: s(r.amountXDeposited),
+      in_position_y_raw: s(r.amountYDeposited),
+      from_wallet_x_raw: s(r.actualAmountXDeposited),
+      from_wallet_y_raw: s(r.actualAmountYDeposited),
+      to_wallet_x_raw: s(r.actualAmountXWithdrawn),
+      to_wallet_y_raw: s(r.actualAmountYWithdrawn),
+      // Bin array baru punya sewa sendiri. Angkanya disebut di kartu supaya
+      // user tidak kaget SOL-nya berkurang di luar fee tx.
+      rental_lamports: s(r.rentalCostLamports),
+      bin_array_cost: sim.binArrayCost, bitmap_cost: sim.bitmapExtensionCost,
+      dec_x: inst.tokenX.mint.decimals, dec_y: inst.tokenY.mint.decimals,
+    };
+    if (req.dry) return out;                 // simulasi saja, tidak ada tx
+    const ixs = await inst.rebalancePosition(
+      sim, bn(req.max_active_bin_slippage || dlmmPkg.MAX_ACTIVE_BIN_SLIPPAGE),
+      owner, req.slippage_pct === undefined ? undefined : Number(req.slippage_pct));
+    out.signatures = await sendAll(
+      conn, buildTxs(owner, [ixs.initBinArrayInstructions,
+                             ixs.rebalancePositionInstruction]),
+      kp, req.priority_micro_lamports);
+    return out;
+  },
+
+  /* ── Compound: klaim fee lalu setor kembali ke RANGE YANG SAMA ────────────
+   *
+   * Beda dari `rebalance`: rangenya TIDAK digeser. Deposit dinyatakan sebagai
+   * delta terhadap bin aktif (`lowerBinId - activeId` … `upperBinId - activeId`),
+   * jadi bin batasnya persis sama dengan sebelumnya.
+   *
+   * Fee DLMM tidak mengendap di posisi seperti v3 dan tidak bisa dikreditkan
+   * terhadap tagihan seperti v4 — ia DIKLAIM (`shouldClaimFee: true`) lalu
+   * dipakai sebagai jumlah setoran dalam simulasi yang sama, sehingga tidak ada
+   * jeda di mana dana itu menganggur di wallet. */
+  async compound(req, conn, kp) {
+    const { inst } = await poolState(conn, req.pool);
+    const owner = kp ? kp.publicKey : new PublicKey(req.owner);
+    const key = new PublicKey(String(req.position));
+    const p = await inst.getPosition(key);
+    const d = p.positionData;
+    const dx = inst.tokenX.mint.decimals, dy = inst.tokenY.mint.decimals;
+    const before = posOut(p, req.pool, inst.lbPair.binStep, dx, dy);
+    const feeX = bn(d.feeX), feeY = bn(d.feeY);
+    if (feeX.isZero() && feeY.isZero()) {
+      throw new Error("Tidak ada fee yang bisa di-compound (kedua sisi 0)");
+    }
+    const activeId = inst.lbPair.activeId;
+    const minDeltaId = bn(d.lowerBinId - activeId);
+    const maxDeltaId = bn(d.upperBinId - activeId);
+    const sp = dlmmPkg.buildLiquidityStrategyParameters(
+      feeX, feeY, minDeltaId, maxDeltaId, bn(inst.lbPair.binStep), false,
+      bn(activeId), dlmmPkg.getLiquidityStrategyParameterBuilder(strategyOf(req.strategy)));
+    const rp = await dlmmPkg.RebalancePosition.create({
+      program: inst.program, positionAddress: key, positionData: d,
+      shouldClaimFee: true, shouldClaimReward: false, pairAddress: inst.pubkey,
+    });
+    const sim = await inst.simulateRebalancePositionWithStrategy(rp, {
+      buildRebalanceStrategyParameters: () => ({
+        // withdraws kosong = pokok TIDAK disentuh; yang masuk cuma fee.
+        withdraws: [],
+        deposits: [{ minDeltaId, maxDeltaId, x0: sp.x0, y0: sp.y0,
+                     deltaX: sp.deltaX, deltaY: sp.deltaY,
+                     favorXInActiveBin: false }],
+      }),
+    });
+    const r = sim.simulationResult;
+    const out = {
+      position: req.position, before,
+      lower_bin: d.lowerBinId, upper_bin: d.upperBinId, active_bin: activeId,
+      fee_x_raw: s(feeX), fee_y_raw: s(feeY),
+      in_position_x_raw: s(r.amountXDeposited),
+      in_position_y_raw: s(r.amountYDeposited),
+      from_wallet_x_raw: s(r.actualAmountXDeposited),
+      from_wallet_y_raw: s(r.actualAmountYDeposited),
+      to_wallet_x_raw: s(r.actualAmountXWithdrawn),
+      to_wallet_y_raw: s(r.actualAmountYWithdrawn),
+      rental_lamports: s(r.rentalCostLamports),
+      dec_x: dx, dec_y: dy,
+    };
+    if (req.dry) return out;
+    const ixs = await inst.rebalancePosition(
+      sim, bn(req.max_active_bin_slippage || dlmmPkg.MAX_ACTIVE_BIN_SLIPPAGE),
+      owner, req.slippage_pct === undefined ? undefined : Number(req.slippage_pct));
+    out.signatures = await sendAll(
+      conn, buildTxs(owner, [ixs.initBinArrayInstructions,
+                             ixs.rebalancePositionInstruction]),
+      kp, req.priority_micro_lamports);
+    return out;
   },
 
   async close(req, conn, kp) {

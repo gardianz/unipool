@@ -353,14 +353,60 @@ baris tombol tersendiri di kartu konfirmasi. Terukur pada SOL/USDC ±25/50%
 dengan 100 USDC: Spot butuh 0,8756 SOL, Curve 0,9112, BidAsk 0,8423 — Curve
 menumpuk dekat bin aktif sehingga butuh sisi lawan lebih banyak.
 
-Karena shape tidak punya padanan di mode EVM, **`rebalance_position` MENOLAK
-posisi DLMM**: rebalance = close + mint ulang, dan menebak shape berarti
-memindahkan dana user ke bentuk likuiditas yang tidak pernah ia pilih.
+Karena shape tidak punya padanan di mode EVM, layar rebalance DLMM menawarkan
+**shape**, bukan mode range (wide/lower/upper) — callback-nya
+`rebok|<pid>|shape:<X>`, dibedakan dari mode EVM lewat awalannya.
 
-**Compound juga ditolak**, dengan alasan berbeda: fee DLMM ditarik ke WALLET
-saat diklaim (tidak mengendap di posisi seperti v3, tidak bisa dikreditkan
-terhadap tagihan seperti v4), jadi "compound" = Claim lalu Add — dua tombol
-yang sudah ada.
+#### Rebalance & compound DLMM terjadi DI TEMPAT, bukan close + mint ulang
+
+Keduanya lewat `rebalancePosition` SDK. Akun posisinya **tidak ditutup**, jadi
+sewa ~0,057 SOL tidak dilepas lalu dibayar lagi, tidak ada posisi baru yang
+lahir, dan **`pid`-nya tetap** sehingga riwayat PnL tidak terputus. Ini beda
+mendasar dari jalur EVM yang harus close → swap → mint (3–5 tx).
+
+- **Rebalance** = `simulateRebalancePositionWithBalancedStrategy` dengan
+  withdraw 0 bps dan topup 0: seluruh likuiditas + fee ditarik lalu disetor
+  ulang **selebar semula, dipusatkan di bin aktif**. Artinya sama persis dengan
+  "lebar lama, dipusatkan di harga sekarang" di EVM, dan fee ikut ter-reinvest —
+  juga sama. `mode` dan `gap` karena itu TIDAK dipakai; mengubah lebar berarti
+  posisi baru, dan itu tombol Close + mint.
+- **Compound** = `simulateRebalancePositionWithStrategy` dengan `withdraws: []`
+  (pokok tidak disentuh) dan satu deposit yang range-nya dinyatakan sebagai
+  **delta terhadap bin aktif** (`lowerBinId − activeId … upperBinId − activeId`),
+  sehingga bin batasnya persis tidak bergeser. `shouldClaimFee: true`, jadi fee
+  diklaim dan dipakai sebagai jumlah setoran **di dalam simulasi yang sama** —
+  tidak ada jeda di mana dana itu menganggur di wallet.
+- **Pindah pool ditolak**: akun posisi DLMM terikat ke satu `lbPair`.
+
+**TIGA besaran hasil yang WAJIB dipisah — menukarnya membuat kartu melapor
+"0 masuk" untuk rebalance yang sebenarnya menyetor ulang penuh.** Dibaca dari
+sumber SDK (`_simulateDeposit`):
+
+| field SDK | artinya |
+|---|---|
+| `amountXDeposited` | yang MENDARAT di bin (pokok lama + fee + tambahan) |
+| `actualAmountXDeposited` = `max(0, deposit − withdrawn)` | yang keluar dari **wallet** |
+| `actualLiquidityAndFeeXWithdrawn` = `max(0, withdrawn − deposit)` | yang kembali ke **wallet** |
+
+Percobaan pertama memakai `actualAmountXDeposited` sebagai "yang disetor" dan
+kartunya menulis **0** untuk rebalance FLEX/SOL yang sebenarnya menyetor ulang
+71.724 FLEX + 1,0956 SOL. `_rb_amounts()` menamainya `in_*` / `from_*` / `to_*`.
+
+**Simulasi dijalankan DULU sebelum tx** (`dry: true`), dan kalau strategi minta
+lebih dari yang ditarik, kekurangannya diambil dari wallet — saldo diperiksa di
+situ dan ditolak dengan angka yang jelas, bukan dibiarkan revert setelah gas
+terbakar.
+
+`rebalancePosition` mengembalikan **instruksi**, bukan `Transaction` (beda dengan
+jalur add/remove). `buildTxs()` memecahnya jadi dua tx: init bin array harus
+sudah masuk chain sebelum instruksi rebalance jalan, dan menggabungnya bisa
+melewati batas ukuran tx. Bin array baru punya sewa sendiri
+(`rentalCostLamports`, terukur 0,000569 SOL) — disebut di kartu supaya user
+tidak kaget SOL-nya berkurang di luar fee tx.
+
+Pembukuan compound sama artinya dengan v4: `added_usd` menghitung likuiditas
+penuh, jadi fee yang jadi modalnya WAJIB diimbangi event `fees` — tanpa itu fee
+tercatat sebagai setoran baru dan PnL rugi palsu sebesar fee tersebut.
 
 #### Komposisi dua sisi dihitung SDK, dan sisinya ditentukan letak range
 
@@ -442,9 +488,9 @@ yang ditebak mengembalikan pubkey yang salah TANPA gejala.
 
 #### Yang belum ada untuk Solana
 
-Rebalance, compound, swap komposisi otomatis, revoke approval (Solana tidak
-punya allowance), order TP/SL, dan `/cleanup`. Semuanya menolak dengan pesan
-yang menyebut alasannya, bukan gagal diam-diam.
+Swap komposisi otomatis, pindah pool, revoke approval (Solana tidak punya
+allowance), order TP/SL, dan `/cleanup`. Semuanya menolak dengan pesan yang
+menyebut alasannya, bukan gagal diam-diam.
 
 ### Dispatch versi pool
 

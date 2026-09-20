@@ -2245,6 +2245,56 @@ def mint_card_dlmm(cid: int, p: dict, res: dict) -> str:
     return "\n".join(L)
 
 
+def _rb_line(lbl: str, a: dict, p: dict, s0: str, s1: str, k0: str, k1: str) -> str:
+    return (f"{lbl}: {ch.fmt_amount(a[k0])} {esc(s0)} + "
+            f"{ch.fmt_amount(a[k1])} {esc(s1)}")
+
+
+def rebalance_card_dlmm(cid: int, pid: str, r: dict) -> str:
+    """Kartu hasil rebalance DLMM. Dipanggil di thread."""
+    a, p = r.get("amt") or {}, r.get("pool_info") or {}
+    s0, s1 = p.get("sym0") or "?", p.get("sym1") or "?"
+    L = [f"✅ <b>Rebalance selesai</b> · {esc(p.get('name') or '')} · "
+         f"{esc(SHAPE_LABEL.get(r.get('shape'), r.get('shape') or ''))}",
+         f"Range baru: bin {r.get('lower_bin')} … {r.get('upper_bin')} "
+         f"(bin aktif {r.get('active_bin')})",
+         _rb_line("📥 Masuk posisi", a, p, s0, s1, "in0", "in1")
+         + f" (≈{ch.fmt_usd(r.get('in_usd'))})"]
+    # Tiga arus yang berbeda — disebut terpisah karena tindakannya beda. Kalau
+    # digabung, user membaca "dari wallet" sebagai kerugian.
+    if (a.get("from0") or 0) > 0 or (a.get("from1") or 0) > 0:
+        L.append(_rb_line("➕ Tambahan dari wallet", a, p, s0, s1, "from0", "from1")
+                 + f" (≈{ch.fmt_usd(r.get('from_wallet_usd'))})")
+    if (a.get("to0") or 0) > 0 or (a.get("to1") or 0) > 0:
+        L.append(_rb_line("↩️ Kembali ke wallet", a, p, s0, s1, "to0", "to1")
+                 + f" (≈{ch.fmt_usd(r.get('to_wallet_usd'))}) — sisa yang tidak muat")
+    if a.get("rent_sol"):
+        L.append(f"<i>Sewa bin array baru {a['rent_sol']:.6f} SOL (di luar fee tx).</i>")
+    for st in r.get("steps") or []:
+        L.append(f"• {esc(st)}")
+    L.append("<i>Akun posisi TIDAK ditutup — sewanya tidak dilepas dan pid-nya tetap.</i>")
+    return "\n".join(L)
+
+
+def compound_card_dlmm(cid: int, pid: str, r: dict) -> str:
+    """Kartu hasil compound DLMM. Dipanggil di thread."""
+    a, p = r.get("amt") or {}, r.get("pool_info") or {}
+    s0, s1 = p.get("sym0") or "?", p.get("sym1") or "?"
+    L = [f"✅ <b>Compound selesai</b> · {esc(p.get('name') or '')}",
+         f"💰 Fee diklaim: {ch.fmt_amount(r.get('fees0') or 0)} {esc(s0)} + "
+         f"{ch.fmt_amount(r.get('fees1') or 0)} {esc(s1)} "
+         f"(≈{ch.fmt_usd(r.get('fee_usd'))})",
+         _rb_line("📥 Masuk posisi", a, p, s0, s1, "in0", "in1")
+         + f" (≈{ch.fmt_usd(r.get('added_usd'))})",
+         f"Range TIDAK berubah: bin {r.get('lower_bin')} … {r.get('upper_bin')}"]
+    if (a.get("to0") or 0) > 0 or (a.get("to1") or 0) > 0:
+        L.append(_rb_line("↩️ Kembali ke wallet", a, p, s0, s1, "to0", "to1")
+                 + " — sisa yang tidak muat di range ini")
+    for st in r.get("steps") or []:
+        L.append(f"• {esc(st)}")
+    return "\n".join(L)
+
+
 def build_preview(ctx_data: dict) -> str:
     """Kartu konfirmasi mint (dipanggil di thread)."""
     cid = ctx_data["chain"]
@@ -4495,6 +4545,28 @@ async def ask_rebalance(update: Update, pid: str):
         return
     meme_sym = p["sym0"] if p["quote_is_token1"] else p["sym1"]
     status = "🟢 IN" if p["in_range"] else "🔴 OUT"
+    if p.get("ver") == 5:
+        # DLMM: yang dipilih SHAPE, bukan mode range. Lebarnya dipertahankan SDK
+        # dan selalu dipusatkan di bin aktif, jadi wide/lower/upper tidak punya
+        # arti di sini — dan menawarkannya akan menjanjikan sesuatu yang tidak
+        # terjadi. `rebok|<pid>|shape:<X>` dibedakan dari mode EVM lewat awalan.
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(SHAPE_LABEL[sh], callback_data=f"rebok|{pid}|shape:{sh}")
+             for sh in ("Spot", "Curve", "BidAsk")],
+            [InlineKeyboardButton("❌ Cancel", callback_data="cancel")],
+        ])
+        await reply(update, (
+            f"⚖️ <b>Rebalance {_pos_disp(p)}?</b>\n"
+            f"{esc(meme_sym)}/{esc(p['quote_sym'] or '')} · "
+            f"Val ~{ch.fmt_usd(p['value_usd'])} · {status}\n"
+            f"Range: {esc(range_str(p))}\n"
+            f"💰 Fee unclaimed {ch.fmt_usd(p['unclaimed_usd'])} — ikut ter-reinvest.\n\n"
+            f"Likuiditas + fee ditarik lalu disetor ulang <b>selebar sekarang "
+            f"({p.get('n_bins')} bin)</b>, dipusatkan di bin aktif.\n"
+            f"<i>Dilakukan DI TEMPAT: akun posisinya tidak ditutup, jadi sewa "
+            f"~{ch.fmt_amount(p.get('rent_sol') or 0)} SOL tidak dilepas lalu dibayar "
+            f"lagi, dan riwayat PnL-nya tidak terputus. Pilih bentuk sebarannya:</i>"), kb)
+        return
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("⚖️ Wide — dua sisi", callback_data=f"rebok|{pid}|wide")],
         [InlineKeyboardButton(f"Lower — {p['quote_sym'] or 'quote'} saja (nampung turun)",
@@ -4523,12 +4595,20 @@ async def do_rebalance(update: Update, pid: str, mode: str):
             return position_one(cid, pid)
 
         pos = await asyncio.to_thread(snapshot)
-        head = f"⏳ Rebalance {disp_pid(pid)} → {mode}... (close → swap → mint)"
+        # DLMM: `mode` membawa SHAPE (`shape:Spot`), bukan mode range EVM —
+        # lebar rangenya dipertahankan SDK dan tidak ada close/swap/mint.
+        shape = mode.split(":", 1)[1] if str(mode).startswith("shape:") else None
+        if shape:
+            head = (f"⏳ Rebalance {disp_pid(pid)} · {SHAPE_LABEL.get(shape, shape)}… "
+                    f"(di tempat, posisi tidak ditutup)")
+        else:
+            head = f"⏳ Rebalance {disp_pid(pid)} → {mode}... (close → swap → mint)"
         status = await reply(update, head)
         async with TX_LOCK:
             try:
                 r = await with_progress(status, head, lambda: ch.rebalance_position(
-                    cid, pk(), pid, mode, s["slippage_pct"], int(s.get("gap", 1))))
+                    cid, pk(cid), pid, mode, s["slippage_pct"], int(s.get("gap", 1)),
+                    shape=shape))
             except Exception as e:
                 if isinstance(e, ch.AlreadyClosed):
                     await edit(status, f"✅ {esc(e)}", NAV_KB)
@@ -4538,6 +4618,15 @@ async def do_rebalance(update: Update, pid: str, mode: str):
                                    f"cek /wallet lalu mint manual.</i>")
                 return
 
+        if shape:
+            # Posisi DLMM TIDAK berganti pid (akunnya sama), jadi pembukuan
+            # close+mint jalur EVM tidak berlaku: tidak ada posisi lama yang
+            # ditutup dan tidak ada yang baru lahir.
+            pos_cache_drop(cid)
+            await edit(status, await asyncio.to_thread(rebalance_card_dlmm, cid, pid, r),
+                       InlineKeyboardMarkup([[InlineKeyboardButton(
+                           "📄 Buka posisi", callback_data=f"pos|{pid}")]]))
+            return
         await finish_rebalance(update, status, cid, pid, pos, r, mode=mode)
 
 
@@ -6668,8 +6757,13 @@ async def ask_compound(update: Update, pid: str):
     if not p or p["unclaimed_usd"] <= 0:
         await edit(msg, "ℹ️ Tidak ada fee unclaimed untuk di-compound.", NAV_KB)
         return
-    # v3 vs v4 beda jumlah tx dan beda sumber dana — sebutkan supaya user tahu
-    detail = ("Fee dipakai langsung sebagai modal (v4 mengkreditkannya ke tagihan "
+    # Tiap versi beda jumlah tx dan beda sumber dana — sebutkan supaya user tahu
+    detail = ("Fee diklaim lalu langsung disetor kembali di dalam SATU simulasi "
+              "rebalance, jadi tidak ada jeda di mana dana itu menganggur di "
+              "wallet. Range TIDAK bergeser dan pokoknya tidak disentuh. "
+              "1–2 transaksi."
+              if ver == 5 else
+              "Fee dipakai langsung sebagai modal (v4 mengkreditkannya ke tagihan "
               "settle), jadi wallet praktis tidak membayar apa-apa. 1–2 transaksi."
               if ver == 4 else
               "Fee di-collect ke wallet dulu, lalu ditambahkan kembali ke posisi. "
@@ -6703,6 +6797,28 @@ async def do_compound(update: Update, pid: str):
         cid = s["chain"]
         head = f"⏳ Compound {disp_pid(pid)}…"
         status = await reply(update, head)
+        if ch.parse_pid(pid)[0] == 5:
+            async with TX_LOCK:
+                try:
+                    r = await with_progress(status, head, lambda: ch.compound_any(
+                        cid, pk(cid), pid, s["slippage_pct"]))
+                except Exception as e:
+                    await edit(status, f"❌ Compound gagal: {esc(e)}")
+                    return
+            # Pembukuan sama artinya dengan v4: `added_usd` menghitung likuiditas
+            # penuh, jadi fee yang jadi modalnya WAJIB diimbangi event `fees` —
+            # tanpa itu fee tercatat sebagai setoran baru dan PnL rugi palsu.
+            store.record_event(cid, "mint", str(pid), r.get("added_usd") or 0,
+                               "compound", wallet=wallet_address())
+            if (r.get("fee_usd") or 0) > 0:
+                store.record_event(cid, "fees", str(pid), r["fee_usd"],
+                                   "compound", wallet=wallet_address())
+            pos_cache_drop(cid)
+            await edit(status,
+                       await asyncio.to_thread(compound_card_dlmm, cid, pid, r),
+                       InlineKeyboardMarkup([[InlineKeyboardButton(
+                           "📄 Buka posisi", callback_data=f"pos|{pid}")]]))
+            return
         pre_fee = _reinvested_fee_usd(cid, pid)
         async with TX_LOCK:
             try:
