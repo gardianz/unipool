@@ -497,6 +497,13 @@ def _pool_from_api(row: dict) -> dict | None:
         "token0": mx, "token1": my,
         "sym0": tx.get("symbol") or "?", "sym1": ty.get("symbol") or "?",
         "dec0": int(tx.get("decimals") or 0), "dec1": int(ty.get("decimals") or 0),
+        # Harga KEDUA sisi ikut dibawa. Data API sudah mengirimnya di payload
+        # pool yang sama, jadi mengambilnya lagi lewat `token_usd_price()` berarti
+        # satu request per TOKEN per posisi — terukur 10 request tambahan untuk
+        # 5 posisi, dan `/list` lintas chain cuma punya anggaran 5 detik total.
+        "px0": float(tx.get("price") or 0), "px1": float(ty.get("price") or 0),
+        "supply0": float(tx.get("total_supply") or 0),
+        "supply1": float(ty.get("total_supply") or 0),
         "basis": "meteora",
         "tvl_usd": float(row.get("tvl") or 0),
         "vol24_usd": float(vol.get("24h") or 0),
@@ -619,8 +626,10 @@ def _position_detail(raw: dict, pinfo: dict, active_bin: int | None = None) -> d
     f0 = int(raw.get("fee_x_raw") or 0) / 10 ** dx
     f1 = int(raw.get("fee_y_raw") or 0) / 10 ** dy
 
-    px0 = token_usd_price(pinfo["token0"])
-    px1 = token_usd_price(pinfo["token1"])
+    # Harga dari payload pool dulu (sudah ada, nol request); `token_usd_price`
+    # hanya untuk pool yang belum diindeks Data API.
+    px0 = float(pinfo.get("px0") or 0) or token_usd_price(pinfo["token0"])
+    px1 = float(pinfo.get("px1") or 0) or token_usd_price(pinfo["token1"])
     usd0, usd1 = a0 * px0, a1 * px1
     fu0, fu1 = f0 * px0, f1 * px1
 
@@ -661,6 +670,13 @@ def _position_detail(raw: dict, pinfo: dict, active_bin: int | None = None) -> d
         # Wajib disebut UI, kalau tidak user mengira SOL-nya hilang.
         "rent_sol": POSITION_RENT_SOL,
     }
+
+
+def _safe_pool_info(pool: str) -> dict | None:
+    try:
+        return pool_info(pool)
+    except Exception:
+        return None
 
 
 def portfolio_index(address: str) -> list[tuple[str, list[str]]]:
@@ -712,23 +728,41 @@ def list_positions(address: str) -> list[dict]:
     Posisi yang belum diindeks Data API (baru dibuat beberapa detik lalu) tetap
     ketemu lewat jalur 2, jadi indeks yang telat tidak pernah MENGHILANGKAN
     posisi — aturan yang sama dengan indexer Uniswap di jalur EVM."""
+    idx = portfolio_index(address)
     raws = []
-    for pool, keys in portfolio_index(address):
+    if idx:
+        # SATU panggilan untuk semua pool: tiap panggilan sidecar itu proses Node
+        # baru (~0,7–1 detik hanya untuk start + require SDK), dan `/list` lintas
+        # chain punya anggaran 5 detik TOTAL. Lima pool = lima kali ongkos itu.
         try:
-            d = sidecar("positions_by_key", pool=pool, positions=keys)
-            for raw in d.get("positions") or []:
-                raw.setdefault("active_bin", d.get("active_bin"))
-                raws.append(raw)
+            d = sidecar("positions_by_key",
+                        groups=[{"pool": pool, "positions": keys}
+                                for pool, keys in idx])
+            raws = d.get("positions") or []
         except SolanaError:
-            continue
+            raws = []
     if not raws:
         d = sidecar("positions", owner=address)
         raws = d.get("positions") or []
+    # `pool_info` satu request Data API per POOL. Berurutan itu terukur mendominasi
+    # pembacaan dingin (8,0 detik untuk 5 posisi), dan `/list` lintas chain cuma
+    # punya anggaran 5 detik TOTAL — jadi Solana selalu tertulis "masih dimuat"
+    # pada klik pertama. Diambil paralel; hasilnya di-cache `_api` jadi klik
+    # berikutnya tidak membayar lagi.
+    pools = list(dict.fromkeys(r["pool"] for r in raws))
+    infos: dict = {}
+    if pools:
+        import concurrent.futures as _cf
+        with _cf.ThreadPoolExecutor(max_workers=min(8, len(pools))) as ex:
+            for pool, info in zip(pools, ex.map(
+                    lambda x: (lambda: _safe_pool_info(x))(), pools)):
+                if info:
+                    infos[pool] = info
     out = []
     for raw in raws:
         try:
-            out.append(_position_detail(raw, pool_info(raw["pool"]),
-                                        raw.get("active_bin")))
+            pinfo = infos.get(raw["pool"]) or pool_info(raw["pool"])
+            out.append(_position_detail(raw, pinfo, raw.get("active_bin")))
         except Exception:
             # Sama seperti `list_all_positions` EVM: satu posisi yang gagal
             # dibaca tidak boleh menjatuhkan seluruh daftar.

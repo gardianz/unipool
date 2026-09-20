@@ -598,6 +598,45 @@ pool sebuah posisi tidak pernah berubah), **bukan** dengan mengambil offset byte
 sendiri: layout Position, PositionV2, dan extended position berbeda, dan offset
 yang ditebak mengembalikan pubkey yang salah TANPA gejala.
 
+#### Wallet PER CHAIN, dan `pk()` tanpa argumen itu jebakan
+
+Daftar wallet EVM dan Solana BERBEDA (secp256k1 vs ed25519), jadi `pk()` tanpa
+argumen — yang membaca chain AKTIF — salah di setiap jalur lintas-chain.
+Terjadi sungguhan: dengan chain aktif Solana, `/list` mengirim secret Solana ke
+jalur EVM dan **Robinhood/Base/Arc gagal dibaca seluruhnya** ("masih dimuat"),
+sementara posisi Solana-nya sendiri tidak pernah muncul. Gejalanya terbaca
+sebagai "wallet Solana tidak terdeteksi" padahal dashboard-nya justru benar —
+dashboard memang memakai chain aktif.
+
+Aturannya: **jalur lintas-chain WAJIB `pk(cid)` dan `wallet_address(cid)`**,
+bukan versi tanpa argumen. Sudah dipindah: `list_positions_all`,
+`position_by_pid`, dan pembukuan per-chain di `cmd_list`
+(`adopt_orphans`/`portfolio_summary`/`churn_count` — alamatnya beda per chain,
+jadi riwayat bisa menempel ke wallet yang salah).
+
+`wallet_idx` dipakai bersama semua chain, jadi indeksnya **dijepit** ke panjang
+daftar chain itu — tanpa itu chain ber-1 wallet menampilkan wallet pertamanya
+dengan label "W3" hanya karena chain lain punya 3. Chain yang belum punya
+wallet sama sekali (Solana sebelum `SOLANA_PRIVATE_KEY` diisi) **dilewati**,
+bukan dilaporkan sebagai kegagalan baca.
+
+#### Pembacaan posisi Solana: satu proses Node, dan pool diambil paralel
+
+Tiap panggilan sidecar itu **proses Node baru** (~0,7–1 detik hanya untuk start
++ `require` SDK). Lima pool berarti lima kali ongkos itu, sedangkan `/list`
+lintas chain punya anggaran **5 detik TOTAL**. Dua hal yang memperbaikinya:
+
+- `positions_by_key` menerima `groups` — semua pool dalam SATU panggilan.
+- `pool_info` per pool diambil **paralel**, dan harga kedua sisi dibaca dari
+  payload pool yang sudah ada (`px0`/`px1`) alih-alih `token_usd_price()` per
+  token — itu satu request per TOKEN per posisi, 10 request tambahan untuk 5
+  posisi.
+
+Terukur untuk 5 posisi: **6,5 → 1,4 detik hangat**, dingin 6,8 detik. Dingin
+masih di atas anggaran, jadi klik pertama menandai Solana "masih dimuat" dan
+klik kedua lengkap — perilaku yang sama dengan chain EVM yang lambat, dan
+task-nya sengaja tidak dibatalkan supaya cache-nya terisi.
+
 #### Yang belum ada untuk Solana
 
 Swap komposisi otomatis, pindah pool, revoke approval (Solana tidak punya

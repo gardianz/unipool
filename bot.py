@@ -153,8 +153,16 @@ def pk(cid=None) -> str:
     return keys[min(active_wallet_idx(), len(keys) - 1)]
 
 
-def wallet_label(idx: int | None = None) -> str:
-    return f"W{(active_wallet_idx() if idx is None else idx) + 1}"
+def wallet_label(idx: int | None = None, cid=None) -> str:
+    """Label wallet aktif. Indeksnya DIJEPIT ke panjang daftar chain itu, sama
+    seperti `pk()` — kalau tidak, chain ber-1 wallet (Solana) menampilkan alamat
+    wallet pertamanya dengan label "W3" hanya karena chain lain punya 3."""
+    if idx is None:
+        idx = active_wallet_idx()
+        n = len(pks_for(cid)) if cid is not None else 0
+        if n:
+            idx = min(idx, n - 1)
+    return f"W{idx + 1}"
 
 
 def _is_sol_key(key: str) -> bool:
@@ -304,7 +312,14 @@ def list_positions_all(cid: int, key: str | None = None, errors: list | None = N
     `light=True` (monitor) membaca versi murah: `value_usd`/`unclaimed_usd`-nya
     **0**. Hasilnya karena itu TIDAK boleh masuk `_POS_CACHE` — `/list` akan
     menampilkan semua posisi bernilai $0. Mode ini melewati cache dua arah."""
-    key = key or pk()
+    # Kunci milik CHAIN YANG DIPINDAI, bukan chain aktif. `pk()` tanpa argumen
+    # membaca daftar wallet chain aktif, dan daftar itu BERBEDA antara EVM dan
+    # Solana (secp256k1 vs ed25519). Akibatnya saat chain aktif Solana, `/list`
+    # mengirim secret Solana ke jalur EVM — Robinhood/Base/Arc gagal dibaca
+    # seluruhnya — dan sebaliknya saat chain aktif EVM, Solana tidak pernah
+    # terbaca. Gejalanya persis "wallet Solana tidak terdeteksi" padahal
+    # dashboard-nya benar.
+    key = key or pk(cid)
     w = _addr_of(key)
     if light:
         errs: list = []
@@ -342,13 +357,16 @@ def position_one(cid: int, pid, key: str | None = None) -> dict | None:
     membuat user mengira dananya hilang, lalu mengklik ulang dan beraksi dua kali.
     Sekarang gagal baca dilempar sebagai error yang menyebut sebabnya."""
     try:
-        return ch.position_by_pid(cid, key or pk(), pid)
+        return ch.position_by_pid(cid, key or pk(cid), pid)
     except Exception as e:
         raise RuntimeError(f"Gagal membaca posisi {disp_pid(pid)}: {e}") from e
 
 
-def wallet_address() -> str:
-    return _addr_of(pk())
+def wallet_address(cid=None) -> str:
+    """Alamat wallet aktif. `cid` WAJIB diisi di jalur lintas-chain: alamat EVM
+    dan Solana berbeda, jadi memakai alamat chain aktif untuk chain lain membuat
+    pembukuan (`store.*`) menempel ke wallet yang salah."""
+    return _addr_of(pk(cid))
 
 
 TG_MAX_CHARS = 4096          # batas keras Telegram untuk satu pesan
@@ -603,10 +621,14 @@ def build_main_menu() -> str:
     pks = pks_for(cid)
     wallets_line = ""
     if len(pks) > 1:
-        cur = active_wallet_idx()
+        cur = min(active_wallet_idx(), len(pks) - 1)
         parts = []
         for i, k in enumerate(pks):
-            bal = w3.eth.get_balance(_addr_of(k)) / 1e18
+            if ch.is_solana(cid):
+                import sol as _so
+                bal = _so.sol_balance(_addr_of(k))
+            else:
+                bal = w3.eth.get_balance(_addr_of(k)) / 1e18
             mark = "▸" if i == cur else ""
             parts.append(f"{mark}W{i + 1} {ch.fmt_amount(bal)}")
         wallets_line = f"👛 {' · '.join(parts)} {esc(cfg['native_symbol'])}\n"
@@ -617,7 +639,7 @@ def build_main_menu() -> str:
         f"{'' if ch.is_solana(cid) else ' ' + esc(ch.versions_label(cid))}\n"
         f"⛓ {esc(cfg['name'])} (chain {cid})\n"
         f"{wallets_line}"
-        f"{esc(wallet_label())}: <code>{esc(addr)}</code>\n\n"
+        f"{esc(wallet_label(cid=cid))}: <code>{esc(addr)}</code>\n\n"
         f"💰 <b>Saldo:</b>\n" + "\n".join(bal_lines) + "\n"
         f"<b>Total: {ch.fmt_usd(total)}</b> · 1 {esc(cfg['wrapped_symbol'])} = ${eth_usd:,.0f}\n\n"
         f"⚙️ amount {esc(amount)} · slippage {s['slippage_pct']:g}% · gap {s.get('gap', 1)} · "
@@ -1380,7 +1402,7 @@ def wallet_text_sol(page: int = 0) -> tuple[str, int, int]:
     cid = ch.SOL_CHAIN
     cfg = ch.CHAINS[cid]
     addr = wallet_address()
-    lines = [f"<b>Wallet {esc(wallet_label())}</b> <code>{esc(addr)}</code> — "
+    lines = [f"<b>Wallet {esc(wallet_label(cid=cid))}</b> <code>{esc(addr)}</code> — "
              f"{esc(cfg['name'])}"]
     total = 0.0
     native = so.sol_balance(addr)
@@ -3771,6 +3793,8 @@ _SCAN_TASKS: dict = {}   # chain -> task pindai yang sedang jalan (single-flight
 async def _chain_positions(cid: int) -> tuple[int, list, list]:
     """(cid, posisi, error) satu chain — dipakai pemindaian lintas chain."""
     errs: list = []
+    if not pks_for(cid):
+        return cid, [], []          # chain tanpa wallet: bukan error, bukan posisi
     try:
         pos = await asyncio.to_thread(list_positions_all, cid, None, errs)
     except Exception as e:
@@ -3849,13 +3873,19 @@ async def cmd_list(update: Update, _, status_msg=None):
     withdrawals = fees_claimed = 0.0
     churn = 0
     for c, (pos, _errs) in per_chain.items():
+        # Alamat wallet per CHAIN: alamat EVM dan Solana berbeda, jadi memakai
+        # alamat chain aktif untuk chain lain membuat riwayat menempel ke wallet
+        # yang salah dan PnL-nya ikut salah.
+        if not pks_for(c):
+            continue                 # chain tanpa wallet: tidak ada yang dibukukan
+        wc = wallet_address(c)
         # klaim event riwayat lama (tanpa tag wallet) yang posisinya milik wallet ini
-        store.adopt_orphans(c, wallet_address(), [p["token_id"] for p in pos])
-        sm = store.portfolio_summary(c, wallet_address())
+        store.adopt_orphans(c, wc, [p["token_id"] for p in pos])
+        sm = store.portfolio_summary(c, wc)
         deposits += sm["deposits"]
         withdrawals += sm["withdrawals"]
         fees_claimed += sm["fees_claimed"]
-        churn += store.churn_count(c, wallet_address())
+        churn += store.churn_count(c, wc)
         open_value += sum(p["value_usd"] for p in pos)
         unclaimed += sum(p["unclaimed_usd"] for p in pos)
     summary = {"deposits": deposits, "withdrawals": withdrawals, "fees_claimed": fees_claimed}
@@ -6576,6 +6606,12 @@ async def cmd_all(update: Update, _=None):
     def scan():
         out = []
         for cid in ch.CHAINS:
+            if not pks_for(cid):
+                # Chain tanpa wallet sama sekali (mis. Solana sebelum
+                # SOLANA_PRIVATE_KEY diisi) — sebutkan, jangan tampilkan sebagai
+                # kegagalan baca.
+                out.append((cid, None, "belum ada wallet untuk chain ini"))
+                continue
             try:
                 out.append((cid, list_positions_all(cid), None))
             except Exception as e:

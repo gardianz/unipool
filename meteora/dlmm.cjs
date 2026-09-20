@@ -385,14 +385,35 @@ const CMDS = {
    * membaca akun yang ditunjuk saja, jadi ongkosnya tetap walau wallet-nya
    * punya ratusan posisi. Alamatnya datang dari indeks Data API. */
   async positions_by_key(req, conn) {
-    const { inst, active, dx, dy } = await poolState(conn, req.pool);
+    /* `groups` = [{pool, positions:[...]}, ...] dalam SATU panggilan.
+     *
+     * Tiap panggilan sidecar itu satu proses Node baru (~0,7–1 detik hanya untuk
+     * start + require SDK), jadi lima pool berarti lima kali ongkos itu — dan
+     * `/list` lintas chain punya anggaran 5 detik TOTAL. Dengan batch, satu
+     * proses melayani semuanya. Bentuk lama (`pool` + `positions`) tetap
+     * diterima supaya pemanggil satu-pool tidak perlu berubah. */
+    const groups = req.groups && req.groups.length
+      ? req.groups
+      : [{ pool: req.pool, positions: req.positions || [] }];
     const out = [];
-    for (const key of req.positions || []) {
-      const p = await inst.getPosition(new PublicKey(String(key)));
-      out.push(posOut(p, req.pool, inst.lbPair.binStep, dx, dy));
+    let first = null;
+    for (const g of groups) {
+      const { inst, active, dx, dy } = await poolState(conn, g.pool);
+      if (!first) first = { active, inst, dx, dy, pool: g.pool };
+      for (const key of g.positions || []) {
+        const p = await inst.getPosition(new PublicKey(String(key)));
+        const o = posOut(p, g.pool, inst.lbPair.binStep, dx, dy);
+        o.active_bin = active.binId;
+        o.mint_x = inst.tokenX.publicKey.toBase58();
+        o.mint_y = inst.tokenY.publicKey.toBase58();
+        out.push(o);
+      }
     }
-    return { active_bin: active.binId,
-             pool: poolOut(inst, active, dx, dy, req.pool), positions: out };
+    return {
+      active_bin: first ? first.active.binId : null,
+      pool: first ? poolOut(first.inst, first.active, first.dx, first.dy, first.pool) : null,
+      positions: out,
+    };
   },
 
   async positions(req, conn) {
