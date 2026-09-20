@@ -608,11 +608,29 @@ sementara posisi Solana-nya sendiri tidak pernah muncul. Gejalanya terbaca
 sebagai "wallet Solana tidak terdeteksi" padahal dashboard-nya justru benar —
 dashboard memang memakai chain aktif.
 
-Aturannya: **jalur lintas-chain WAJIB `pk(cid)` dan `wallet_address(cid)`**,
-bukan versi tanpa argumen. Sudah dipindah: `list_positions_all`,
-`position_by_pid`, dan pembukuan per-chain di `cmd_list`
+Aturannya: **apa pun yang memilih wallet WAJIB menyebut chain-nya** —
+`pk(cid)`, `wallet_address(cid)`, `pks_for(cid)`, `wallet_label(cid=…)` —
+bukan versi tanpa argumen. Yang sudah dipindah: `list_positions_all`,
+`position_by_pid`, pembukuan per-chain di `cmd_list`
 (`adopt_orphans`/`portfolio_summary`/`churn_count` — alamatnya beda per chain,
-jadi riwayat bisa menempel ke wallet yang salah).
+jadi riwayat bisa menempel ke wallet yang salah), layar **Kelola wallet**
+(`wallets_text`/`wallets_kb`/`wallet_pick_kb`), tombol W di `menu_kb`, header
+PnL, `_orders_for_chain`, dan `_gather_positions` milik monitor.
+
+Dua yang TIDAK ikut, dan sengaja:
+
+- **`pk_for(addr)` menyapu KEDUA keluarga** (`all_pks() + sol_pks()`): ia
+  mencari kunci dari ALAMAT, dan alamat itu bisa milik chain mana pun karena
+  monitor dan eksekutor order jalan lintas chain. Kalau daftar Solana tidak
+  ikut, alert/order posisi DLMM tidak akan pernah menemukan key-nya.
+- **Brankas bot (`wallets.json`) menyimpan key EVM**, jadi tombol Impor/Buat/
+  Ekspor/Hapus TIDAK ditawarkan di chain Solana — tombol yang dijamin salah
+  lebih buruk daripada tombol yang tidak ada. Wallet Solana hanya dari
+  `SOLANA_PRIVATE_KEY(S)`, dan layarnya mengatakan itu.
+
+`active_wallet_idx()` dijepit ke daftar TERPANJANG di antara kedua keluarga
+(bukan ke daftar EVM saja — wallet Solana ke-3 akan terpotong jadi indeks 0
+kalau wallet EVM cuma satu); penjepitan per-chain yang sebenarnya di `pk(cid)`.
 
 `wallet_idx` dipakai bersama semua chain, jadi indeksnya **dijepit** ke panjang
 daftar chain itu — tanpa itu chain ber-1 wallet menampilkan wallet pertamanya

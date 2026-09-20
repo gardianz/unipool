@@ -113,7 +113,12 @@ def wallet_name(key: str) -> str:
 
 
 def active_wallet_idx() -> int:
-    n = max(1, len(all_pks()))
+    """Indeks wallet yang dipilih user — SATU nilai dipakai semua chain.
+
+    Dijepit ke daftar TERPANJANG di antara kedua keluarga kunci, bukan ke daftar
+    EVM saja: wallet Solana ke-3 akan terpotong jadi indeks 0 kalau wallet EVM
+    cuma ada satu. Penjepitan per-chain yang sebenarnya dilakukan `pk(cid)`."""
+    n = max(1, len(all_pks()), len(sol_pks()))
     try:
         return min(max(0, int(store.load_settings().get("wallet_idx", 0))), n - 1)
     except (TypeError, ValueError):
@@ -239,7 +244,10 @@ def fmt_pct_short(v) -> str:
 def pk_for(addr: str) -> str | None:
     """Private key untuk alamat wallet tertentu (buat eksekusi order milik wallet itu)."""
     al = str(addr).lower()
-    for k in all_pks():
+    # Kedua keluarga kunci disapu: alamat yang dicari bisa milik chain mana pun
+    # (monitor & eksekutor order jalan lintas chain), dan kalau daftar Solana
+    # tidak ikut, order/alert posisi DLMM tidak akan pernah menemukan key-nya.
+    for k in (*all_pks(), *sol_pks()):
         if _addr_of(k).lower() == al:
             return k
     return None
@@ -538,9 +546,10 @@ HELP = (
 
 def menu_kb() -> InlineKeyboardMarkup:
     rows = []
-    n = len(all_pks())
+    _cid = store.load_settings()["chain"]
+    n = len(pks_for(_cid))
     if n > 1:
-        cur = active_wallet_idx()
+        cur = min(active_wallet_idx(), n - 1)
         rows.append([InlineKeyboardButton(("✓ " if i == cur else "") + f"W{i + 1}",
                                           callback_data=f"wsel|{i}")
                      for i in range(min(n, 8))])
@@ -1504,33 +1513,59 @@ def wallet_kb(page: int = 0, pages: int = 1) -> InlineKeyboardMarkup:
 
 
 # ---------- Kelola wallet (tambah / buat / ekspor / hapus) ----------
-def wallets_text() -> str:
-    cur = active_wallet_idx()
-    lines = ["👛 <b>Kelola wallet</b>\n"]
-    for i, k in enumerate(all_pks()):
-        src = ".env" if is_env_pk(k) else "brankas bot"
-        nm = wallet_name(k)
+def wallets_text(cid=None) -> str:
+    """Daftar wallet CHAIN AKTIF.
+
+    Daftarnya beda per keluarga chain: EVM secp256k1 (`PRIVATE_KEY*` + brankas),
+    Solana ed25519 (`SOLANA_PRIVATE_KEY*`). Menampilkan daftar EVM saat chain
+    aktif Solana membuat wallet Solana terlihat "tidak terbaca" padahal ada —
+    dan lebih buruk, tombol W1/W2/W3-nya lalu menunjuk wallet yang tidak dipakai
+    chain itu sama sekali."""
+    cid = store.load_settings()["chain"] if cid is None else cid
+    sol_chain = ch.is_solana(cid)
+    pks = pks_for(cid)
+    n = len(pks)
+    cur = min(active_wallet_idx(), n - 1) if n else 0
+    lines = [f"👛 <b>Kelola wallet</b> · {esc(ch.CHAINS[cid]['name'])}\n"]
+    if not pks:
+        lines.append("<i>Belum ada wallet untuk chain ini.</i>")
+    for i, k in enumerate(pks):
+        src = ".env" if (sol_chain or is_env_pk(k)) else "brankas bot"
+        nm = "" if sol_chain else wallet_name(k)
         lines.append(f"{'▸ ' if i == cur else '   '}<b>W{i + 1}</b>{' ' + esc(nm) if nm else ''} "
                      f"<code>{esc(_addr_of(k))}</code>\n     <i>{src}</i>")
-    lines.append(
-        "\n⚠️ Wallet dari <code>.env</code> tidak bisa dihapus lewat bot — ubah filenya "
-        "lalu restart. Wallet tambahan disimpan di <code>wallets.json</code> "
-        "(permission 600, tidak ikut git).")
+    if sol_chain:
+        lines.append(
+            "\n⚠️ Wallet Solana dibaca dari <code>SOLANA_PRIVATE_KEY</code> "
+            "(atau <code>SOLANA_PRIVATE_KEYS</code>, dipisah koma) di "
+            "<code>.env</code> — ubah filenya lalu restart. Brankas bot "
+            "(<code>wallets.json</code>) menyimpan key EVM, jadi impor/buat/hapus "
+            "di sini tidak berlaku untuk Solana.")
+    else:
+        lines.append(
+            "\n⚠️ Wallet dari <code>.env</code> tidak bisa dihapus lewat bot — ubah filenya "
+            "lalu restart. Wallet tambahan disimpan di <code>wallets.json</code> "
+            "(permission 600, tidak ikut git).")
     return "\n".join(lines)
 
 
-def wallets_kb() -> InlineKeyboardMarkup:
+def wallets_kb(cid=None) -> InlineKeyboardMarkup:
     rows = []
-    pks = all_pks()
-    cur = active_wallet_idx()
+    cid = store.load_settings()["chain"] if cid is None else cid
+    pks = pks_for(cid)
+    cur = min(active_wallet_idx(), len(pks) - 1) if pks else 0
     for i in range(0, min(len(pks), 8), 4):
         rows.append([InlineKeyboardButton(("✓ " if j == cur else "") + f"W{j + 1}",
                                           callback_data=f"wsel|{j}")
                      for j in range(i, min(i + 4, len(pks), 8))])
-    rows.append([InlineKeyboardButton("➕ Impor key", callback_data="wal2|import"),
-                 InlineKeyboardButton("🆕 Buat baru", callback_data="wal2|new")])
-    rows.append([InlineKeyboardButton("🔑 Ekspor key", callback_data="wal2|exportmenu"),
-                 InlineKeyboardButton("🗑 Hapus", callback_data="wal2|delmenu")])
+    # Brankas bot menyimpan key EVM (`0x…`); impor/buat/hapus karena itu tidak
+    # ditawarkan di chain Solana — tombol yang dijamin salah lebih buruk daripada
+    # tombol yang tidak ada.
+    if not ch.is_solana(cid):
+        rows.append([InlineKeyboardButton("➕ Impor key", callback_data="wal2|import"),
+                     InlineKeyboardButton("🆕 Buat baru", callback_data="wal2|new")])
+        rows.append([InlineKeyboardButton("🔑 Ekspor key", callback_data="wal2|exportmenu"),
+                     InlineKeyboardButton("🗑 Hapus", callback_data="wal2|delmenu")])
     rows.append([InlineKeyboardButton("‹ Menu", callback_data="menu|home")])
     return InlineKeyboardMarkup(rows)
 
@@ -1538,7 +1573,7 @@ def wallets_kb() -> InlineKeyboardMarkup:
 def wallet_pick_kb(action: str) -> InlineKeyboardMarkup:
     """Daftar wallet untuk dipilih (ekspor/hapus). Wallet .env tidak bisa dihapus."""
     rows = []
-    for i, k in enumerate(all_pks()):
+    for i, k in enumerate(pks_for(store.load_settings()["chain"])):
         if action == "del" and is_env_pk(k):
             continue
         rows.append([InlineKeyboardButton(f"W{i + 1} · {_addr_of(k)[:8]}…{_addr_of(k)[-4:]}",
@@ -3901,9 +3936,11 @@ async def cmd_list(update: Update, _, status_msg=None):
     pnl_pct = (pnl / base * 100) if base else 0.0
 
     lines = []
-    if len(all_pks()) > 1:
-        waddr = wallet_address()
-        lines.append(f"👛 {esc(wallet_label())} <code>{esc(waddr[:6])}…{esc(waddr[-4:])}</code>")
+    _cid = store.load_settings()["chain"]
+    if len(pks_for(_cid)) > 1:
+        waddr = wallet_address(_cid)
+        lines.append(f"👛 {esc(wallet_label(cid=_cid))} "
+                     f"<code>{esc(waddr[:6])}…{esc(waddr[-4:])}</code>")
     lines += [
         f"<b>Portfolio PnL {ch.fmt_usd(pnl)} ({pnl_pct:+.2f}% dari modal bersih "
         f"{ch.fmt_usd(net_in)})</b>",
@@ -5594,7 +5631,7 @@ async def do_create_order(update: Update, pid: str, tp_s: str, sl_s: str, autosw
 
 def _orders_for_chain(cid: int, status: str = "") -> list[dict]:
     out = []
-    for k in all_pks():
+    for k in pks_for(cid):
         out += store.orders(cid, _addr_of(k), status=status)
     return out
 
@@ -6302,7 +6339,9 @@ async def _gather_positions(cid: int, only_wallets: set | None = None):
     """
     positions = []
     by_wallet = {}
-    for key in all_pks():
+    # Wallet CHAIN INI saja: daftar EVM dan Solana berbeda, dan memakai daftar
+    # yang salah berarti `_addr_of` menurunkan alamat dengan kurva yang salah.
+    for key in pks_for(cid):
         waddr = _addr_of(key).lower()
         if only_wallets is not None and waddr not in only_wallets:
             continue
