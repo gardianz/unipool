@@ -8799,7 +8799,8 @@ def _convert_quote(w3: Web3, chain_id: int, pk: str, src_q: str, dst_q: str,
 def rebalance_position(chain_id: int, pk: str, pid, mode: str, slippage_pct: float,
                        gap: int = 1, target_pool: dict | None = None,
                        shape: str | None = None,
-                       max_impact: float | None = None) -> dict:
+                       max_impact: float | None = None,
+                       width_bins: int | None = None) -> dict:
     """Close posisi → swap komposisi sesuai mode → mint ulang dengan lebar range
     sama, dipusatkan di harga sekarang. Fee unclaimed ikut ter-reinvest.
     Hanya dana HASIL posisi ini yang dipakai (delta saldo, bukan seluruh wallet).
@@ -8829,7 +8830,8 @@ def rebalance_position(chain_id: int, pk: str, pid, mode: str, slippage_pct: flo
         return _sol().rebalance_any(pk, str(_ref), mode=mode,
                                     shape=(shape or "Spot"),
                                     slippage_pct=slippage_pct,
-                                    max_impact=max_impact)
+                                    max_impact=max_impact,
+                                    width_bins=width_bins)
     ver, ref = parse_pid(pid)
     if ver == 2:
         raise RuntimeError("Posisi v2 full-range — tidak perlu rebalance.")

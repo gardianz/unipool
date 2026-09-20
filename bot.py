@@ -4615,15 +4615,27 @@ async def ask_rebalance(update: Update, pid: str):
         f"<i>Hanya dana hasil posisi ini yang dipakai. 3–5 transaksi.</i>"), kb)
 
 
-async def ask_rebalance_shape(update: Update, pid: str, mode: str):
-    """Langkah 2 rebalance DLMM: bentuk sebaran likuiditas di dalam range.
+async def ask_rebalance_shape(update: Update, pid: str, mode: str,
+                              width: int | None = None, edit_in_place: bool = False):
+    """Langkah 2 rebalance DLMM: LEBAR range + bentuk sebaran likuiditas.
 
-    Knop ini tidak ada di Uniswap — di sana likuiditas selalu rata sepanjang
-    range — jadi ia layar tersendiri, bukan varian mode."""
+    Keduanya tidak ada di Uniswap. Lebar di DLMM itu jumlah BIN, dan
+    mempertahankan jumlah bin posisi lama saat memindahkan seluruh range ke satu
+    sisi menghasilkan tangga jauh lebih dalam daripada posisi semula — terukur
+    WOJAK/SOL: 125 bin dua sisi jadi 125 bin satu sisi = rentang 3,4% × ... =
+    246%, dengan 0,0076 SOL per bin. Karena itu lebarnya bisa dipilih, dan
+    bawaannya RAPAT."""
+    import sol as _so
     p = await asyncio.to_thread(position_one, store.load_settings()["chain"], pid)
     if not p:
         await reply(update, f"❌ Posisi {disp_pid(pid)} tidak ditemukan.")
         return
+    opts = _so.width_choices(int(p.get("bin_step") or 1), int(p.get("n_bins") or 1))
+    if width is None:
+        # Bawaan = preset RAPAT (bukan lebar lama): likuiditas yang tersebar
+        # sepanjang rentang berkali-kali lipat praktis tidak menghasilkan
+        # apa-apa sampai harga bergerak jauh.
+        width = opts[1][0] if len(opts) > 1 else opts[0][0]
     import sol as _so
     # Mode Lower/Upper menjual HABIS satu sisi. Di pool tipis itu bisa puluhan
     # persen, jadi angkanya ditampilkan SEBELUM tombol ditekan — bukan ditolak
@@ -4638,19 +4650,30 @@ async def ask_rebalance_shape(update: Update, pid: str, mode: str):
                 + (f" · DI ATAS batas {lim * 100:.0f}%, akan DITOLAK. "
                    f"Pakai mode Wide atau naikkan batas di /settings."
                    if imp > lim else " (dalam batas)") + "\n")
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(SHAPE_LABEL[sh], callback_data=f"rebok|{pid}|{mode}:{sh}")
-         for sh in ("Spot", "Curve", "BidAsk")],
-        [InlineKeyboardButton("⬅️ Ganti mode", callback_data=f"reb|{pid}"),
-         InlineKeyboardButton("❌ Cancel", callback_data="cancel")],
-    ])
-    await reply(update, (
+    step_pct = int(p.get("bin_step") or 1) / 100.0
+    span = ((1.0 + step_pct / 100.0) ** width - 1.0) * 100.0
+    rows = [[InlineKeyboardButton(("✓ " if n == width else "") + lbl.split(" · ")[0],
+                                  callback_data=f"rebw|{pid}|{mode}|{n}")
+             for n, lbl in opts]]
+    rows.append([InlineKeyboardButton(SHAPE_LABEL[sh],
+                                      callback_data=f"rebok|{pid}|{mode}:{sh}:{width}")
+                 for sh in ("Spot", "Curve", "BidAsk")])
+    rows.append([InlineKeyboardButton("⬅️ Ganti mode", callback_data=f"reb|{pid}"),
+                 InlineKeyboardButton("❌ Cancel", callback_data="cancel")])
+    text = (
         f"⚖️ <b>Rebalance {_pos_disp(p)} · {esc(STRAT_LABEL.get(mode, mode))}</b>\n"
-        f"Lebar range dipertahankan: <b>{p.get('n_bins')} bin</b> "
-        f"(bin step {p.get('bin_step')}).\n{warn}\n"
-        f"Pilih bentuk sebaran likuiditasnya:\n"
+        f"Lebar: <b>{width} bin</b> (~{span:.1f}% rentang harga) · "
+        f"1 bin = {step_pct:g}% · lebar lama {p.get('n_bins')} bin\n{warn}\n"
+        f"<i>Makin sedikit bin = likuiditas makin padat di dekat harga, fee per "
+        f"dolar makin besar, tapi makin cepat keluar range.</i>\n\n"
+        f"Pilih lebar lalu bentuk sebarannya:\n"
         + "\n".join(f"· <b>{esc(SHAPE_LABEL[k])}</b> — {esc(SHAPE_DESC[k])}"
-                     for k in ("Spot", "Curve", "BidAsk"))), kb)
+                     for k in ("Spot", "Curve", "BidAsk")))
+    kb = InlineKeyboardMarkup(rows)
+    if edit_in_place:
+        await edit(update, text, kb)
+    else:
+        await reply(update, text, kb)
 
 
 async def do_rebalance(update: Update, pid: str, mode: str):
@@ -4666,18 +4689,23 @@ async def do_rebalance(update: Update, pid: str, mode: str):
         pos = await asyncio.to_thread(snapshot)
         # DLMM membawa mode DAN shape dalam satu callback ("wide:Spot"); jalur
         # EVM cuma mode. Alurnya sendiri sama: close → swap → mint.
-        shape = None
+        shape, width_bins = None, None
         if ":" in str(mode):
-            mode, shape = str(mode).split(":", 1)
+            parts = str(mode).split(":")
+            mode, shape = parts[0], parts[1]
+            if len(parts) > 2 and parts[2].isdigit():
+                width_bins = int(parts[2])
         head = (f"⏳ Rebalance {disp_pid(pid)} → {mode}"
                 + (f" · {SHAPE_LABEL.get(shape, shape)}" if shape else "")
+                + (f" · {width_bins} bin" if width_bins else "")
                 + "... (close → swap → mint)")
         status = await reply(update, head)
         async with TX_LOCK:
             try:
                 r = await with_progress(status, head, lambda: ch.rebalance_position(
                     cid, pk(cid), pid, mode, s["slippage_pct"], int(s.get("gap", 1)),
-                    shape=shape, max_impact=impact_limit()))
+                    shape=shape, max_impact=impact_limit(),
+                    width_bins=width_bins))
             except Exception as e:
                 if isinstance(e, ch.AlreadyClosed):
                     await edit(status, f"✅ {esc(e)}", NAV_KB)
@@ -5382,6 +5410,12 @@ async def _route_callback(update: Update):
         _, tid, mode = data.split("|")
         await q.edit_message_reply_markup(None)
         await ask_rebalance_shape(update, tid, mode)
+        return
+    if data.startswith("rebw|"):
+        # Ganti LEBAR tanpa meninggalkan layar — pesan yang sama dirender ulang,
+        # pola yang sama dengan tombol lebar range di kartu mint.
+        _, tid, mode, n = data.split("|")
+        await ask_rebalance_shape(q.message, tid, mode, int(n), edit_in_place=True)
         return
     if data.startswith("rebok|"):
         _, tid, mode = data.split("|")

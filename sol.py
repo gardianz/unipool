@@ -1501,9 +1501,31 @@ def rebalance_impact(address: str, position: str, mode: str) -> float | None:
         return None
 
 
+def width_choices(bin_step: int, old_width: int) -> list[tuple[int, str]]:
+    """[(lebar_bin, label)] untuk kartu rebalance DLMM.
+
+    Lebar dinyatakan dalam BIN, dan lebar yang sama berarti rentang harga yang
+    sangat berbeda tergantung `bin_step`: satu bin = `bin_step/100` persen. 125
+    bin di pool bin step 100 itu rentang **3,4×** — likuiditasnya tersebar
+    setipis 0,0076 SOL per bin dan praktis tidak menghasilkan apa-apa sampai
+    harga bergerak jauh. Itu yang terjadi pada rebalance WOJAK/SOL pertama."""
+    step = max(1, int(bin_step)) / 100.0          # persen per bin
+    out, seen = [], set()
+    for n, tag in ((1, "🎯 1 kotak"), (5, "rapat"), (20, "sedang"),
+                   (int(old_width), "lebar lama")):
+        n = max(1, min(MAX_BINS_PER_POSITION, int(n)))
+        if n in seen:
+            continue
+        seen.add(n)
+        span = (1.0 + step / 100.0) ** n - 1.0
+        out.append((n, f"{tag} · {n} bin (~{span * 100:.1f}%)"))
+    return out
+
+
 def rebalance_any(secret: str, position: str, mode: str = "wide",
                   shape: str = "Spot", slippage_pct: float = 5.0,
-                  max_impact: float | None = 0.25) -> dict:
+                  max_impact: float | None = 0.25,
+                  width_bins: int | None = None) -> dict:
     """Close posisi → swap komposisi sesuai mode → mint ulang dengan LEBAR range
     yang sama, diletakkan menurut mode terhadap harga sekarang.
 
@@ -1527,8 +1549,16 @@ def rebalance_any(secret: str, position: str, mode: str = "wide",
     if not raws:
         raise SolanaError("Posisi tidak ditemukan (sudah ditutup?).")
     old = raws[0]
-    width = int(old["upper_bin"]) - int(old["lower_bin"]) + 1
     old_lo, old_hi = int(old["lower_bin"]), int(old["upper_bin"])
+    old_width = old_hi - old_lo + 1
+    # Lebar range BOLEH diganti di sini, dan itu perbedaan nyata dari jalur EVM.
+    # Di Uniswap lebar range = rentang harga; di DLMM ia jumlah BIN, dan
+    # mempertahankan jumlah bin yang sama saat memindahkan seluruh range ke satu
+    # sisi menghasilkan tangga yang jauh lebih dalam daripada posisi semula
+    # (terukur WOJAK/SOL: 125 bin dua sisi jadi 125 bin satu sisi = rentang
+    # 3,4× dengan 0,0076 SOL per bin).
+    width = max(1, min(MAX_BINS_PER_POSITION,
+                       int(width_bins) if width_bins else old_width))
 
     steps: list = []
     before_x, before_y = _wallet_pair(addr, p)
@@ -1596,7 +1626,7 @@ def rebalance_any(secret: str, position: str, mode: str = "wide",
             "pid": f"dlmm:{d.get('position')}", "position": d.get("position"),
             "old_position": position, "old_lower": old_lo, "old_upper": old_hi,
             "lower_bin": lo, "upper_bin": hi, "active_bin": active,
-            "n_bins": hi - lo + 1, "width": width,
+            "n_bins": hi - lo + 1, "width": width, "old_width": old_width,
             "closed_usd": (out_x * px0) + (out_y * px1),
             "in0": dep_x, "in1": dep_y,
             "added_usd": dep_x * px0 + dep_y * px1,

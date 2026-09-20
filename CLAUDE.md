@@ -364,9 +364,26 @@ close (fee ikut terambil) → swap komposisi di pool itu sendiri → mint ulang
 dengan **lebar range yang sama**, diletakkan menurut mode.
 
 UI-nya **dua langkah**, dan urutannya penting: mode dulu (`rebsh|<pid>|<mode>`,
-tombolnya sama dengan EVM), baru shape (`rebok|<pid>|<mode>:<shape>`).
-Menggabungnya jadi satu layar berarti 3×3 = sembilan tombol yang artinya tidak
-bisa ditebak dari labelnya.
+tombolnya sama dengan EVM), baru layar kedua yang memuat LEBAR + shape
+(`rebok|<pid>|<mode>:<shape>:<width>`). Menggabung semuanya jadi satu layar
+berarti belasan tombol yang artinya tidak bisa ditebak dari labelnya. Tombol
+lebar (`rebw|`) merender ulang pesan yang SAMA dan tidak mengeksekusi apa pun —
+pola yang sama dengan tombol lebar range di kartu mint.
+
+**Lebar range TIDAK dipertahankan apa adanya, dan itu perbedaan nyata dari
+EVM.** Di Uniswap lebar range = rentang harga; di DLMM ia jumlah BIN, dan satu
+bin = `bin_step/100` persen. Mempertahankan jumlah bin posisi lama saat
+memindahkan SELURUH range ke satu sisi menghasilkan tangga jauh lebih dalam
+daripada posisi semula. Terukur pada rebalance WOJAK/SOL pertama: posisi 125
+bin dua sisi (bin step 100) jadi 125 bin satu sisi = rentang **2,38e-6 … 8,18e-6
+SOL, 3,4×**, dengan **0,0076 SOL per bin** — likuiditasnya tersebar setipis itu
+dan praktis tidak menghasilkan apa-apa sampai harga bergerak jauh.
+
+`width_choices()` karena itu menawarkan lebar dalam BIN dengan rentang
+harganya ikut ditulis (1 kotak / rapat 5 / sedang 20 / lebar lama), dan
+**bawaannya RAPAT, bukan lebar lama**. Angka persennya dihitung dari `bin_step`
+pool itu, jadi "5 bin" di pool bin step 4 (~0,2%) dan bin step 100 (~5,1%)
+tidak tertukar artinya.
 
 **Sisi mana yang memegang quote TIDAK tetap, dan menebaknya dari nama mode
 memberi user kebalikan dari yang ia minta.** Di DLMM bin **di bawah** bin aktif
@@ -449,6 +466,23 @@ dana itu menganggur di wallet. Akun posisinya tidak ditutup, jadi sewa ~0,057
 SOL tidak dilepas lalu dibayar lagi dan `pid`-nya tetap.
 
 **Pindah pool ditolak**: akun posisi DLMM terikat ke satu `lbPair`.
+
+#### Zap Meteora: TIDAK dipakai, dan batasnya bukan angka tetap
+
+`@meteora-ag/zap-sdk` (v1.3.2) bisa zap-in satu token, zap-out lewat Jupiter,
+dan `rebalanceDlmmPosition`. Sengaja tidak dipakai untuk rebalance: range-nya
+dinyatakan `minDeltaId`/`maxDeltaId` terhadap bin aktif dan alurnya milik SDK,
+sedangkan jalur ini harus mengikuti logika EVM. Nilai tambahnya yang nyata
+adalah ATOMISITAS (close/swap/mint sekarang tx terpisah).
+
+**Batas bin Zap tidak ada sebagai konstanta.** Dicari di dokumen dan di
+`dist/` SDK-nya: satu-satunya angka yang ada `BINARY_SEARCH_MAX_ITERATIONS = 20`
+dan `SWAP_BIN_ARRAY_COUNT = 4`; tidak ada `MAX_BIN*` apa pun. Yang mengikat
+adalah **ukuran transaksi dan jumlah akun**: satu tx Zap memuat rute swap
+Jupiter DAN bin array DLMM (satu bin array = 70 bin), jadi makin lebar range
+makin banyak akun sampai tx tidak muat. Itulah guna parameter `maxAccounts`
+(contoh resminya memakai 50) — batasnya bergeser mengikuti panjang rute swap,
+bukan angka tetap yang bisa dihafal.
 
 **TIGA besaran hasil compound yang WAJIB dipisah — menukarnya membuat kartu melapor
 "0 masuk" untuk rebalance yang sebenarnya menyetor ulang penuh.** Dibaca dari
