@@ -1645,17 +1645,24 @@ def rebalance_impact(address: str, position: str, mode: str) -> float | None:
 
 
 def width_choices(bin_step: int, old_width: int) -> list[tuple[int, str]]:
-    """[(lebar_bin, label)] untuk kartu rebalance DLMM.
+    """[(lebar_bin, label)] untuk kartu rebalance DLMM. YANG PERTAMA = bawaan.
 
-    Lebar dinyatakan dalam BIN, dan lebar yang sama berarti rentang harga yang
-    sangat berbeda tergantung `bin_step`: satu bin = `bin_step/100` persen. 125
-    bin di pool bin step 100 itu rentang **3,4×** — likuiditasnya tersebar
-    setipis 0,0076 SOL per bin dan praktis tidak menghasilkan apa-apa sampai
-    harga bergerak jauh. Itu yang terjadi pada rebalance WOJAK/SOL pertama."""
+    **Bawaannya LEBAR LAMA**, sama seperti rebalance EVM: rebalance itu
+    memindahkan range ke harga sekarang, bukan mengubah ukurannya. Yang dulu
+    terbaca "kurang rapat" adalah LETAKNYA — range lama tertinggal jauh di
+    bawah harga — dan itu memang yang diperbaiki `rebalance_bins()` dengan
+    menempelkan range ke bin aktif. Mengecilkan lebarnya sekaligus membuat
+    posisi 70 bin pulang jadi 5 bin, dan user kehilangan cakupan yang ia pilih
+    sendiri saat mint.
+
+    Preset yang lebih rapat tetap ditawarkan karena lebar di DLMM itu jumlah
+    BIN, dan satu bin = `bin_step/100` persen: 125 bin di pool bin step 100
+    adalah rentang **3,4×** dengan likuiditas setipis 0,0076 SOL per bin.
+    Tapi itu pilihan, bukan bawaan."""
     step = max(1, int(bin_step)) / 100.0          # persen per bin
     out, seen = [], set()
-    for n, tag in ((1, "🎯 1 kotak"), (5, "rapat"), (20, "sedang"),
-                   (int(old_width), "lebar lama")):
+    for n, tag in ((int(old_width), "lebar lama"), (20, "sedang"),
+                   (5, "rapat"), (1, "🎯 1 kotak")):
         n = max(1, min(MAX_BINS_PER_POSITION, int(n)))
         if n in seen:
             continue
@@ -1694,12 +1701,11 @@ def rebalance_any(secret: str, position: str, mode: str = "wide",
     old = raws[0]
     old_lo, old_hi = int(old["lower_bin"]), int(old["upper_bin"])
     old_width = old_hi - old_lo + 1
-    # Lebar range BOLEH diganti di sini, dan itu perbedaan nyata dari jalur EVM.
-    # Di Uniswap lebar range = rentang harga; di DLMM ia jumlah BIN, dan
-    # mempertahankan jumlah bin yang sama saat memindahkan seluruh range ke satu
-    # sisi menghasilkan tangga yang jauh lebih dalam daripada posisi semula
-    # (terukur WOJAK/SOL: 125 bin dua sisi jadi 125 bin satu sisi = rentang
-    # 3,4× dengan 0,0076 SOL per bin).
+    # Bawaannya LEBAR LAMA, sama seperti EVM: rebalance memindahkan LETAK range
+    # ke harga sekarang, bukan mengubah ukurannya. `width_bins` cuma dipakai
+    # kalau user memilih preset lain di kartu — berguna karena lebar di DLMM itu
+    # jumlah BIN dan satu bin = bin_step/100 persen, jadi 125 bin di pool bin
+    # step 100 adalah rentang 3,4× dengan likuiditas setipis 0,0076 SOL per bin.
     width = max(1, min(MAX_BINS_PER_POSITION,
                        int(width_bins) if width_bins else old_width))
 

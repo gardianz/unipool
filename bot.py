@@ -5007,12 +5007,16 @@ async def ask_rebalance_shape(update: Update, pid: str, mode: str,
                               width: int | None = None, edit_in_place: bool = False):
     """Langkah 2 rebalance DLMM: LEBAR range + bentuk sebaran likuiditas.
 
-    Keduanya tidak ada di Uniswap. Lebar di DLMM itu jumlah BIN, dan
-    mempertahankan jumlah bin posisi lama saat memindahkan seluruh range ke satu
-    sisi menghasilkan tangga jauh lebih dalam daripada posisi semula — terukur
-    WOJAK/SOL: 125 bin dua sisi jadi 125 bin satu sisi = rentang 3,4% × ... =
-    246%, dengan 0,0076 SOL per bin. Karena itu lebarnya bisa dipilih, dan
-    bawaannya RAPAT."""
+    Keduanya tidak ada di Uniswap. **Bawaan lebarnya = LEBAR LAMA**, sama
+    seperti rebalance EVM: yang dipindahkan rebalance adalah LETAK range ke
+    harga sekarang, bukan ukurannya. Mengecilkannya sekaligus membuat posisi 70
+    bin pulang jadi 5 bin — cakupan yang user pilih sendiri saat mint hilang
+    tanpa ia meminta.
+
+    Preset yang lebih rapat tetap ada karena lebar di DLMM itu jumlah BIN dan
+    satu bin = `bin_step/100` persen, jadi 125 bin di pool bin step 100 adalah
+    rentang 3,4× dengan likuiditas setipis 0,0076 SOL per bin. Itu pilihan,
+    bukan bawaan."""
     import sol as _so
     p = await asyncio.to_thread(position_one, store.load_settings()["chain"], pid)
     if not p:
@@ -5020,10 +5024,10 @@ async def ask_rebalance_shape(update: Update, pid: str, mode: str,
         return
     opts = _so.width_choices(int(p.get("bin_step") or 1), int(p.get("n_bins") or 1))
     if width is None:
-        # Bawaan = preset RAPAT (bukan lebar lama): likuiditas yang tersebar
-        # sepanjang rentang berkali-kali lipat praktis tidak menghasilkan
-        # apa-apa sampai harga bergerak jauh.
-        width = opts[1][0] if len(opts) > 1 else opts[0][0]
+        # Bawaan = LEBAR LAMA. Diambil dari `opts[0]`, bukan `n_bins` mentah,
+        # supaya ia sama persis dengan tombol yang tercentang (`width_choices`
+        # menjepitnya ke 1..MAX_BINS_PER_POSITION).
+        width = opts[0][0]
     import sol as _so
     # Mode Lower/Upper menjual HABIS satu sisi. Di pool tipis itu bisa puluhan
     # persen, jadi angkanya ditampilkan SEBELUM tombol ditekan — bukan ditolak
@@ -5052,8 +5056,10 @@ async def ask_rebalance_shape(update: Update, pid: str, mode: str,
         f"⚖️ <b>Rebalance {_pos_disp(p)} · {esc(STRAT_LABEL.get(mode, mode))}</b>\n"
         f"Lebar: <b>{width} bin</b> (~{span:.1f}% rentang harga) · "
         f"1 bin = {step_pct:g}% · lebar lama {p.get('n_bins')} bin\n{warn}\n"
-        f"<i>Makin sedikit bin = likuiditas makin padat di dekat harga, fee per "
-        f"dolar makin besar, tapi makin cepat keluar range.</i>\n\n"
+        f"<i>Bawaannya lebar lama — rebalance memindahkan LETAK range ke harga "
+        f"sekarang, bukan mengubah ukurannya. Makin sedikit bin = likuiditas "
+        f"makin padat di dekat harga, fee per dolar makin besar, tapi makin "
+        f"cepat keluar range.</i>\n\n"
         f"Pilih lebar lalu bentuk sebarannya:\n"
         + "\n".join(f"· <b>{esc(SHAPE_LABEL[k])}</b> — {esc(SHAPE_DESC[k])}"
                      for k in ("Spot", "Curve", "BidAsk")))

@@ -370,20 +370,26 @@ berarti belasan tombol yang artinya tidak bisa ditebak dari labelnya. Tombol
 lebar (`rebw|`) merender ulang pesan yang SAMA dan tidak mengeksekusi apa pun —
 pola yang sama dengan tombol lebar range di kartu mint.
 
-**Lebar range TIDAK dipertahankan apa adanya, dan itu perbedaan nyata dari
-EVM.** Di Uniswap lebar range = rentang harga; di DLMM ia jumlah BIN, dan satu
-bin = `bin_step/100` persen. Mempertahankan jumlah bin posisi lama saat
-memindahkan SELURUH range ke satu sisi menghasilkan tangga jauh lebih dalam
-daripada posisi semula. Terukur pada rebalance WOJAK/SOL pertama: posisi 125
-bin dua sisi (bin step 100) jadi 125 bin satu sisi = rentang **2,38e-6 … 8,18e-6
-SOL, 3,4×**, dengan **0,0076 SOL per bin** — likuiditasnya tersebar setipis itu
-dan praktis tidak menghasilkan apa-apa sampai harga bergerak jauh.
+**Lebar range DIPERTAHANKAN, dan yang dipindahkan cuma LETAKNYA** — sama
+seperti EVM. Rebalance artinya menempelkan range ke harga sekarang, bukan
+mengubah ukuran yang user pilih saat mint.
 
-`width_choices()` karena itu menawarkan lebar dalam BIN dengan rentang
-harganya ikut ditulis (1 kotak / rapat 5 / sedang 20 / lebar lama), dan
-**bawaannya RAPAT, bukan lebar lama**. Angka persennya dihitung dari `bin_step`
-pool itu, jadi "5 bin" di pool bin step 4 (~0,2%) dan bin step 100 (~5,1%)
-tidak tertukar artinya.
+Ini sempat salah dibaca dan hasilnya merugikan. Keluhan "posisinya kurang
+rapat" ternyata soal LETAK (range lama tertinggal jauh di bawah harga), bukan
+soal lebar — dan `width_choices()` sempat dibuat berbawaan **RAPAT 5 bin**.
+Akibatnya rebalance posisi PAID/SOL **70 bin** pulang jadi **5 bin (~4,1%)**:
+cakupan yang user pilih sendiri hilang tanpa ia meminta. Yang benar-benar
+memperbaiki keluhan aslinya adalah `rebalance_bins()` yang menempelkan range
+ke bin aktif, dan itu sudah jalan.
+
+`width_choices()` tetap menawarkan preset lebih rapat karena lebar di DLMM itu
+jumlah BIN dan satu bin = `bin_step/100` persen: 125 bin di pool bin step 100
+adalah rentang **2,38e-6 … 8,18e-6 SOL, 3,4×** dengan **0,0076 SOL per bin** —
+tersebar setipis itu dan praktis tidak menghasilkan apa-apa sampai harga
+bergerak jauh (terukur pada rebalance WOJAK/SOL pertama). Tapi itu PILIHAN.
+Urutannya lebar lama / sedang 20 / rapat 5 / 1 kotak, **yang pertama = bawaan**,
+dan persennya dihitung dari `bin_step` pool itu sehingga "5 bin" di pool bin
+step 4 (~0,2%) dan bin step 100 (~5,1%) tidak tertukar artinya.
 
 **Sisi mana yang memegang quote TIDAK tetap, dan menebaknya dari nama mode
 memberi user kebalikan dari yang ia minta.** Di DLMM bin **di bawah** bin aktif
