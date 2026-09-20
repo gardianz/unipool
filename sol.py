@@ -1182,62 +1182,6 @@ def _rb_amounts(d: dict) -> dict:
     }
 
 
-def rebalance_plan(address: str, position: str, shape: str = "Spot",
-                   withdraw_pct: float = 0.0, topup_quote: float = 0.0) -> dict:
-    """Simulasi rebalance TANPA mengirim tx — untuk kartu konfirmasi."""
-    pool = pool_of_position(position)
-    p = pool_info(pool)
-    q_is_y = bool(p["quote_is_token1"])
-    qdec = p["dec1"] if q_is_y else p["dec0"]
-    bps = max(0, min(10_000, int(round(float(withdraw_pct) * 100))))
-    kw = {("topup_y_raw" if q_is_y else "topup_x_raw"): _amt_raw(topup_quote, qdec)}
-    d = sidecar("rebalance", pool=pool, position=position, owner=address,
-                strategy=shape, withdraw_x_bps=bps, withdraw_y_bps=bps,
-                dry=True, **kw)
-    return {**d, "pool_info": p, "amt": _rb_amounts(d)}
-
-
-def rebalance(secret: str, position: str, shape: str = "Spot",
-              withdraw_pct: float = 0.0, topup_quote: float = 0.0,
-              slippage_pct: float = 5.0) -> dict:
-    """Tarik seluruh likuiditas + fee, setor ulang selebar SEMULA dan dipusatkan
-    di bin aktif. Fee ikut ter-reinvest — sama seperti rebalance jalur EVM.
-
-    `withdraw_pct` > 0 menarik sebagian ke wallet alih-alih menyetornya ulang;
-    `topup_quote` menambah dana baru. Keduanya 0 = murni recenter."""
-    addr = address_of(secret)
-    pool = pool_of_position(position)
-    p = pool_info(pool)
-    q_is_y = bool(p["quote_is_token1"])
-    qdec = p["dec1"] if q_is_y else p["dec0"]
-    bps = max(0, min(10_000, int(round(float(withdraw_pct) * 100))))
-    kw = {("topup_y_raw" if q_is_y else "topup_x_raw"): _amt_raw(topup_quote, qdec)}
-
-    # Simulasi DULU: strategi bisa meminta lebih dari yang ditarik, dan
-    # kekurangannya diambil dari wallet. Kalau wallet tidak cukup, tx-nya revert
-    # setelah gas terbakar — lebih baik ditolak di sini dengan angka yang jelas.
-    plan = sidecar("rebalance", pool=pool, position=position, owner=addr,
-                   strategy=shape, withdraw_x_bps=bps, withdraw_y_bps=bps,
-                   dry=True, **kw)
-    a = _rb_amounts(plan)
-    need_q, need_m = (a["from1"], a["from0"]) if q_is_y else (a["from0"], a["from1"])
-    if need_q > 0 and need_q > capital(addr, p) + 1e-12:
-        raise SolanaError(
-            f"Rebalance butuh tambahan {need_q:.6f} {p['quote_sym']} dari wallet, "
-            f"saldo tidak cukup. Tarik sebagian dulu (withdraw %) atau kecilkan top-up.")
-    msym = p.get("sym0") if q_is_y else p.get("sym1")
-    if need_m > 0 and need_m > meme_balance(addr, p) + 1e-12:
-        raise SolanaError(
-            f"Rebalance butuh tambahan {need_m:.6f} {msym} dari wallet, saldo "
-            f"tidak cukup. Bot ini tidak menukar otomatis di Solana.")
-
-    d = sidecar("rebalance", secret=secret, pool=pool, position=position,
-                strategy=shape, withdraw_x_bps=bps, withdraw_y_bps=bps,
-                slippage_pct=float(slippage_pct),
-                priority_micro_lamports=priority_fee(), **kw)
-    return {**d, "pool_info": p, "amt": _rb_amounts(d)}
-
-
 def compound_plan(address: str, position: str, shape: str = "Spot") -> dict:
     """Simulasi compound TANPA mengirim tx."""
     pool = pool_of_position(position)
@@ -1260,28 +1204,6 @@ def compound(secret: str, position: str, shape: str = "Spot",
     return {**d, "pool_info": pool_info(pool), "amt": _rb_amounts(d)}
 
 
-def rebalance_any(secret: str, position: str, mode: str = "wide",
-                  shape: str = "Spot", slippage_pct: float = 5.0) -> dict:
-    """Jembatan `chain.rebalance_position` untuk DLMM.
-
-    `mode` EVM (wide/lower/upper/same) TIDAK dipakai: lebar range dipertahankan
-    apa adanya oleh SDK dan selalu dipusatkan di bin aktif — yaitu arti
-    "lebar lama, dipusatkan di harga sekarang" yang sama dengan jalur EVM.
-    Mengubah lebar berarti membuat posisi baru, dan itu tombol Close + mint."""
-    r = rebalance(secret, position, shape=shape, slippage_pct=slippage_pct)
-    a, p = r["amt"], r["pool_info"]
-    px0, px1 = token_usd_price(p["token0"]), token_usd_price(p["token1"])
-    return {"steps": _steps(r.get("signatures"), "Rebalance DLMM"),
-            "pid": f"dlmm:{position}", "position": position,
-            "lower_bin": r.get("lower_bin"), "upper_bin": r.get("upper_bin"),
-            "active_bin": r.get("active_bin"), "shape": shape,
-            "in_usd": a["in0"] * px0 + a["in1"] * px1,
-            "from_wallet_usd": a["from0"] * px0 + a["from1"] * px1,
-            "to_wallet_usd": a["to0"] * px0 + a["to1"] * px1,
-            "rent_sol": a["rent_sol"], "amt": a, "pool_info": p,
-            "signatures": r.get("signatures")}
-
-
 def compound_bridge(secret: str, position: str, shape: str = "Spot",
                     slippage_pct: float = 5.0) -> dict:
     """Jembatan `chain.compound_any` untuk DLMM."""
@@ -1297,3 +1219,228 @@ def compound_bridge(secret: str, position: str, shape: str = "Spot",
             "fees0": f0, "fees1": f1, "fee_usd": f0 * px0 + f1 * px1,
             "added_usd": a["in0"] * px0 + a["in1"] * px1,
             "amt": a, "pool_info": p, "signatures": r.get("signatures")}
+
+
+# ══════════════════ Rebalance: close → swap komposisi → mint ══════════════════
+# Alurnya SENGAJA sama dengan jalur EVM (`chain.rebalance_position`), bukan
+# `rebalancePosition` bawaan SDK. SDK itu mempertahankan lebar range dan selalu
+# memusatkannya di bin aktif — jadi ia cuma bisa meniru mode `wide`, dan mode
+# Lower/Upper (satu sisi) mustahil dinyatakan di sana. Mode itu justru yang
+# paling sering dipakai: Lower menampung harga turun dengan 100% quote, Upper
+# menjual naik dengan 100% meme.
+
+
+def rebalance_bins(width: int, active: int, mode: str, quote_is_y: bool
+                   ) -> tuple[int, int]:
+    """Bin batas baru: LEBAR SAMA, diletakkan sesuai mode terhadap bin aktif.
+
+    Sisi mana yang memegang quote TIDAK tetap. Di DLMM bin **di bawah** bin
+    aktif memegang token Y dan bin **di atas** memegang token X. Jadi "Lower =
+    100% quote" berarti di bawah bin aktif kalau quote itu token_y, tapi di
+    ATAS bin aktif kalau quote itu token_x. Menebaknya dari nama mode saja akan
+    menghasilkan posisi 100% MEME untuk user yang meminta 100% quote."""
+    w = max(1, int(width))
+    quote_below = bool(quote_is_y)       # quote ada di bin bawah?
+    if mode == "lower":                  # 100% quote
+        below = quote_below
+    elif mode == "upper":                # 100% meme
+        below = not quote_below
+    else:                                # wide/stable/same → dua sisi, terpusat
+        lo = int(active) - w // 2
+        return lo, lo + w - 1
+    if below:
+        hi = int(active) - 1
+        return hi - w + 1, hi
+    lo = int(active) + 1
+    return lo, lo + w - 1
+
+
+def _wallet_pair(address: str, p: dict) -> tuple[float, float]:
+    """(saldo token_x, saldo token_y) yang benar-benar bisa dipakai.
+
+    Sisi yang kebetulan SOL dipotong cadangan gas: fee tx dan sewa akun posisi
+    baru dibayar dari kantong yang sama, jadi memakai saldo penuh membuat mint
+    gagal justru di langkah terakhir."""
+    import chain as ch
+    res = float(ch.CHAINS[SOL_CHAIN].get("gas_reserve") or 0.08)
+    b0 = token_balance(address, p["token0"])
+    b1 = token_balance(address, p["token1"])
+    if p["token0"] == SOL_MINT:
+        b0 = max(0.0, b0 - res)
+    if p["token1"] == SOL_MINT:
+        b1 = max(0.0, b1 - res)
+    return b0, b1
+
+
+def _plan_pair(pool: str, lower: int, upper: int, shape: str,
+               p: dict, x: float | None = None, y: float | None = None) -> dict:
+    """quote_add dengan salah satu sisi diberikan; kembalikan (x, y) manusia."""
+    kw = ({"amount_x_raw": _amt_raw(x, p["dec0"])} if x is not None
+          else {"amount_y_raw": _amt_raw(y, p["dec1"])})
+    d = sidecar("quote_add", pool=pool, lower_bin=lower, upper_bin=upper,
+                strategy=shape, **kw)
+    return {"x": int(d["amount_x_raw"]) / 10 ** p["dec0"],
+            "y": int(d["amount_y_raw"]) / 10 ** p["dec1"],
+            "side": d.get("side"), "active_bin": int(d["active_bin"])}
+
+
+def _compose(secret: str, pool: str, p: dict, lower: int, upper: int,
+             shape: str, have_x: float, have_y: float, slippage_pct: float,
+             steps: list) -> tuple[float, float]:
+    """Tukar sebagian sisi supaya komposisinya pas untuk range ini.
+
+    Swapnya DI POOL POSISI ITU SENDIRI, sama seperti swap komposisi jalur EVM.
+    Rasio deposit untuk sebuah range+shape itu TETAP, dan `autoFill*` linear
+    terhadap jumlah — jadi satu probe sudah cukup: dari (y0, x0) hasil probe,
+    faktor skalanya `k = nilai_total / nilai_probe`, dan target tiap sisi
+    `k × sisi_probe`. Tanpa penskalaan ini, sisa yang tidak terpakai bisa
+    puluhan persen dari modal."""
+    pr = float(pool_state(pool)["price"])          # token_y per token_x
+    if pr <= 0:
+        return have_x, have_y
+
+    def val(x, y):                                  # nilai total dalam satuan Y
+        return x * pr + y
+
+    probe = _plan_pair(pool, lower, upper, shape, p,
+                       y=have_y if have_y > 0 else None,
+                       x=None if have_y > 0 else have_x)
+    if probe["side"] == "y_only":
+        # Range butuh Y saja: seluruh X ditukar.
+        if have_x > 0:
+            r = swap(secret, pool, have_x, True, slippage_pct, priority_fee())
+            steps += _steps(r.get("signatures"), "Swap komposisi")
+            have_y += int(r.get("amount_out_raw") or 0) / 10 ** p["dec1"]
+            have_x = 0.0
+        return have_x, have_y
+    if probe["side"] == "x_only":
+        if have_y > 0:
+            r = swap(secret, pool, have_y, False, slippage_pct, priority_fee())
+            steps += _steps(r.get("signatures"), "Swap komposisi")
+            have_x += int(r.get("amount_out_raw") or 0) / 10 ** p["dec0"]
+            have_y = 0.0
+        return have_x, have_y
+
+    vp = val(probe["x"], probe["y"])
+    if vp <= 0:
+        return have_x, have_y
+    k = val(have_x, have_y) / vp
+    want_x, want_y = probe["x"] * k, probe["y"] * k
+    if want_x > have_x:
+        need_y = (want_x - have_x) * pr
+        amt = min(need_y, have_y)
+        if amt > 0:
+            r = swap(secret, pool, amt, False, slippage_pct, priority_fee())
+            steps += _steps(r.get("signatures"), "Swap komposisi")
+            have_x += int(r.get("amount_out_raw") or 0) / 10 ** p["dec0"]
+            have_y -= amt
+    elif want_y > have_y:
+        need_x = (want_y - have_y) / pr
+        amt = min(need_x, have_x)
+        if amt > 0:
+            r = swap(secret, pool, amt, True, slippage_pct, priority_fee())
+            steps += _steps(r.get("signatures"), "Swap komposisi")
+            have_y += int(r.get("amount_out_raw") or 0) / 10 ** p["dec1"]
+            have_x -= amt
+    return have_x, have_y
+
+
+def rebalance_any(secret: str, position: str, mode: str = "wide",
+                  shape: str = "Spot", slippage_pct: float = 5.0) -> dict:
+    """Close posisi → swap komposisi sesuai mode → mint ulang dengan LEBAR range
+    yang sama, diletakkan menurut mode terhadap harga sekarang.
+
+    Alur dan artinya sama persis dengan `chain.rebalance_position` di EVM:
+
+    - `wide`/`stable` — dua sisi, dipusatkan di harga sekarang
+    - `lower` — 100% quote, seluruh range di sisi yang memegang quote
+    - `upper` — 100% meme, seluruh range di sisi yang memegang meme
+
+    **Hanya dana HASIL posisi ini yang dipakai**, bukan seluruh saldo wallet —
+    aturan yang sama dengan jalur EVM. Jumlahnya diambil dari snapshot posisi
+    tepat sebelum close (pokok + fee), lalu dijepit ke saldo NYATA supaya
+    selisih pembulatan tidak membuat mint meminta lebih dari yang ada."""
+    addr = address_of(secret)
+    pool = pool_of_position(position)
+    p = pool_info(pool)
+    q_is_y = bool(p["quote_is_token1"])
+
+    cur = sidecar("positions_by_key", pool=pool, positions=[position])
+    raws = cur.get("positions") or []
+    if not raws:
+        raise SolanaError("Posisi tidak ditemukan (sudah ditutup?).")
+    old = raws[0]
+    width = int(old["upper_bin"]) - int(old["lower_bin"]) + 1
+    old_lo, old_hi = int(old["lower_bin"]), int(old["upper_bin"])
+
+    steps: list = []
+    before_x, before_y = _wallet_pair(addr, p)
+    cl = close(secret, pool, position, priority=priority_fee())
+    steps += _steps(cl.get("signatures"), "Close DLMM")
+    snap = cl.get("before") or {}
+    # Yang keluar dari posisi = pokok + fee. Dipakai sebagai BATAS ATAS, lalu
+    # dijepit ke selisih saldo nyata: pembacaan snapshot dan hasil close bisa
+    # berbeda beberapa wei, dan meminta lebih dari yang ada = mint gagal.
+    out_x = (int(snap.get("amount_x_raw") or 0) + int(snap.get("fee_x_raw") or 0)) / 10 ** p["dec0"]
+    out_y = (int(snap.get("amount_y_raw") or 0) + int(snap.get("fee_y_raw") or 0)) / 10 ** p["dec1"]
+    after_x, after_y = _wallet_pair(addr, p)
+    got_x = min(out_x, max(0.0, after_x - before_x)) if after_x > before_x else out_x
+    got_y = min(out_y, max(0.0, after_y - before_y)) if after_y > before_y else out_y
+    got_x, got_y = min(got_x, after_x), min(got_y, after_y)
+    if got_x <= 0 and got_y <= 0:
+        raise SolanaError(
+            "Hasil close terbaca 0 — dananya aman di wallet, cek /wallet lalu "
+            "buat posisi baru manual.")
+
+    st = pool_state(pool)
+    active = int(st["active_bin"])
+    lo, hi = rebalance_bins(width, active, mode, q_is_y)
+    got_x, got_y = _compose(secret, pool, p, lo, hi, shape, got_x, got_y,
+                            slippage_pct, steps)
+
+    # Sisi PROBE dipilih dari sisi mana yang BERISI, bukan dari nama mode.
+    # Setelah swap komposisi, mode satu sisi menyisakan dana hanya di satu sisi
+    # — dan sisi mana itu bergantung orientasi quote. Memilihnya dari mode
+    # membuat "Lower" pada pool ber-quote token_x memprobe sisi yang kosong,
+    # autoFill mengembalikan 0, dan posisi barunya lahir TANPA dana.
+    def _probe(lo_, hi_):
+        return (_plan_pair(pool, lo_, hi_, shape, p, y=got_y) if got_y > 0
+                else _plan_pair(pool, lo_, hi_, shape, p, x=got_x))
+
+    # Bin aktif bisa bergeser oleh swap komposisi itu sendiri — mode satu sisi
+    # harus tetap tidak menyentuh bin aktif, jadi letaknya dihitung ULANG.
+    plan = _probe(lo, hi)
+    if plan["active_bin"] != active:
+        active = plan["active_bin"]
+        lo, hi = rebalance_bins(width, active, mode, q_is_y)
+        plan = _probe(lo, hi)
+    # Kalau sisi lawan yang diminta melebihi yang ada, rencananya disusun ULANG
+    # dari sisi yang membatasi. Memotongnya begitu saja (`min`) merusak RASIO
+    # kedua sisi, dan rasio itulah yang menentukan bentuk posisinya.
+    if plan["x"] > got_x + 1e-12:
+        plan = _plan_pair(pool, lo, hi, shape, p, x=got_x)
+    elif plan["y"] > got_y + 1e-12:
+        plan = _plan_pair(pool, lo, hi, shape, p, y=got_y)
+    dep_x, dep_y = min(plan["x"], got_x), min(plan["y"], got_y)
+    if dep_x <= 0 and dep_y <= 0:
+        raise SolanaError(
+            "Komposisi hasil close tidak muat di range baru — dananya aman di "
+            "wallet, cek /wallet lalu buat posisi baru manual.")
+
+    d = sidecar("add_new", secret=secret, pool=pool, lower_bin=lo, upper_bin=hi,
+                amount_x_raw=_amt_raw(dep_x, p["dec0"]),
+                amount_y_raw=_amt_raw(dep_y, p["dec1"]),
+                strategy=shape, slippage_pct=float(slippage_pct),
+                priority_micro_lamports=priority_fee())
+    steps += _steps(d.get("signatures"), "Mint DLMM")
+    px0, px1 = token_usd_price(p["token0"]), token_usd_price(p["token1"])
+    return {"steps": steps, "mode": mode, "shape": shape,
+            "pid": f"dlmm:{d.get('position')}", "position": d.get("position"),
+            "old_position": position, "old_lower": old_lo, "old_upper": old_hi,
+            "lower_bin": lo, "upper_bin": hi, "active_bin": active,
+            "n_bins": hi - lo + 1, "width": width,
+            "closed_usd": (out_x * px0) + (out_y * px1),
+            "in0": dep_x, "in1": dep_y,
+            "added_usd": dep_x * px0 + dep_y * px1,
+            "left0": max(0.0, got_x - dep_x), "left1": max(0.0, got_y - dep_y),
+            "pool_info": p, "signatures": d.get("signatures")}

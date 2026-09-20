@@ -353,32 +353,71 @@ baris tombol tersendiri di kartu konfirmasi. Terukur pada SOL/USDC ±25/50%
 dengan 100 USDC: Spot butuh 0,8756 SOL, Curve 0,9112, BidAsk 0,8423 — Curve
 menumpuk dekat bin aktif sehingga butuh sisi lawan lebih banyak.
 
-Karena shape tidak punya padanan di mode EVM, layar rebalance DLMM menawarkan
-**shape**, bukan mode range (wide/lower/upper) — callback-nya
-`rebok|<pid>|shape:<X>`, dibedakan dari mode EVM lewat awalannya.
+#### Rebalance DLMM = close → swap komposisi → mint, SAMA seperti EVM
 
-#### Rebalance & compound DLMM terjadi DI TEMPAT, bukan close + mint ulang
+**`rebalancePosition` bawaan SDK sengaja TIDAK dipakai untuk rebalance.** Ia
+selalu memusatkan range di bin aktif, jadi ia cuma bisa meniru mode `wide` —
+mode **Lower** (100% quote, menampung harga turun) dan **Upper** (100% meme,
+menjual naik) mustahil dinyatakan di sana, padahal justru itu yang paling
+sering dipakai. Jadi alurnya sama persis dengan `chain.rebalance_position`:
+close (fee ikut terambil) → swap komposisi di pool itu sendiri → mint ulang
+dengan **lebar range yang sama**, diletakkan menurut mode.
 
-Keduanya lewat `rebalancePosition` SDK. Akun posisinya **tidak ditutup**, jadi
-sewa ~0,057 SOL tidak dilepas lalu dibayar lagi, tidak ada posisi baru yang
-lahir, dan **`pid`-nya tetap** sehingga riwayat PnL tidak terputus. Ini beda
-mendasar dari jalur EVM yang harus close → swap → mint (3–5 tx).
+UI-nya **dua langkah**, dan urutannya penting: mode dulu (`rebsh|<pid>|<mode>`,
+tombolnya sama dengan EVM), baru shape (`rebok|<pid>|<mode>:<shape>`).
+Menggabungnya jadi satu layar berarti 3×3 = sembilan tombol yang artinya tidak
+bisa ditebak dari labelnya.
 
-- **Rebalance** = `simulateRebalancePositionWithBalancedStrategy` dengan
-  withdraw 0 bps dan topup 0: seluruh likuiditas + fee ditarik lalu disetor
-  ulang **selebar semula, dipusatkan di bin aktif**. Artinya sama persis dengan
-  "lebar lama, dipusatkan di harga sekarang" di EVM, dan fee ikut ter-reinvest —
-  juga sama. `mode` dan `gap` karena itu TIDAK dipakai; mengubah lebar berarti
-  posisi baru, dan itu tombol Close + mint.
-- **Compound** = `simulateRebalancePositionWithStrategy` dengan `withdraws: []`
-  (pokok tidak disentuh) dan satu deposit yang range-nya dinyatakan sebagai
-  **delta terhadap bin aktif** (`lowerBinId − activeId … upperBinId − activeId`),
-  sehingga bin batasnya persis tidak bergeser. `shouldClaimFee: true`, jadi fee
-  diklaim dan dipakai sebagai jumlah setoran **di dalam simulasi yang sama** —
-  tidak ada jeda di mana dana itu menganggur di wallet.
-- **Pindah pool ditolak**: akun posisi DLMM terikat ke satu `lbPair`.
+**Sisi mana yang memegang quote TIDAK tetap, dan menebaknya dari nama mode
+memberi user kebalikan dari yang ia minta.** Di DLMM bin **di bawah** bin aktif
+memegang token Y, bin **di atas** memegang token X. Jadi "Lower = 100% quote"
+berarti di bawah bin aktif kalau quote itu `token_y`, tapi di **ATAS** bin aktif
+kalau quote itu `token_x`. `rebalance_bins()` yang menanganinya; diuji untuk
+kedua orientasi.
 
-**TIGA besaran hasil yang WAJIB dipisah — menukarnya membuat kartu melapor
+Tiga hal lain yang gampang salah di jalur ini:
+
+- **Sisi PROBE dipilih dari sisi yang BERISI, bukan dari nama mode.** Sesudah
+  swap komposisi, mode satu sisi menyisakan dana hanya di satu sisi — dan sisi
+  mana itu bergantung orientasi quote. Memilihnya dari mode membuat "Lower"
+  pada pool ber-quote `token_x` memprobe sisi yang kosong, `autoFill`
+  mengembalikan 0, dan posisi barunya lahir **tanpa dana**.
+- **Kalau sisi lawan yang diminta melebihi yang ada, rencananya disusun ULANG
+  dari sisi yang membatasi** — bukan dipotong dengan `min()`. Memotong merusak
+  RASIO kedua sisi, dan rasio itulah yang menentukan bentuk posisinya.
+- **Bin aktif bisa bergeser oleh swap komposisi itu sendiri**, jadi letak range
+  dihitung ulang sesudah swap. Tanpa itu mode satu sisi bisa menyentuh bin aktif
+  lagi dan menarik sisi lawan yang tidak diminta.
+
+Swap komposisinya memakai `swapQuote` pool itu sendiri, dan **rasio deposit
+untuk sebuah range+shape itu TETAP** sedangkan `autoFill*` linear terhadap
+jumlah — jadi satu probe cukup: dari `(y0, x0)` hasil probe, faktor skalanya
+`k = nilai_total / nilai_probe` dan target tiap sisi `k × sisi_probe`. Tanpa
+penskalaan itu sisa yang tidak terpakai bisa puluhan persen dari modal.
+
+**Hanya dana HASIL posisi ini yang dipakai**, sama seperti EVM. Jumlahnya dari
+snapshot tepat sebelum close (pokok + fee), lalu dijepit ke saldo NYATA —
+pembacaan snapshot dan hasil close bisa beda beberapa wei, dan meminta lebih
+dari yang ada = mint gagal.
+
+Pid-nya BERGANTI (akun lama ditutup, yang baru lahir), jadi pembukuannya sama
+dengan EVM: event `close` + `fees` untuk yang lama, `mint` untuk yang baru.
+
+#### Compound DLMM justru TETAP di tempat
+
+Di sini `rebalancePosition` SDK memang alat yang benar, karena yang diinginkan
+justru **range yang tidak bergeser**:
+`simulateRebalancePositionWithStrategy` dengan `withdraws: []` (pokok tidak
+disentuh) dan satu deposit yang range-nya dinyatakan sebagai **delta terhadap
+bin aktif** (`lowerBinId − activeId … upperBinId − activeId`), sehingga bin
+batasnya persis sama. `shouldClaimFee: true`, jadi fee diklaim dan dipakai
+sebagai jumlah setoran **di dalam simulasi yang sama** — tidak ada jeda di mana
+dana itu menganggur di wallet. Akun posisinya tidak ditutup, jadi sewa ~0,057
+SOL tidak dilepas lalu dibayar lagi dan `pid`-nya tetap.
+
+**Pindah pool ditolak**: akun posisi DLMM terikat ke satu `lbPair`.
+
+**TIGA besaran hasil compound yang WAJIB dipisah — menukarnya membuat kartu melapor
 "0 masuk" untuk rebalance yang sebenarnya menyetor ulang penuh.** Dibaca dari
 sumber SDK (`_simulateDeposit`):
 
@@ -389,13 +428,8 @@ sumber SDK (`_simulateDeposit`):
 | `actualLiquidityAndFeeXWithdrawn` = `max(0, withdrawn − deposit)` | yang kembali ke **wallet** |
 
 Percobaan pertama memakai `actualAmountXDeposited` sebagai "yang disetor" dan
-kartunya menulis **0** untuk rebalance FLEX/SOL yang sebenarnya menyetor ulang
-71.724 FLEX + 1,0956 SOL. `_rb_amounts()` menamainya `in_*` / `from_*` / `to_*`.
-
-**Simulasi dijalankan DULU sebelum tx** (`dry: true`), dan kalau strategi minta
-lebih dari yang ditarik, kekurangannya diambil dari wallet — saldo diperiksa di
-situ dan ditolak dengan angka yang jelas, bukan dibiarkan revert setelah gas
-terbakar.
+kartunya menulis **0** untuk operasi yang sebenarnya menyetor ulang 71.724 FLEX
++ 1,0956 SOL. `_rb_amounts()` menamainya `in_*` / `from_*` / `to_*`.
 
 `rebalancePosition` mengembalikan **instruksi**, bukan `Transaction` (beda dengan
 jalur add/remove). `buildTxs()` memecahnya jadi dua tx: init bin array harus

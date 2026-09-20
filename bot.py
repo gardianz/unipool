@@ -2251,29 +2251,57 @@ def _rb_line(lbl: str, a: dict, p: dict, s0: str, s1: str, k0: str, k1: str) -> 
 
 
 def rebalance_card_dlmm(cid: int, pid: str, r: dict) -> str:
-    """Kartu hasil rebalance DLMM. Dipanggil di thread."""
-    a, p = r.get("amt") or {}, r.get("pool_info") or {}
+    """Kartu hasil rebalance DLMM (close → swap → mint). Dipanggil di thread."""
+    p = r.get("pool_info") or {}
     s0, s1 = p.get("sym0") or "?", p.get("sym1") or "?"
     L = [f"✅ <b>Rebalance selesai</b> · {esc(p.get('name') or '')} · "
+         f"{esc(STRAT_LABEL.get(r.get('mode'), r.get('mode') or ''))} · "
          f"{esc(SHAPE_LABEL.get(r.get('shape'), r.get('shape') or ''))}",
+         f"Closed: {ch.fmt_usd(r.get('closed_usd'))} (termasuk fee)",
+         # Range SESUDAHNYA wajib disebut: seluruh guna rebalance adalah
+         # memindahkan range, jadi kartu tanpa angka barunya memaksa user
+         # membuka kartu posisi cuma untuk tahu hasilnya sesuai atau tidak.
          f"Range baru: bin {r.get('lower_bin')} … {r.get('upper_bin')} "
-         f"(bin aktif {r.get('active_bin')})",
-         _rb_line("📥 Masuk posisi", a, p, s0, s1, "in0", "in1")
-         + f" (≈{ch.fmt_usd(r.get('in_usd'))})"]
-    # Tiga arus yang berbeda — disebut terpisah karena tindakannya beda. Kalau
-    # digabung, user membaca "dari wallet" sebagai kerugian.
-    if (a.get("from0") or 0) > 0 or (a.get("from1") or 0) > 0:
-        L.append(_rb_line("➕ Tambahan dari wallet", a, p, s0, s1, "from0", "from1")
-                 + f" (≈{ch.fmt_usd(r.get('from_wallet_usd'))})")
-    if (a.get("to0") or 0) > 0 or (a.get("to1") or 0) > 0:
-        L.append(_rb_line("↩️ Kembali ke wallet", a, p, s0, s1, "to0", "to1")
-                 + f" (≈{ch.fmt_usd(r.get('to_wallet_usd'))}) — sisa yang tidak muat")
-    if a.get("rent_sol"):
-        L.append(f"<i>Sewa bin array baru {a['rent_sol']:.6f} SOL (di luar fee tx).</i>")
+         f"({r.get('n_bins')} bin, lebar dipertahankan) · bin aktif {r.get('active_bin')}",
+         f"📥 Masuk posisi: {ch.fmt_amount(r.get('in0') or 0)} {esc(s0)} + "
+         f"{ch.fmt_amount(r.get('in1') or 0)} {esc(s1)} "
+         f"(≈{ch.fmt_usd(r.get('added_usd'))})"]
+    if (r.get("left0") or 0) > 0 or (r.get("left1") or 0) > 0:
+        L.append(f"<i>Sisa {ch.fmt_amount(r['left0'])} {esc(s0)} + "
+                 f"{ch.fmt_amount(r['left1'])} {esc(s1)} tetap di WALLET (bukan "
+                 f"hilang) — rasio dua sisi ditentukan range, jadi lazim ada yang "
+                 f"tidak muat.</i>")
     for st in r.get("steps") or []:
         L.append(f"• {esc(st)}")
-    L.append("<i>Akun posisi TIDAK ditutup — sewanya tidak dilepas dan pid-nya tetap.</i>")
+    L.append(f"<code>{esc(r.get('position') or '')}</code>")
     return "\n".join(L)
+
+
+async def finish_rebalance_dlmm(update, status, cid: int, pid: str, pos, r: dict):
+    """Pembukuan + kartu hasil rebalance DLMM.
+
+    Pid-nya BERGANTI (akun posisi lama ditutup, yang baru lahir), jadi
+    pencatatannya sama persis dengan jalur EVM: event `close` + `fees` untuk
+    yang lama, `mint` untuk yang baru. Tanpa itu deposit lama menggantung
+    "masih terbuka" dan PnL portfolio menggelembung palsu."""
+    w = wallet_address()
+    if pos:
+        store.record_event(cid, "close", str(pid), pos["value_usd"],
+                           "rebalance out", wallet=w)
+        if pos["unclaimed_usd"] > 0:
+            store.record_event(cid, "fees", str(pid), pos["unclaimed_usd"], wallet=w)
+    elif r.get("closed_usd"):
+        # closed_usd sudah mencakup pokok + fee, jadi JANGAN tambah event fees
+        # lagi — nanti fee-nya terhitung dua kali.
+        store.record_event(cid, "close", str(pid), r["closed_usd"],
+                           "rebalance out (snapshot gagal)", wallet=w)
+    new_pid = r.get("pid") or pid
+    store.record_event(cid, "mint", new_pid, r.get("added_usd") or 0,
+                       "rebalance in", wallet=w)
+    pos_cache_drop(cid)
+    text = await asyncio.to_thread(rebalance_card_dlmm, cid, pid, r)
+    await edit(status, text, InlineKeyboardMarkup([[InlineKeyboardButton(
+        "📄 Buka posisi baru", callback_data=f"pos|{new_pid}")]]))
 
 
 def compound_card_dlmm(cid: int, pid: str, r: dict) -> str:
@@ -4546,13 +4574,15 @@ async def ask_rebalance(update: Update, pid: str):
     meme_sym = p["sym0"] if p["quote_is_token1"] else p["sym1"]
     status = "🟢 IN" if p["in_range"] else "🔴 OUT"
     if p.get("ver") == 5:
-        # DLMM: yang dipilih SHAPE, bukan mode range. Lebarnya dipertahankan SDK
-        # dan selalu dipusatkan di bin aktif, jadi wide/lower/upper tidak punya
-        # arti di sini — dan menawarkannya akan menjanjikan sesuatu yang tidak
-        # terjadi. `rebok|<pid>|shape:<X>` dibedakan dari mode EVM lewat awalan.
+        # Langkah 1 dari dua: MODE dulu, persis seperti EVM. Shape dipilih di
+        # layar berikutnya (`rebsh|`) — menggabung 3 mode × 3 shape jadi satu
+        # layar berarti 9 tombol yang artinya tidak bisa ditebak dari labelnya.
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton(SHAPE_LABEL[sh], callback_data=f"rebok|{pid}|shape:{sh}")
-             for sh in ("Spot", "Curve", "BidAsk")],
+            [InlineKeyboardButton("⚖️ Wide — dua sisi", callback_data=f"rebsh|{pid}|wide")],
+            [InlineKeyboardButton(f"Lower — {p['quote_sym'] or 'quote'} saja (nampung turun)",
+                                  callback_data=f"rebsh|{pid}|lower"),
+             InlineKeyboardButton(f"Upper — {meme_sym} saja (jual naik)",
+                                  callback_data=f"rebsh|{pid}|upper")],
             [InlineKeyboardButton("❌ Cancel", callback_data="cancel")],
         ])
         await reply(update, (
@@ -4560,12 +4590,13 @@ async def ask_rebalance(update: Update, pid: str):
             f"{esc(meme_sym)}/{esc(p['quote_sym'] or '')} · "
             f"Val ~{ch.fmt_usd(p['value_usd'])} · {status}\n"
             f"Range: {esc(range_str(p))}\n"
-            f"💰 Fee unclaimed {ch.fmt_usd(p['unclaimed_usd'])} — ikut ter-reinvest.\n\n"
-            f"Likuiditas + fee ditarik lalu disetor ulang <b>selebar sekarang "
-            f"({p.get('n_bins')} bin)</b>, dipusatkan di bin aktif.\n"
-            f"<i>Dilakukan DI TEMPAT: akun posisinya tidak ditutup, jadi sewa "
-            f"~{ch.fmt_amount(p.get('rent_sol') or 0)} SOL tidak dilepas lalu dibayar "
-            f"lagi, dan riwayat PnL-nya tidak terputus. Pilih bentuk sebarannya:</i>"), kb)
+            f"💰 Fee unclaimed {ch.fmt_usd(p['unclaimed_usd'])} — ikut terambil saat close.\n\n"
+            f"Close (fee ikut terambil) → swap komposisi → mint ulang dengan "
+            f"<b>lebar range sama ({p.get('n_bins')} bin)</b>, diletakkan menurut "
+            f"mode terhadap harga sekarang.\n"
+            f"<i>Hanya dana hasil posisi ini yang dipakai. Sewa akun posisi lama "
+            f"(~{ch.fmt_amount(p.get('rent_sol') or 0)} SOL) kembali saat close dan "
+            f"dibayar lagi untuk posisi baru. 2–4 transaksi.</i>"), kb)
         return
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("⚖️ Wide — dua sisi", callback_data=f"rebok|{pid}|wide")],
@@ -4584,6 +4615,30 @@ async def ask_rebalance(update: Update, pid: str):
         f"<i>Hanya dana hasil posisi ini yang dipakai. 3–5 transaksi.</i>"), kb)
 
 
+async def ask_rebalance_shape(update: Update, pid: str, mode: str):
+    """Langkah 2 rebalance DLMM: bentuk sebaran likuiditas di dalam range.
+
+    Knop ini tidak ada di Uniswap — di sana likuiditas selalu rata sepanjang
+    range — jadi ia layar tersendiri, bukan varian mode."""
+    p = await asyncio.to_thread(position_one, store.load_settings()["chain"], pid)
+    if not p:
+        await reply(update, f"❌ Posisi {disp_pid(pid)} tidak ditemukan.")
+        return
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(SHAPE_LABEL[sh], callback_data=f"rebok|{pid}|{mode}:{sh}")
+         for sh in ("Spot", "Curve", "BidAsk")],
+        [InlineKeyboardButton("⬅️ Ganti mode", callback_data=f"reb|{pid}"),
+         InlineKeyboardButton("❌ Cancel", callback_data="cancel")],
+    ])
+    await reply(update, (
+        f"⚖️ <b>Rebalance {_pos_disp(p)} · {esc(STRAT_LABEL.get(mode, mode))}</b>\n"
+        f"Lebar range dipertahankan: <b>{p.get('n_bins')} bin</b> "
+        f"(bin step {p.get('bin_step')}).\n\n"
+        f"Pilih bentuk sebaran likuiditasnya:\n"
+        + "\n".join(f"· <b>{esc(SHAPE_LABEL[k])}</b> — {esc(SHAPE_DESC[k])}"
+                     for k in ("Spot", "Curve", "BidAsk"))), kb)
+
+
 async def do_rebalance(update: Update, pid: str, mode: str):
     async with position_busy(update, pid) as _ok:
         if not _ok:
@@ -4595,14 +4650,14 @@ async def do_rebalance(update: Update, pid: str, mode: str):
             return position_one(cid, pid)
 
         pos = await asyncio.to_thread(snapshot)
-        # DLMM: `mode` membawa SHAPE (`shape:Spot`), bukan mode range EVM —
-        # lebar rangenya dipertahankan SDK dan tidak ada close/swap/mint.
-        shape = mode.split(":", 1)[1] if str(mode).startswith("shape:") else None
-        if shape:
-            head = (f"⏳ Rebalance {disp_pid(pid)} · {SHAPE_LABEL.get(shape, shape)}… "
-                    f"(di tempat, posisi tidak ditutup)")
-        else:
-            head = f"⏳ Rebalance {disp_pid(pid)} → {mode}... (close → swap → mint)"
+        # DLMM membawa mode DAN shape dalam satu callback ("wide:Spot"); jalur
+        # EVM cuma mode. Alurnya sendiri sama: close → swap → mint.
+        shape = None
+        if ":" in str(mode):
+            mode, shape = str(mode).split(":", 1)
+        head = (f"⏳ Rebalance {disp_pid(pid)} → {mode}"
+                + (f" · {SHAPE_LABEL.get(shape, shape)}" if shape else "")
+                + "... (close → swap → mint)")
         status = await reply(update, head)
         async with TX_LOCK:
             try:
@@ -4619,13 +4674,7 @@ async def do_rebalance(update: Update, pid: str, mode: str):
                 return
 
         if shape:
-            # Posisi DLMM TIDAK berganti pid (akunnya sama), jadi pembukuan
-            # close+mint jalur EVM tidak berlaku: tidak ada posisi lama yang
-            # ditutup dan tidak ada yang baru lahir.
-            pos_cache_drop(cid)
-            await edit(status, await asyncio.to_thread(rebalance_card_dlmm, cid, pid, r),
-                       InlineKeyboardMarkup([[InlineKeyboardButton(
-                           "📄 Buka posisi", callback_data=f"pos|{pid}")]]))
+            await finish_rebalance_dlmm(update, status, cid, pid, pos, r)
             return
         await finish_rebalance(update, status, cid, pid, pos, r, mode=mode)
 
@@ -5314,6 +5363,11 @@ async def _route_callback(update: Update):
         return
     if data.startswith("reb|"):
         await ask_rebalance(update, data.split("|", 1)[1])
+        return
+    if data.startswith("rebsh|"):
+        _, tid, mode = data.split("|")
+        await q.edit_message_reply_markup(None)
+        await ask_rebalance_shape(update, tid, mode)
         return
     if data.startswith("rebok|"):
         _, tid, mode = data.split("|")

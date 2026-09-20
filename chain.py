@@ -8814,12 +8814,13 @@ def rebalance_position(chain_id: int, pk: str, pid, mode: str, slippage_pct: flo
             raise RuntimeError(
                 "Pindah pool belum ada untuk Meteora DLMM — Close posisi ini "
                 "lalu buat posisi baru di pool tujuan.")
-        # DLMM rebalance DI TEMPAT lewat SDK: akun posisinya tidak ditutup,
-        # sewanya tidak dilepas lalu dibayar lagi, dan pid-nya tetap sehingga
-        # riwayat PnL tidak terputus. Lebar range dipertahankan apa adanya dan
-        # selalu dipusatkan di bin aktif — arti yang sama dengan mode EVM
-        # wide/lower/upper ("lebar lama, dipusatkan di harga sekarang"), jadi
-        # `mode` dan `gap` tidak dipakai.
+        # Alurnya SAMA dengan jalur EVM di bawah: close → swap komposisi →
+        # mint ulang dengan LEBAR range yang sama, diletakkan menurut mode
+        # terhadap harga sekarang. `rebalancePosition` bawaan SDK Meteora
+        # sengaja TIDAK dipakai: ia selalu memusatkan range di bin aktif, jadi
+        # ia cuma bisa meniru mode `wide` — Lower/Upper (satu sisi) mustahil
+        # dinyatakan di sana, padahal justru itu yang paling sering dipakai.
+        # `shape` (Spot/Curve/BidAsk) knop tambahan yang tidak ada di Uniswap.
         _, _ref = parse_pid(pid)
         return _sol().rebalance_any(pk, str(_ref), mode=mode,
                                     shape=(shape or "Spot"),
