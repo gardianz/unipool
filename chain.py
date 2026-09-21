@@ -7719,7 +7719,10 @@ def pool_stats(w3: Web3, chain_id: int, p: dict, _cache={}) -> dict:
         st = _sol().pool_stats(p)
         out = {"tvl_usd": st.get("tvl_usd"), "vol24_usd": st.get("vol24_usd"),
                "fee_pct": (st.get("fee") or 0) / 1e4, "tick_spacing": st.get("tick_spacing"),
-               "dex": p.get("dex"), "tvl_src": "meteora", "apr_pct": st.get("apr_pct")}
+               "dex": p.get("dex"), "tvl_src": "meteora", "apr_pct": st.get("apr_pct"),
+               # Pool DLMM ber-CollectFeeMode OnlyY: fee HANYA menumpuk di satu
+               # sisi. Ikut dibawa karena kartu posisi yang menampilkannya.
+               "fee_only_sym": st.get("fee_only_sym")}
         _cache[ck] = (out, time.time())
         return out
     q_is_t1 = bool(p.get("quote_is_token1"))

@@ -2090,7 +2090,9 @@ async def show_pools_for(status, cid: int, token: str, extra: dict | None = None
         ver = p.get("ver", 3)
         # tanda DEX cuma muncul di chain ber-DEX ganda (BSC: P=PancakeSwap, U=Uniswap)
         dtag = (p.get("dex") or "")[:1] if len(ch.dex_names(cid)) > 1 else ""
-        warn = "!" if p.get("deviation") else ""
+        # `!` = harga menyimpang, `¤` = fee cuma menumpuk di SATU sisi
+        # (CollectFeeMode OnlyY). Keduanya boleh muncul bersamaan.
+        warn = ("!" if p.get("deviation") else "") + ("¤" if p.get("fee_only_sym") else "")
         # DLMM: yang menentukan presisi range adalah BIN STEP, bukan nomor versi —
         # jadi itu yang ditulis di kolom kiri. "v5" tidak berarti apa pun bagi user.
         tag = f"b{p.get('bin_step')}" if ver == 5 else f"v{ver}{dtag}"
@@ -2100,8 +2102,10 @@ async def show_pools_for(status, cid: int, token: str, extra: dict | None = None
             f"{fmt_short(p.get('vol24_usd')):>5} {fmt_ratio(p.get('vol24_usd'), p.get('tvl_usd')):>6}")
         lbl = (f"{i}. [DLMM bin {p.get('bin_step')}] " if ver == 5
                else f"{i}. [{esc(p.get('dex') or '')} v{ver}] ")
+        fo = p.get("fee_only_sym")
         buttons.append([InlineKeyboardButton(
-            f"{lbl}{p['quote_sym']} {p['fee'] / 10000:.2f}% · {ch.fmt_usd(p['tvl_usd'])}",
+            f"{lbl}{p['quote_sym']} {p['fee'] / 10000:.2f}% · {ch.fmt_usd(p['tvl_usd'])}"
+            + (f" · fee→{fo}" if fo else ""),
             callback_data=f"pool|{key}")])
     # Buat pool v4 ber-fee/spacing custom. Cuma muncul kalau chain ini punya v4 DAN
     # sudah ada pool rujukan — harga awal pool baru disalin dari pool terdalam yang
@@ -2114,10 +2118,15 @@ async def show_pools_for(status, cid: int, token: str, extra: dict | None = None
                                              callback_data=f"np|{nk}")])
     buttons.append([InlineKeyboardButton("✖ Cancel", callback_data="cancel")])
     # pool yang disaring — sebutkan, jangan hilang diam-diam
+    n_fo = sum(1 for x in top if x.get("fee_only_sym"))
     hooks_n = res.get("hook_pools") or 0
     dead = res.get("dropped_dead") or []
     off = res.get("dropped_offprice") or []
     off_line = ""
+    if n_fo:
+        off_line += (f"\n💠 <b>¤</b> = {n_fo} pool membayar fee hanya di SATU sisi "
+                     f"(CollectFeeMode OnlyY) — sisi lawannya tidak pernah menumpuk fee, "
+                     f"jadi Compound di situ cuma menyetor ulang satu sisi.")
     if hooks_n:
         off_line += (f"\n🪝 {hooks_n} pool v4 <b>ber-hooks</b> tidak ditampilkan — hook itu "
                      f"kontrak arbitrer yang ikut jalan tiap swap/mint/burn dan bisa "
@@ -2528,7 +2537,9 @@ def build_preview_dlmm(ctx_data: dict) -> str:
     L = [f"<b>{esc(tsym)}/{esc(qsym)}</b> · {esc(p['dex'])} · "
          f"bin step <b>{p.get('bin_step')}</b> (kisi {p.get('bin_step', 0) / 100:.2f}%)",
          f"fee dasar <b>{p.get('base_fee_pct', 0):g}%</b> · "
-         f"fee sekarang {p.get('dynamic_fee_pct', 0):g}% · "
+         f"fee sekarang {p.get('dynamic_fee_pct', 0):g}%"
+         + (f" · fee hanya <b>{esc(p['fee_only_sym'])}</b>"
+            if p.get("fee_only_sym") else "") + " · "
          f"TVL {ch.fmt_usd(p.get('tvl_usd'))} · vol 24j {ch.fmt_usd(p.get('vol24_usd'))}",
          f"<code>{esc(p['pool'])}</code>",
          "",
@@ -2552,6 +2563,13 @@ def build_preview_dlmm(ctx_data: dict) -> str:
         L.append(f"Seluruh range DI ATAS harga sekarang → setoran <b>100% "
                  f"{esc(tsym)}</b>. Posisi baru menghasilkan {esc(qsym)} kalau harga naik "
                  f"melintasinya — persis limit sell bertingkat.")
+    fo = p.get("fee_only_sym")
+    if fo:
+        lawan = tsym if fo == qsym else qsym
+        L.append(f"💠 Pool ini <b>membayar fee hanya dalam {esc(fo)}</b> "
+                 f"(CollectFeeMode OnlyY) — arah swap apa pun. Sisi {esc(lawan)} "
+                 f"TIDAK pernah menumpuk fee, jadi ♻️ Compound cuma menyetor "
+                 f"ulang sisi {esc(fo)}.")
     L.append(f"Setoran: <b>{ch.fmt_amount(plan['quote_in'])} {esc(qsym)}</b> + "
              f"<b>{ch.fmt_amount(plan['meme_in'])} {esc(tsym)}</b> "
              f"(≈{ch.fmt_usd(plan['usd'])})")
@@ -4547,6 +4565,12 @@ def _pool_info_line(cid: int, p: dict, ver: int) -> str:
         bits.append(f"V/TVL {fmt_ratio(vol, tvl)}")
     line = "🏊 " + " · ".join(bits)
     extra = []
+    # Pool DLMM ber-CollectFeeMode OnlyY: fee menumpuk HANYA di satu sisi, arah
+    # swap apa pun. Itu mengubah arti Compound (sisi lawan selalu 0) dan bikin
+    # posisi 100% meme tetap menghasilkan quote, jadi wajib disebut.
+    fo = s.get("fee_only_sym")
+    if fo:
+        extra.append(f"fee hanya <b>{esc(fo)}</b>")
     if tvl and p.get("value_usd"):
         # Porsi kita di pool: penentu seberapa besar dampak masuk/keluar kita sendiri
         extra.append(f"porsi kita {p['value_usd'] / tvl * 100:.1f}%")

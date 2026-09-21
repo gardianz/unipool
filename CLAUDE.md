@@ -920,6 +920,41 @@ generik**, dan kartu generik membacanya dengan `.get()` + melewati barisnya kala
 kosong. Dua-duanya, bukan salah satu — kontrak menjaga kartunya informatif, dan
 `.get()` menjaga aksi yang sudah berhasil tidak dilaporkan gagal.
 
+#### `CollectFeeMode`: pool yang fee-nya cuma menumpuk di SATU sisi
+
+Sebagian pool DLMM membayar fee **hanya dalam satu token**, arah swap apa pun.
+Meteora menandainya dengan titik hijau "Fees In Quote Token" di daftar pool
+mereka; bot dulu tidak menyebutnya sama sekali, jadi dua pool pasangan yang
+sama terlihat identik padahal artinya berbeda untuk LP.
+
+Enum SDK-nya: **0 = `InputOnly`** (fee diambil dari sisi token yang MASUK, jadi
+kedua sisi bisa menumpuk) dan **1 = `OnlyY`** (fee SELALU token Y). Terukur
+pada TIGRINO/SOL, pasangan yang sama persis: `5TTHzu39…` mode 0, `AGVxQPJk…`
+dan `HrqPvukx…` mode 1 — cocok persis dengan titik hijau di UI Meteora.
+
+Dua sumber, dan keduanya dipakai:
+
+- **Data API**: `pool_config.collect_fee_mode` (bukan di akar row — di akar
+  tidak ada field fee apa pun selain `dynamic_fee_pct`).
+- **Sidecar**: `lbPair.parameters.collectFeeMode` — **bersarang di
+  `parameters`**, bukan di akar `lbPair`. Mencarinya di akar mengembalikan
+  `undefined` TANPA error, dan pool quote-only lalu terbaca seperti pool biasa.
+  Dipakai untuk pool yang belum terindeks Data API. Nilainya diverifikasi
+  identik dengan Data API pada kedua pool di atas.
+
+**Mode 1 TIDAK otomatis berarti "fee dalam quote".** Nama Meteora benar untuk
+pool mereka karena quote di situ memang selalu token Y — tapi kalau quote
+justru `token_x`, mode 1 berarti fee menumpuk di sisi **MEME**. Itu kebalikan
+dari yang dibaca user dan justru kasus yang paling perlu ditandai, jadi
+`fee_only_sym()` menurunkan simbolnya dari ORIENTASI, bukan dari nama mode.
+
+Kenapa ini bukan kosmetik: **Compound berubah artinya.** Fee sisi lawan selalu
+0, jadi `compound_any` cuma menyetor ulang satu sisi — dan untuk posisi
+satu-sisi mode `upper` (100% meme) hasilnya tetap quote. Ditandai di tiga
+tempat: tabel daftar pool (`¤` di kolom tag + legenda yang menyebut jumlahnya),
+label tombol pool (`· fee→SOL`), kartu konfirmasi mint (satu kalimat penuh
+dengan akibatnya), dan baris info pool di kartu posisi (`fee hanya SOL`).
+
 #### Yang belum ada untuk Solana
 
 Swap komposisi otomatis, pindah pool, revoke approval (Solana tidak punya

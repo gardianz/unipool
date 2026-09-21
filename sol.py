@@ -461,6 +461,27 @@ def token_usd_price(mint: str) -> float:
 
 
 # ══════════════════════════ Pool ══════════════════════════
+def fee_only_sym(mode, sym1: str | None) -> str | None:
+    """Simbol satu-satunya token tempat fee pool ini menumpuk, atau `None`.
+
+    `CollectFeeMode` DLMM: **0 = InputOnly** (fee diambil dari sisi token yang
+    MASUK, jadi kedua sisi bisa menumpuk fee) dan **1 = OnlyY** (fee SELALU
+    token Y, arah swap apa pun). Terukur: dua pool TIGRINO/SOL yang mintnya
+    sama persis, satu mode 0 satu mode 1.
+
+    **Mode 1 TIDAK otomatis berarti "fee dalam quote".** Meteora menamainya
+    "Fees In Quote Token" karena di pool mereka quote memang selalu token Y —
+    tapi kalau quote justru `token_x`, mode 1 berarti fee menumpuk di sisi
+    MEME. Itu kebalikan dari yang dibaca user, dan justru kasus yang paling
+    perlu ditandai, jadi simbolnya diturunkan dari orientasi bukan dari nama
+    mode-nya."""
+    try:
+        m = int(mode)
+    except (TypeError, ValueError):
+        return None
+    return (sym1 or None) if m == 1 else None
+
+
 def _pool_from_api(row: dict) -> dict | None:
     """Satu entri Data API → dict pool_info berbentuk SAMA dengan pool EVM.
 
@@ -488,6 +509,11 @@ def _pool_from_api(row: dict) -> dict | None:
         "base_fee_pct": float(cfgp.get("base_fee_pct") or 0),
         "max_fee_pct": float(cfgp.get("max_fee_pct") or 0),
         "dynamic_fee_pct": float(row.get("dynamic_fee_pct") or 0),
+        # 1 = fee SELALU token Y (lihat `fee_only_sym`). Dibawa mentah supaya
+        # UI bisa menyebut mode-nya, dan sebagai simbol supaya UI tidak perlu
+        # menurunkan orientasinya sendiri.
+        "collect_fee_mode": int(cfgp.get("collect_fee_mode") or 0),
+        "fee_only_sym": fee_only_sym(cfgp.get("collect_fee_mode"), ty.get("symbol")),
         # Padanan tick spacing: bin_step yang menentukan lebar satu kotak.
         "tick_spacing": bin_step,
         "quote_sym": qsym, "quote_addr": qaddr,
@@ -532,6 +558,11 @@ def pool_info(pool: str) -> dict:
         "fee": int(round(float(st.get("base_fee_pct") or 0) * 10_000)),
         "base_fee_pct": float(st.get("base_fee_pct") or 0),
         "dynamic_fee_pct": float(st.get("dynamic_fee_pct") or 0),
+        "collect_fee_mode": int(st.get("collect_fee_mode") or 0),
+        # Pool yang belum terindeks: simbolnya tidak diketahui dari sidecar, tapi
+        # untuk pool ber-quote token_y (lazimnya) itu quote-nya.
+        "fee_only_sym": fee_only_sym(st.get("collect_fee_mode"),
+                                     qsym if q_is_y else None),
         "quote_sym": qsym, "quote_addr": (st["mint_y"] if q_is_y else st["mint_x"]),
         "quote_decimals": int(st["dec_y"] if q_is_y else st["dec_x"]),
         "quote_usd": 0.0, "quote_is_token1": q_is_y,
@@ -591,7 +622,9 @@ def pool_stats(p: dict) -> dict:
     src = fresh or p
     return {"tvl_usd": src.get("tvl_usd"), "vol24_usd": src.get("vol24_usd"),
             "fee": src.get("fee"), "tick_spacing": src.get("bin_step"),
-            "apr_pct": src.get("apr_pct"), "tvl_src": "meteora"}
+            "apr_pct": src.get("apr_pct"), "tvl_src": "meteora",
+            "fee_only_sym": src.get("fee_only_sym"),
+            "collect_fee_mode": src.get("collect_fee_mode")}
 
 
 # ══════════════════════════ Posisi ══════════════════════════

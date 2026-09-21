@@ -257,6 +257,13 @@ function poolOut(inst, active, dx, dy, poolAddr) {
     dec_y: dy,
     reserve_x_raw: s(inst.tokenX.amount),
     reserve_y_raw: s(inst.tokenY.amount),
+    // CollectFeeMode: 0 = InputOnly (fee di sisi token yang MASUK, jadi bisa
+    // kedua sisi), 1 = OnlyY (fee SELALU token Y). Letaknya bersarang di
+    // `parameters`, bukan di akar `lbPair` — mencarinya di akar mengembalikan
+    // undefined tanpa error, dan pool quote-only lalu terbaca seperti pool biasa.
+    // Nilainya cocok persis dengan `pool_config.collect_fee_mode` Data API
+    // (diverifikasi pada dua pool TIGRINO/SOL: mode 1 dan mode 0).
+    collect_fee_mode: Number((inst.lbPair.parameters || {}).collectFeeMode ?? 0),
   };
 }
 
