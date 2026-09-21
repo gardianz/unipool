@@ -1320,6 +1320,39 @@ def range_bins(pool: str, low_pct: float, up_pct: float, mode: str = "wide") -> 
             "quote_sym": qsym, "quote_is_token1": q_is_y}
 
 
+def plan_view(plan: dict, pinfo: dict) -> dict:
+    """Batas range rencana mint dalam satuan QUOTE-per-MEME + market cap USD.
+
+    Dua hal yang diluruskan di sini, dan keduanya soal angka yang dibaca user
+    tepat sebelum ia menekan Confirm:
+
+    - **Orientasi.** `quote_add` mengembalikan `price_*` sebagai harga MENTAH
+      y-per-x (`_price_of_bin`), TIDAK dibalik untuk orientasi quote — berbeda
+      dari `_position_detail` yang memakai `_q_price`. Kartu mint menulisnya apa
+      adanya berlabel `<quote>/<meme>`, jadi di pool ber-quote `token_x` angkanya
+      kebalikan dari labelnya.
+    - **Market cap.** Batas range jauh lebih gampang dinilai sebagai MC daripada
+      sebagai `0.0₅545` — dan MC juga satuan yang dipakai TP/SL, jadi kartu mint
+      dan kartu posisi jadi sebanding. Rumusnya sama dengan `_mc()`: harga
+      quote-per-meme × harga quote USD × supply sisi MEME.
+
+    `mc_*` bernilai `None` kalau supply-nya tidak terbaca; pemanggil lalu jatuh
+    ke harga, persis seperti `range_str()`."""
+    q_is_y = bool(plan.get("quote_is_token1", pinfo.get("quote_is_token1")))
+
+    def q(v):
+        v = float(v or 0.0)
+        return v if q_is_y else (1.0 / v if v else 0.0)
+
+    lo, hi = sorted((q(plan.get("price_lower")), q(plan.get("price_upper"))))
+    now = q(plan.get("price"))
+    qusd = float(pinfo.get("quote_usd") or 0.0)
+    supply = float(pinfo.get("supply0" if q_is_y else "supply1") or 0.0)
+    mc = (lambda v: v * qusd * supply) if (qusd > 0 and supply > 0) else (lambda v: None)
+    return {"lo": lo, "hi": hi, "now": now,
+            "mc_lo": mc(lo), "mc_hi": mc(hi), "mc_now": mc(now)}
+
+
 def capital(address: str, p: dict) -> float:
     """Modal sisi QUOTE yang benar-benar bisa dipakai, dalam satuan quote.
 

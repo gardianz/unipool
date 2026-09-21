@@ -860,6 +860,16 @@ kombinasi (dua orientasi × dua sisi).
 **Batas MC harus DIURUTKAN sebelum ditulis.** Untuk quote = token0 harganya
 dibalik, jadi `mc_lower` (dari batas bawah tick/bin) justru yang lebih BESAR.
 
+**Kartu MINT ikut, lewat `sol.plan_view()`.** Kartu posisi memakai MC sementara
+kartu konfirmasi mint menulis harga mentah (`0.0₅545 … 0.0₄108`) — dua satuan
+berbeda untuk keputusan yang sama, dan MC juga satuan yang dipakai TP/SL. Helper
+itu sekaligus membetulkan orientasinya: `quote_add` mengembalikan `price_*`
+sebagai harga MENTAH y-per-x (`_price_of_bin`), TIDAK dibalik seperti `_q_price`
+di `_position_detail`, sedangkan kartunya menulis label `<quote>/<meme>` — jadi
+di pool ber-quote `token_x` angkanya kebalikan dari labelnya. Terukur pada
+FAMILY/SOL: bin −663…−578 = **MC $577,0k … $1,1M**. Supply tak terbaca → `mc_*`
+None dan kartu jatuh ke harga, aturan yang sama dengan `range_str()`.
+
 #### Kartu hasil punya KONTRAK, dan mesin Solana sempat tidak memenuhinya
 
 `close_any`/`reduce_any`/`collect_any` adalah dispatcher generik: `do_close`,

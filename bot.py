@@ -2493,6 +2493,24 @@ SHAPE_DESC = {
 }
 
 
+def _dlmm_range_line(plan: dict, p: dict, qsym: str, tsym: str) -> str:
+    """Baris Range kartu konfirmasi mint DLMM — market cap kalau bisa.
+
+    Kartu posisi sudah memakai MC lewat `range_str()`, jadi kartu mint yang
+    menulis harga mentah (`0.0₅545 … 0.0₄108`) memaksa user membandingkan dua
+    satuan yang berbeda untuk keputusan yang sama — dan MC juga satuan yang
+    dipakai TP/SL. `sol.plan_view()` sekaligus membalik orientasinya: `plan`
+    membawa harga MENTAH y-per-x, jadi labelnya `<quote>/<meme>` keliru untuk
+    pool ber-quote token_x."""
+    import sol as so
+    v = so.plan_view(plan, p)
+    if v["mc_now"]:
+        return (f"Range: <b>MC {ch.fmt_usd(v['mc_lo'])} … {ch.fmt_usd(v['mc_hi'])}</b> "
+                f"(MC sekarang {ch.fmt_usd(v['mc_now'])})")
+    return (f"Range: <b>{ch.fmt_price(v['lo'])} … {ch.fmt_price(v['hi'])}</b> "
+            f"{esc(qsym)}/{esc(tsym)} (sekarang {ch.fmt_price(v['now'])})")
+
+
 def build_preview_dlmm(ctx_data: dict) -> str:
     """Kartu konfirmasi posisi Meteora DLMM (dipanggil di thread)."""
     import sol as so
@@ -2516,11 +2534,9 @@ def build_preview_dlmm(ctx_data: dict) -> str:
          "",
          f"Mode <b>{esc(STRAT_LABEL.get(mode, mode))}</b> · shape "
          f"<b>{esc(SHAPE_LABEL.get(shape, shape))}</b> — {esc(SHAPE_DESC.get(shape, ''))}",
-         f"Range: <b>{ch.fmt_price(plan['price_lower'])} … "
-         f"{ch.fmt_price(plan['price_upper'])}</b> {esc(qsym)}/{esc(tsym)}",
+         _dlmm_range_line(plan, p, qsym, tsym),
          f"<i>bin {plan['lower_bin']} … {plan['upper_bin']} "
-         f"({plan['n_bins']} bin, bin aktif {plan['active_bin']}) · "
-         f"harga sekarang {ch.fmt_price(plan['price'] if plan['quote_is_token1'] else (1 / plan['price'] if plan['price'] else 0))}</i>",
+         f"({plan['n_bins']} bin, bin aktif {plan['active_bin']})</i>",
          ""]
     if plan["n_bins"] >= so.MAX_BINS_PER_POSITION:
         L.append(f"⚠️ Range dipangkas ke batas satu posisi "
