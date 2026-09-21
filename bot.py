@@ -5263,7 +5263,16 @@ async def ask_close(update: Update, pid: str):
     status = "🟢 IN" if p["in_range"] else "🔴 OUT"
     wsym = ch.CHAINS[cid]["wrapped_symbol"]
     meme_sym = p["sym0"] if p["quote_is_token1"] else p["sym1"]
-    if ver == 4:
+    if ver == 5:
+        # `sol.close_any` MENGABAIKAN autoswap dan itu disengaja (lihat CLAUDE.md).
+        # Menawarkan tombolnya tetap = menjanjikan swap yang tidak pernah terjadi;
+        # user menekannya, hasilnya utuh di wallet, dan ia mengira swapnya gagal.
+        import sol as _so
+        swap_note = (f"<i>Solana TIDAK menukar otomatis — {esc(meme_sym)} hasil close "
+                     f"tetap di wallet. Sewa akun posisi ~{_so.POSITION_RENT_SOL:g} SOL "
+                     f"kembali bersamaan.</i>")
+        detail = "Full exit DLMM (tarik 100% + klaim fee + tutup akun posisi)."
+    elif ver == 4:
         swap_note = (f"<i>Opsi swap menjual hasil {esc(meme_sym)} → quote pool via "
                      f"UniversalRouter v4.</i>")
         detail = "Full exit LP (burn posisi, principal + fee sekaligus)."
@@ -5277,12 +5286,17 @@ async def ask_close(update: Update, pid: str):
                      f"saldo {esc(meme_sym)} yang sudah ada di wallet tidak disentuh.</i>")
         detail = ("Posisi SUDAH ditarik, tinggal dipindahkan ke wallet (collect)."
                   if p.get("pending_claim") else "Full exit LP (decrease + collect).")
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"✅ Close + swap {meme_sym} → {wsym if ver != 4 else 'quote'}",
-                              callback_data=f"closeok|{cb(pid)}|1")],
-        [InlineKeyboardButton(f"✅ Close, tahan {meme_sym}", callback_data=f"closeok|{cb(pid)}|0")],
-        [InlineKeyboardButton("❌ Cancel", callback_data="cancel")],
-    ])
+    rows = []
+    if ver != 5:
+        rows.append([InlineKeyboardButton(
+            f"✅ Close + swap {meme_sym} → {wsym if ver != 4 else 'quote'}",
+            callback_data=f"closeok|{cb(pid)}|1")])
+        rows.append([InlineKeyboardButton(f"✅ Close, tahan {meme_sym}",
+                                          callback_data=f"closeok|{cb(pid)}|0")])
+    else:
+        rows.append([InlineKeyboardButton("✅ Close", callback_data=f"closeok|{cb(pid)}|0")])
+    rows.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel")])
+    kb = InlineKeyboardMarkup(rows)
     await reply(update, (
         f"⚠️ <b>Close position?</b>\n\n"
         f"{_pos_disp(p)} {esc(p['sym1'])}/{esc(p['sym0'])}\n"
@@ -5381,6 +5395,10 @@ async def do_close(update: Update, pid: str, autoswap: bool):
             lines.append(f"💰 Fee terklaim: {ch.fmt_amount(pos['fees0'])} {esc(pos['sym0'])} + "
                          f"{ch.fmt_amount(pos['fees1'])} {esc(pos['sym1'])} (~{ch.fmt_usd(pos['unclaimed_usd'])})")
         lines.append(f"Withdrawal value ~{ch.fmt_usd(usd)}")
+        if r.get("rent_back_sol"):
+            lines.append(f"🔓 Sewa akun posisi {r['rent_back_sol']:g} SOL kembali ke wallet.")
+        if r.get("note"):
+            lines.append(f"<i>{esc(r['note'])}</i>")
         lines += step_lines(cid, r["steps"])
         g = await asyncio.to_thread(gas_line, cid)
         if g:
@@ -5390,14 +5408,18 @@ async def do_close(update: Update, pid: str, autoswap: bool):
         # pembacaan RPC untuk hasil yang pasti kosong.
         await edit(status, "\n".join(lines), NAV_KB)
 
-        if r["swaps"]:
+        # `.get()`: mesin yang tidak punya auto-swap sama sekali (DLMM) tidak
+        # mengisi kunci ini, dan `r["swaps"]` polos meledak `KeyError: 'swaps'`
+        # SESUDAH kartu hasil terkirim — user membaca "❌ Error: 'swaps'" tepat
+        # di bawah kartu ✅ untuk close yang berhasil.
+        if r.get("swaps"):
             lines = ["🔄 Auto-swap hasil close:"]
             # Info per-swap: jumlah yang benar-benar diterima + biayanya. Dulu label
             # tujuannya di-hardcode ke wrapped_symbol padahal close v4 menjual meme
             # ke QUOTE POOL (mis. USDG) — jadi kartunya menyebut token yang salah dan
             # tidak pernah menyebut berapa yang termakan fee + price impact.
             info = {d["sym"]: d for d in (r.get("swap_info") or [])}
-            for sym, h in r["swaps"]:
+            for sym, h in r.get("swaps") or []:
                 if not str(h).startswith("0x"):
                     lines.append(f"{esc(sym)}: {esc(h)}")
                     continue

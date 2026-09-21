@@ -557,6 +557,21 @@ pada SOL/USDC bin step 4 (0,04% per bin): satu blok saja cukup.
 MENGATAKANNYA dan menyarankan mode Lower — bukan menukar diam-diam. Sama untuk
 close: sisa token tidak dijual.
 
+Konsekuensinya sampai ke TOMBOL, dan itu sempat terlewat. `ask_close` memberi
+dua tombol — "Close + swap MEME → quote" dan "Close, tahan MEME" — sedangkan
+`sol.close_any` MENGABAIKAN `autoswap`. Jadi tombol pertama menjanjikan swap
+yang tidak pernah terjadi: user menekannya, hasilnya utuh di wallet, dan ia
+menyimpulkan swapnya gagal. Untuk `ver == 5` sekarang cuma ada satu tombol
+"Close", dan catatannya menyebut bahwa Solana tidak menukar otomatis + sewa
+akun posisi kembali bersamaan.
+
+Kartu hasilnya juga dulu membaca `r["swaps"]` POLOS, dan mesin tanpa auto-swap
+tidak mengisi kunci itu — `KeyError: 'swaps'` muncul SESUDAH kartu ✅ terkirim,
+jadi user melihat "❌ Error: 'swaps'" tepat di bawah kartu close yang berhasil.
+Ini kelas bug yang SAMA dengan `got0`/`steps` sebelumnya: kartu generik membaca
+kunci yang cuma diisi sebagian mesin. Aturannya tetap satu — **mesin memenuhi
+kontrak, kartu tetap `.get()`**.
+
 #### Wallet & sewa akun
 
 **`SOLANA_PRIVATE_KEY` WAJIB terpisah dari `PRIVATE_KEY`.** Key EVM secp256k1,
