@@ -1259,24 +1259,106 @@ def collect_any(secret: str, position: str) -> dict:
             "signatures": d.get("signatures")}
 
 
-def close_any(secret: str, position: str, autoswap: bool = False) -> dict:
-    """Tarik 100% + klaim fee + tutup akun posisi, satu alur.
+def _close_autoswap(secret: str, p: dict, addr: str, meme_mint: str, meme_sym: str,
+                    bal_before: float | None, out_meme: float, swap_for_y: bool,
+                    slippage_pct: float, max_impact: float | None,
+                    steps: list) -> tuple[dict | None, str | None]:
+    """Jual sisi meme hasil close. `(info, alasan_gagal)` — TIDAK pernah melempar.
 
-    `autoswap` DIABAIKAN dan itu disengaja: di jalur EVM ia menjual sisi meme
-    hasil close lewat pool yang sama, dan di DLMM sisi mana yang keluar
-    ditentukan letak bin aktif terhadap range. Menjual otomatis di sini berarti
-    menebak niat user pada posisi yang baru saja ditutup — lebih baik disebut
-    di kartu daripada dilakukan diam-diam."""
+    `swap_for_y` = arah: True berarti meme itu token_x dan quote token_y.
+    Diturunkan dari `quote_is_token1`, bukan ditebak — di DLMM sisi mana yang
+    keluar saat close ditentukan letak bin aktif terhadap range, jadi menebaknya
+    dari nama apa pun akan menjual sisi yang salah."""
+    if out_meme <= 0:
+        return None, None                      # posisi pulang 100% quote
+    if bal_before is None:
+        return None, ("saldo sebelum close tidak terbaca (RPC telat) — swap "
+                      "dilewati supaya saldo lama tidak ikut terjual")
+    try:
+        bal_after = token_balance(addr, meme_mint)
+    except Exception as e:
+        return None, f"saldo sesudah close tidak terbaca: {e}"
+    # Yang dijual = yang benar-benar MASUK dari close ini, dijepit dua arah:
+    # snapshot bisa lebih besar dari yang mendarat, dan saldo nyata adalah
+    # batas keras.
+    sell = min(out_meme, max(0.0, bal_after - bal_before), bal_after)
+    if meme_mint == SOL_MINT:
+        import chain as ch
+        res = float(ch.CHAINS[SOL_CHAIN].get("gas_reserve") or 0.08)
+        sell = min(sell, max(0.0, bal_after - res))
+    if sell <= 0:
+        return None, ("hasil close belum terbaca di saldo wallet — swap dilewati; "
+                      f"jual {meme_sym} manual kalau perlu")
+    try:
+        q = best_quote(p, sell, swap_for_y, slippage_pct)
+        imp = float(q["impact"])
+        if max_impact is not None and imp > max_impact:
+            return None, (f"price impact {imp * 100:.1f}% lewat {q['route']} di atas "
+                          f"batas {max_impact * 100:.0f}% — {meme_sym} tetap di wallet. "
+                          f"Jual manual bertahap, atau naikkan batas di /settings.")
+        r = best_swap(secret, p, sell, swap_for_y, slippage_pct, q)
+    except Exception as e:
+        # Close-nya SUDAH masuk chain. Melempar di sini membuat kartu melapor
+        # gagal untuk posisi yang dananya sudah aman di wallet.
+        return None, f"{e}"
+    steps += _steps(r.get("signatures"),
+                    f"Jual {meme_sym} lewat {r['route']} ({r['impact'] * 100:.2f}% impact)")
+    qsym = p.get("sym1") if swap_for_y else p.get("sym0")
+    return {"sym": meme_sym, "sold": sell, "got": float(r["got"]),
+            "quote_sym": qsym or p.get("quote_sym") or "?",
+            "impact": float(r["impact"]), "route": r["route"],
+            "signatures": r.get("signatures")}, None
+
+
+def close_any(secret: str, position: str, autoswap: bool = False,
+              slippage_pct: float = 5.0, max_impact: float | None = 0.25) -> dict:
+    """Tarik 100% + klaim fee + tutup akun posisi, lalu (opsional) jual sisi meme.
+
+    **Auto-swapnya lewat JUPITER**, bukan pool posisi — alasan yang sama persis
+    dengan swap komposisi rebalance: pool DLMM satu pasangan itu SATU venue
+    tipis, dan close menjual SELURUH sisi meme sekaligus. Terukur pada WOJAK/SOL
+    untuk jumlah yang sama, Jupiter menang +6,6% sampai +20,2%.
+
+    Tiga aturan yang disalin dari jalur EVM, dan ketiganya soal uang:
+
+    - **Hanya hasil posisi INI yang dijual.** Jumlahnya dari snapshot `before`
+      (pokok + fee), lalu DIJEPIT ke delta saldo nyata. Saldo meme yang sudah
+      ada di wallet untuk keperluan lain tidak boleh ikut terjual. Kalau
+      deltanya tak terbaca (RPC telat), swap DILEWATI — lebih baik tidak
+      menukar daripada menebak.
+    - **Price impact dijaga terpisah.** `minOut` tidak menahannya (quoter sudah
+      memasukkan impact), jadi swap sebesar apa pun tetap "sesuai quote".
+    - **Kegagalan swap TIDAK boleh melempar.** Close-nya sudah masuk chain dan
+      dananya sudah di wallet; melempar di sini membuat kartu melapor gagal
+      untuk posisi yang sebenarnya sudah tertutup. Sebabnya dikembalikan lewat
+      `swap_error` supaya kartu bisa menyebutkannya."""
     pool = pool_of_position(position)
+    p = pool_info(pool)
+    addr = address_of(secret)
+    q_is_y = bool(p["quote_is_token1"])
+    meme_mint = p["token0"] if q_is_y else p["token1"]
+    meme_sym = (p.get("sym0") if q_is_y else p.get("sym1")) or "?"
+    # Saldo meme SEBELUM close — pembanding untuk memisahkan hasil posisi ini
+    # dari saldo lama. Gagal dibaca = None, dan swap lalu dilewati.
+    try:
+        bal_before = token_balance(addr, meme_mint) if autoswap else None
+    except Exception:
+        bal_before = None
     d = close(secret, pool, position, priority=priority_fee())
     before = d.get("before") or {}
-    p = pool_info(pool)
     a0 = int(before.get("amount_x_raw") or 0) / 10 ** p["dec0"]
     a1 = int(before.get("amount_y_raw") or 0) / 10 ** p["dec1"]
     f0 = int(before.get("fee_x_raw") or 0) / 10 ** p["dec0"]
     f1 = int(before.get("fee_y_raw") or 0) / 10 ** p["dec1"]
     px0, px1 = token_usd_price(p["token0"]), token_usd_price(p["token1"])
-    return {"steps": _steps(d.get("signatures"), "Close DLMM"),
+    steps = _steps(d.get("signatures"), "Close DLMM")
+    swap, swap_err = None, None
+    if autoswap:
+        swap, swap_err = _close_autoswap(
+            secret, p, addr, meme_mint, meme_sym, bal_before,
+            (a0 + f0) if q_is_y else (a1 + f1), q_is_y,
+            slippage_pct, max_impact, steps)
+    return {"steps": steps, "swap": swap, "swap_error": swap_err,
             "closed_usd": (a0 + f0) * px0 + (a1 + f1) * px1,
             "fees_usd": f0 * px0 + f1 * px1,
             "amount0": a0, "amount1": a1, "fees0": f0, "fees1": f1,
@@ -1295,7 +1377,8 @@ def close_any(secret: str, position: str, autoswap: bool = False) -> dict:
             "sym0": p.get("sym0") or "?", "sym1": p.get("sym1") or "?",
             "rent_back_sol": POSITION_RENT_SOL,
             "signatures": d.get("signatures"),
-            "note": "Sisa token TIDAK dijual otomatis — cek /wallet.",
+            "note": None if autoswap else
+                    "Sisa token TIDAK dijual otomatis — cek /wallet.",
             }
 
 

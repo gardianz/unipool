@@ -5264,13 +5264,15 @@ async def ask_close(update: Update, pid: str):
     wsym = ch.CHAINS[cid]["wrapped_symbol"]
     meme_sym = p["sym0"] if p["quote_is_token1"] else p["sym1"]
     if ver == 5:
-        # `sol.close_any` MENGABAIKAN autoswap dan itu disengaja (lihat CLAUDE.md).
-        # Menawarkan tombolnya tetap = menjanjikan swap yang tidak pernah terjadi;
-        # user menekannya, hasilnya utuh di wallet, dan ia mengira swapnya gagal.
+        # Auto-swapnya lewat JUPITER, bukan pool posisi — close menjual SELURUH
+        # sisi meme sekaligus, dan pool DLMM satu pasangan itu venue tipis.
         import sol as _so
-        swap_note = (f"<i>Solana TIDAK menukar otomatis — {esc(meme_sym)} hasil close "
-                     f"tetap di wallet. Sewa akun posisi ~{_so.POSITION_RENT_SOL:g} SOL "
-                     f"kembali bersamaan.</i>")
+        swap_note = (f"<i>Opsi jual menukar {esc(meme_sym)} hasil posisi ini lewat "
+                     f"Jupiter (venue terbaik, bukan pool posisi); saldo "
+                     f"{esc(meme_sym)} yang sudah ada di wallet tidak disentuh. "
+                     f"Price impact di atas {impact_limit() * 100:.0f}% membatalkan "
+                     f"SWAP-nya saja — close-nya tetap jalan. Sewa akun posisi "
+                     f"~{_so.POSITION_RENT_SOL:g} SOL kembali bersamaan.</i>")
         detail = "Full exit DLMM (tarik 100% + klaim fee + tutup akun posisi)."
     elif ver == 4:
         swap_note = (f"<i>Opsi swap menjual hasil {esc(meme_sym)} → quote pool via "
@@ -5286,17 +5288,13 @@ async def ask_close(update: Update, pid: str):
                      f"saldo {esc(meme_sym)} yang sudah ada di wallet tidak disentuh.</i>")
         detail = ("Posisi SUDAH ditarik, tinggal dipindahkan ke wallet (collect)."
                   if p.get("pending_claim") else "Full exit LP (decrease + collect).")
-    rows = []
-    if ver != 5:
-        rows.append([InlineKeyboardButton(
-            f"✅ Close + swap {meme_sym} → {wsym if ver != 4 else 'quote'}",
-            callback_data=f"closeok|{cb(pid)}|1")])
-        rows.append([InlineKeyboardButton(f"✅ Close, tahan {meme_sym}",
-                                          callback_data=f"closeok|{cb(pid)}|0")])
-    else:
-        rows.append([InlineKeyboardButton("✅ Close", callback_data=f"closeok|{cb(pid)}|0")])
-    rows.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel")])
-    kb = InlineKeyboardMarkup(rows)
+    tujuan = (p.get("quote_sym") or wsym) if ver == 5 else (wsym if ver != 4 else "quote")
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"✅ Close + jual {meme_sym} → {tujuan}",
+                              callback_data=f"closeok|{cb(pid)}|1")],
+        [InlineKeyboardButton(f"✅ Close, tahan {meme_sym}", callback_data=f"closeok|{cb(pid)}|0")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="cancel")],
+    ])
     await reply(update, (
         f"⚠️ <b>Close position?</b>\n\n"
         f"{_pos_disp(p)} {esc(p['sym1'])}/{esc(p['sym0'])}\n"
@@ -5395,6 +5393,16 @@ async def do_close(update: Update, pid: str, autoswap: bool):
             lines.append(f"💰 Fee terklaim: {ch.fmt_amount(pos['fees0'])} {esc(pos['sym0'])} + "
                          f"{ch.fmt_amount(pos['fees1'])} {esc(pos['sym1'])} (~{ch.fmt_usd(pos['unclaimed_usd'])})")
         lines.append(f"Withdrawal value ~{ch.fmt_usd(usd)}")
+        sw = r.get("swap")
+        if sw:
+            lines.append(
+                f"🔄 Dijual {ch.fmt_amount(sw['sold'])} {esc(sw['sym'])} → "
+                f"<b>{ch.fmt_amount(sw['got'])} {esc(sw['quote_sym'])}</b> "
+                f"lewat {esc(sw['route'])} · impact {sw['impact'] * 100:.2f}%")
+        elif r.get("swap_error"):
+            # Close-nya BERHASIL; yang gagal cuma swapnya. Bedanya wajib jelas,
+            # kalau tidak user mengulang close yang sudah jalan.
+            lines.append(f"⚠️ Auto-swap dilewati: {esc(r['swap_error'])}")
         if r.get("rent_back_sol"):
             lines.append(f"🔓 Sewa akun posisi {r['rent_back_sol']:g} SOL kembali ke wallet.")
         if r.get("note"):

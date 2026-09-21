@@ -8658,7 +8658,11 @@ def close_any(chain_id: int, pk: str, pid, slippage_pct: float, autoswap: bool) 
         # Tanpa `get_w3` — Solana tidak punya Web3, dan panggilan itu dulu ada
         # di baris PERTAMA fungsi ini sehingga ia akan menolak setiap close DLMM
         # sebelum sempat sampai ke cabangnya.
-        return _sol().close_any(pk, ref, autoswap)
+        # `slippage_pct` ikut: auto-swap Solana dirutekan lewat Jupiter dan
+        # butuh toleransi yang sama dengan jalur EVM. Batas price impact memakai
+        # bawaan `sol.close_any` — sama seperti `v4_swap` yang memakai
+        # `_SWAP_IMPACT_MAX` kalau pemanggil tidak menyebutkannya.
+        return _sol().close_any(pk, ref, autoswap, slippage_pct)
     # Gagalkan lebih awal kalau posisinya sudah tertutup — kalau tidak, tx-nya
     # terkirim, revert NOT_MINTED, dan gasnya terbakar percuma.
     assert_position_open(get_w3(chain_id), chain_id, pid)

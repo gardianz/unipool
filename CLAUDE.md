@@ -553,24 +553,49 @@ antara keduanya, range mode satu-sisi menyentuh bin aktif lagi dan kartu
 `side` hasilnya dan menjepit ulang sekali kalau tidak sesuai — terukur terjadi
 pada SOL/USDC bin step 4 (0,04% per bin): satu blok saja cukup.
 
-**Tidak ada swap otomatis di jalur Solana.** Kalau sisi meme kurang, kartu
-MENGATAKANNYA dan menyarankan mode Lower — bukan menukar diam-diam. Sama untuk
-close: sisa token tidak dijual.
+**Mint TIDAK menukar otomatis.** Kalau sisi meme kurang, kartu MENGATAKANNYA
+dan menyarankan mode Lower — bukan menukar diam-diam.
 
-Konsekuensinya sampai ke TOMBOL, dan itu sempat terlewat. `ask_close` memberi
-dua tombol — "Close + swap MEME → quote" dan "Close, tahan MEME" — sedangkan
-`sol.close_any` MENGABAIKAN `autoswap`. Jadi tombol pertama menjanjikan swap
-yang tidak pernah terjadi: user menekannya, hasilnya utuh di wallet, dan ia
-menyimpulkan swapnya gagal. Untuk `ver == 5` sekarang cuma ada satu tombol
-"Close", dan catatannya menyebut bahwa Solana tidak menukar otomatis + sewa
-akun posisi kembali bersamaan.
+**Close BISA**, dan rutenya JUPITER — bukan pool posisi. Close menjual SELURUH
+sisi meme sekaligus, dan pool DLMM satu pasangan itu venue tipis; terukur pada
+posisi hidup, Jupiter memilih venue lain untuk 5 dari 9 pool (Pump.fun Amm,
+Manifest, Raydium CP+Denali+Kipseli). Alasan yang sama persis dengan swap
+komposisi rebalance.
 
-Kartu hasilnya juga dulu membaca `r["swaps"]` POLOS, dan mesin tanpa auto-swap
-tidak mengisi kunci itu — `KeyError: 'swaps'` muncul SESUDAH kartu ✅ terkirim,
-jadi user melihat "❌ Error: 'swaps'" tepat di bawah kartu close yang berhasil.
-Ini kelas bug yang SAMA dengan `got0`/`steps` sebelumnya: kartu generik membaca
-kunci yang cuma diisi sebagian mesin. Aturannya tetap satu — **mesin memenuhi
-kontrak, kartu tetap `.get()`**.
+Tiga aturan disalin dari jalur EVM, dan ketiganya soal uang:
+
+- **Hanya hasil posisi INI yang dijual.** Jumlahnya dari snapshot `before`
+  (pokok + fee), lalu DIJEPIT ke delta saldo nyata dan ke saldo nyata itu
+  sendiri. Saldo meme yang user pegang untuk keperluan lain tidak boleh ikut
+  terjual. Diuji: snapshot 100 sementara yang mendarat 60 → yang dijual 60.
+- **Delta tak terbaca = swap DILEWATI**, bukan ditebak. RPC yang telat menjawab
+  saldo pra-close membuat deltanya 0; menjual "sebanyak snapshot" di situ
+  berarti menjual saldo lama.
+- **Kegagalan swap TIDAK boleh melempar.** Close-nya sudah masuk chain dan
+  dananya sudah di wallet — melempar membuat kartu melapor gagal untuk posisi
+  yang sebenarnya sudah tertutup, dan user mengulang close yang sudah jalan.
+  `_close_autoswap()` mengembalikan `(info, swap_error)` dan kartu menulis
+  "⚠️ Auto-swap dilewati: …" di bawah kartu ✅.
+
+Price impact dijaga terpisah (`minOut` tidak menahannya) dan **membatalkan
+SWAP-nya saja**, bukan close-nya. Untuk sisi meme yang mint-nya SOL, cadangan
+gas dipotong dulu — menjual habis SOL berarti tidak ada ongkos tx tersisa.
+
+Arahnya (`swap_for_y`) diturunkan dari `quote_is_token1`, tidak pernah ditebak:
+di DLMM sisi mana yang keluar saat close ditentukan letak bin aktif terhadap
+range, jadi menebaknya dari nama apa pun akan menjual sisi yang salah.
+
+Jalan ke sini lewat dua bug yang perlu diingat:
+
+- `ask_close` memberi tombol "Close + swap MEME → quote" sementara
+  `sol.close_any` MENGABAIKAN `autoswap`. Tombolnya menjanjikan swap yang tidak
+  pernah terjadi: user menekannya, hasilnya utuh di wallet, dan ia menyimpulkan
+  swapnya gagal.
+- Kartu hasilnya membaca `r["swaps"]` POLOS, dan mesin tanpa auto-swap tidak
+  mengisi kunci itu — `KeyError: 'swaps'` muncul SESUDAH kartu ✅ terkirim,
+  jadi user melihat "❌ Error: 'swaps'" tepat di bawah close yang berhasil.
+  Kelas yang SAMA dengan `got0`/`steps`. Aturannya tetap satu: **mesin memenuhi
+  kontrak, kartu tetap `.get()`**.
 
 #### Wallet & sewa akun
 
