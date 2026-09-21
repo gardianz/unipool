@@ -860,6 +860,56 @@ kombinasi (dua orientasi × dua sisi).
 **Batas MC harus DIURUTKAN sebelum ditulis.** Untuk quote = token0 harganya
 dibalik, jadi `mc_lower` (dari batas bawah tick/bin) justru yang lebih BESAR.
 
+#### Kartu hasil punya KONTRAK, dan mesin Solana sempat tidak memenuhinya
+
+`close_any`/`reduce_any`/`collect_any` adalah dispatcher generik: `do_close`,
+`do_reduce_exec`, dan `do_collect` merakit kartunya dengan SATU kode untuk semua
+versi. Kodenya membaca `r['got0']`/`r['sym0']`/`r['got1']`/`r['sym1']` langsung,
+dan `sol.py` tidak mengisi satu pun dari keempatnya.
+
+**Gagalnya SESUDAH uang bergerak.** Urutan di `do_close`: tx → `record_event` →
+kartu. Jadi close DLMM yang SUKSES di chain berakhir `KeyError: 'got0'` dan user
+membaca **❌ Error: 'got0'** untuk posisi yang sudah tertutup dan dananya sudah
+di wallet — terverifikasi: posisi `Ey8C…HkiG` memang hilang dari daftar posisi
+hidup sesudah error itu. Kerugian nyatanya bukan dana melainkan kepercayaan:
+langkah berikutnya yang wajar adalah mengulang aksi yang sudah berhasil.
+
+Yang diisi sekarang, dan dari mana:
+
+| | isi `got0`/`got1` |
+|---|---|
+| `close_any` | pokok + fee dari snapshot `before` (close DLMM menarik keduanya) |
+| `reduce_any` | pokok × pct, **fee HANYA kalau 100%** |
+| `collect_any` | `fees0`/`fees1` posisi tepat sebelum klaim |
+
+**Reduce sebagian TIDAK menarik fee di DLMM** — `shouldClaimAndClose` cuma
+dinyalakan di 100%, sedangkan v3/v4 EVM selalu menarik fee penuh berapa pun
+pct-nya. `fee_included` menyatakannya dan kartu menulis "(fee TETAP di posisi)"
+alih-alih "(termasuk fee)"; tanpa itu kartu berbohong tentang uang.
+
+Bedanya dari EVM: di sana `got*` diukur dari **delta saldo** sesudah tx, di sini
+dari **snapshot sebelum** eksekusi. Praktis sama karena tidak ada swap yang
+memotongnya, tapi jangan diperlakukan sebagai angka terukur.
+
+**`steps` juga dua bentuk, dan `for label, h in …` meledak untuk salah satunya.**
+Mesin EVM mengembalikan `(label, txhash)` yang UI-nya jadikan link lewat
+`ch.tx_link`; `sol._steps()` sudah mengembalikan STRING jadi, karena signature
+Solana bukan hash 0x-hex. `step_lines(cid, steps)` menerima keduanya dan dipakai
+di SEMUA situs yang bisa menerima hasil DLMM (add/reduce/collect/close/rebalance/
+eksekutor order). `step_tx(steps)` untuk `store.update_order(tx=…)` — `steps[0][1]`
+polos mengambil **karakter kedua** dari string dan menyimpannya sebagai tx order.
+
+**`with_progress(status, head, work)` butuh TIGA argumen.** Jalur mint DLMM
+memanggilnya dengan dua, dan mint gagal SEBELUM satu tx pun dikirim dengan pesan
+yang tidak menunjuk apa pun: *"Mint DLMM gagal: with_progress() missing 1
+required positional argument: 'work'"*. Pemeriksaan murahnya scan AST — cari
+`Call` bernama `with_progress` yang `len(args) != 3`.
+
+Aturan umumnya: **mesin baru wajib memenuhi kontrak dict yang dibaca kartu
+generik**, dan kartu generik membacanya dengan `.get()` + melewati barisnya kalau
+kosong. Dua-duanya, bukan salah satu — kontrak menjaga kartunya informatif, dan
+`.get()` menjaga aksi yang sudah berhasil tidak dilaporkan gagal.
+
 #### Yang belum ada untuk Solana
 
 Swap komposisi otomatis, pindah pool, revoke approval (Solana tidak punya

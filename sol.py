@@ -1186,17 +1186,43 @@ def reduce_any(secret: str, position: str, pct: int) -> dict:
     tanpa itu ~0,057 SOL terkunci selamanya di akun kosong."""
     pool = pool_of_position(position)
     d = reduce(secret, pool, position, pct, priority=priority_fee())
+    closed = bool(d.get("closed"))
+    # `got0`/`got1`/`sym0`/`sym1` adalah kontrak `reduce_any` — kartu hasil
+    # `do_reduce_exec` membacanya untuk SEMUA versi. Dihitung dari snapshot
+    # `before` (sidecar mengirimnya di jalur `remove`) dikali porsi yang ditarik.
+    #
+    # **Fee hanya ikut saat 100%.** `shouldClaimAndClose` cuma dinyalakan di
+    # 100%, jadi untuk penarikan sebagian fee TETAP menggantung di posisi —
+    # berbeda dari v3/v4 EVM yang selalu menarik fee penuh berapa pun pct-nya.
+    # `fee_included` menyatakannya supaya kartu tidak menulis "termasuk fee"
+    # untuk angka yang tidak memuatnya.
+    b = d.get("before") or {}
+    pi = pool_info(pool)
+    frac = max(0.0, min(1.0, float(pct) / 100.0))
+    a0 = int(b.get("amount_x_raw") or 0) / 10 ** pi["dec0"] * frac
+    a1 = int(b.get("amount_y_raw") or 0) / 10 ** pi["dec1"] * frac
+    f0 = int(b.get("fee_x_raw") or 0) / 10 ** pi["dec0"] if closed else 0.0
+    f1 = int(b.get("fee_y_raw") or 0) / 10 ** pi["dec1"] if closed else 0.0
     return {"steps": _steps(d.get("signatures"), f"Reduce {pct}% DLMM"),
-            "closed": bool(d.get("closed")), "signatures": d.get("signatures"),
-            "rent_back_sol": POSITION_RENT_SOL if d.get("closed") else 0.0}
+            "closed": closed, "signatures": d.get("signatures"),
+            "got0": a0 + f0, "got1": a1 + f1,
+            "sym0": pi.get("sym0") or "?", "sym1": pi.get("sym1") or "?",
+            "fee_included": closed,
+            "rent_back_sol": POSITION_RENT_SOL if closed else 0.0}
 
 
 def collect_any(secret: str, position: str) -> dict:
     pool = pool_of_position(position)
     before = position_one(address_of(secret), position, pool)
     d = collect(secret, pool, position, priority=priority_fee())
+    b = before or {}
+    # Kontrak `collect_any` yang sama: yang diterima = fee kedua sisi tepat
+    # sebelum klaim. Tanpa keempat kunci ini kartu "Fee terklaim" meledak
+    # `KeyError: 'got0'` SESUDAH fee benar-benar masuk wallet.
     return {"steps": _steps(d.get("signatures"), "Claim fee DLMM"),
-            "fees_usd": (before or {}).get("unclaimed_usd") or 0.0,
+            "fees_usd": b.get("unclaimed_usd") or 0.0,
+            "got0": b.get("fees0") or 0.0, "got1": b.get("fees1") or 0.0,
+            "sym0": b.get("sym0") or "?", "sym1": b.get("sym1") or "?",
             "signatures": d.get("signatures")}
 
 
@@ -1221,6 +1247,19 @@ def close_any(secret: str, position: str, autoswap: bool = False) -> dict:
             "closed_usd": (a0 + f0) * px0 + (a1 + f1) * px1,
             "fees_usd": f0 * px0 + f1 * px1,
             "amount0": a0, "amount1": a1, "fees0": f0, "fees1": f1,
+            # `got0`/`got1`/`sym0`/`sym1` adalah KONTRAK `close_any`: kartu hasil
+            # `do_close` membacanya apa adanya untuk SEMUA versi. Tanpa keempatnya
+            # close DLMM yang SUKSES di chain berakhir `KeyError: 'got0'` — dan
+            # errornya muncul SESUDAH event PnL tercatat, jadi user melihat "gagal"
+            # untuk posisi yang sebenarnya sudah tertutup dan dananya sudah di
+            # wallet. Isinya pokok + fee, karena close DLMM menarik keduanya.
+            #
+            # Bedanya dari jalur EVM: di sana `got*` diukur dari DELTA SALDO
+            # sesudah tx, di sini dari snapshot tepat SEBELUM close (sidecar
+            # mengembalikannya di `before`). Praktis sama — tidak ada swap yang
+            # memotongnya — tapi jangan diperlakukan sebagai angka terukur.
+            "got0": a0 + f0, "got1": a1 + f1,
+            "sym0": p.get("sym0") or "?", "sym1": p.get("sym1") or "?",
             "rent_back_sol": POSITION_RENT_SOL,
             "signatures": d.get("signatures"),
             "note": "Sisa token TIDAK dijual otomatis — cek /wallet.",

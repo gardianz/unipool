@@ -3971,19 +3971,25 @@ async def do_mint(update: Update, ctx_data: dict):
             await reply(update, "❌ " + esc(await asyncio.to_thread(
                 no_funds_msg, ctx_data, p["quote_sym"])))
             return
-        status = await reply(update, (
+        # `with_progress(status, head, work)` — HEAD-nya wajib, dan ia dipakai
+        # sebagai baris pertama tiap kali pesan progres di-edit. Memanggilnya
+        # dengan dua argumen membuat mint DLMM gagal SEBELUM satu tx pun dikirim,
+        # dengan pesan yang tidak menunjuk apa pun: "Mint DLMM gagal:
+        # with_progress() missing 1 required positional argument: 'work'".
+        head_sol = (
             f"⏳ Membuat posisi DLMM ({STRAT_LABEL.get(mode, mode)} · "
             f"{esc(strategy['shape'])})…\n"
             f"<i>{esc(tsym)}/{esc(p['quote_sym'])} bin step {p.get('bin_step')} · "
             f"fee {p['fee'] / 10000:.2f}% · deposit {ch.fmt_amount(amount)} "
-            f"{esc(p['quote_sym'])}</i>"))
+            f"{esc(p['quote_sym'])}</i>")
+        status = await reply(update, head_sol)
 
         def work_sol():
             return ch.mint_dlmm(cid, pk(cid), p, amount, strategy, s["slippage_pct"])
 
         async with TX_LOCK:
             try:
-                res = await with_progress(status, work_sol)
+                res = await with_progress(status, head_sol, work_sol)
             except Exception as e:
                 await edit(status, f"❌ Mint DLMM gagal: {esc(e)}")
                 return
@@ -4044,8 +4050,7 @@ async def do_mint(update: Update, ctx_data: dict):
         lines = [f"✅ <b>{esc(tsym)} LP</b> [v2] · full range ({ch.fmt_usd(r['deposited_usd'])})",
                  f"Masuk: {ch.fmt_amount(r['quote_in'])} {esc(r['quote_sym'])} + "
                  f"{ch.fmt_amount(r['meme_in'])} {esc(r['meme_sym'])}"]
-        for label, h in r["steps"]:
-            lines.append(f"{label}: {ch.tx_link(cid, h)}")
+        lines += step_lines(cid, r["steps"])
         lines.append(ch.pos_link_any(cid, pid))
         g = await asyncio.to_thread(gas_line, cid)
         if g:
@@ -4825,7 +4830,7 @@ async def do_add_exec(update: Update, pid: str, val: float, is_pct: bool):
                         except Exception:
                             pass
                 budget = (bal * val / 100) / 10 ** qdec
-            return ch.add_any(cid, pk(), pid, budget, s["slippage_pct"]), pre_fee
+            return ch.add_any(cid, pk(cid), pid, budget, s["slippage_pct"]), pre_fee
 
         head = f"⏳ Menambah dana ke {disp_pid(pid)}..."
         async with TX_LOCK:
@@ -4848,8 +4853,7 @@ async def do_add_exec(update: Update, pid: str, val: float, is_pct: bool):
             lines.append(f"♻️ Fee unclaimed {ch.fmt_usd(pre_fee)} ikut jadi modal "
                          f"(sisa yang tidak terpakai masuk wallet) — dihitung sebagai fee, "
                          f"bukan setoran baru.")
-        for label, h in r["steps"]:
-            lines.append(f"{label}: {ch.tx_link(cid, h)}")
+        lines += step_lines(cid, r["steps"])
         lines.append(ch.pos_link_any(cid, pid))
         g = await asyncio.to_thread(gas_line, cid)
         if g:
@@ -4921,7 +4925,7 @@ async def do_reduce_exec(update: Update, pid: str, pct: int):
         async with TX_LOCK:
             try:
                 r = await with_progress(status, head,
-                                        lambda: ch.reduce_any(cid, pk(), pid, pct, s["slippage_pct"]))
+                                        lambda: ch.reduce_any(cid, pk(cid), pid, pct, s["slippage_pct"]))
             except Exception as e:
                 await edit(status, f"❌ Reduce gagal: {esc(e)}")
                 return
@@ -4931,11 +4935,16 @@ async def do_reduce_exec(update: Update, pid: str, pct: int):
                                f"reduce {pct}%", wallet=wallet_address())
             if pos["unclaimed_usd"] > 0:
                 store.record_event(cid, "fees", ev_tid, pos["unclaimed_usd"], wallet=wallet_address())
-        lines = [f"✅ <b>Reduced {disp_pid(pid)} −{pct}%</b>",
-                 f"Received ~{ch.fmt_amount(r['got0'])} {esc(r['sym0'])} + "
-                 f"{ch.fmt_amount(r['got1'])} {esc(r['sym1'])} (termasuk fee)"]
-        for label, h in r["steps"]:
-            lines.append(f"{label}: {ch.tx_link(cid, h)}")
+        lines = [f"✅ <b>Reduced {disp_pid(pid)} −{pct}%</b>"]
+        if r.get("got0") is not None and r.get("got1") is not None:
+            # "termasuk fee" TIDAK selalu benar: reduce sebagian di DLMM
+            # membiarkan fee menggantung di posisi (`shouldClaimAndClose` cuma
+            # menyala di 100%), sedangkan v3/v4 EVM selalu menarik fee penuh.
+            ekor = " (termasuk fee)" if r.get("fee_included", True) else " (fee TETAP di posisi)"
+            lines.append(
+                f"Received ~{ch.fmt_amount(r['got0'])} {esc(r.get('sym0') or '?')} + "
+                f"{ch.fmt_amount(r['got1'])} {esc(r.get('sym1') or '?')}{ekor}")
+        lines += step_lines(cid, r["steps"])
         lines.append(ch.pos_link_any(cid, pid))
         g = await asyncio.to_thread(gas_line, cid)
         if g:
@@ -4959,7 +4968,7 @@ async def do_collect(update: Update, pid: str):
         status = await reply(update, f"⏳ Collect fee {disp_pid(pid)}...")
         async with TX_LOCK:
             try:
-                r = await asyncio.to_thread(ch.collect_any, cid, pk(), pid)
+                r = await asyncio.to_thread(ch.collect_any, cid, pk(cid), pid)
             except Exception as e:
                 await edit(status, f"❌ Collect gagal: {esc(e)}")
                 return
@@ -4968,12 +4977,12 @@ async def do_collect(update: Update, pid: str):
         if pos and pos["unclaimed_usd"] > 0:
             store.record_event(cid, "fees", ev_tid, pos["unclaimed_usd"], wallet=wallet_address())
             usd_txt = f" (~{ch.fmt_usd(pos['unclaimed_usd'])})"
-        lines = [f"✅ <b>Fee terklaim {disp_pid(pid)}</b>{usd_txt}",
-                 f"Received {ch.fmt_amount(r['got0'])} {esc(r['sym0'])} + "
-                 f"{ch.fmt_amount(r['got1'])} {esc(r['sym1'])}",
-                 "<i>Posisi tetap jalan — liquidity tidak berubah.</i>"]
-        for label, h in r["steps"]:
-            lines.append(f"{label}: {ch.tx_link(cid, h)}")
+        lines = [f"✅ <b>Fee terklaim {disp_pid(pid)}</b>{usd_txt}"]
+        if r.get("got0") is not None and r.get("got1") is not None:
+            lines.append(f"Received {ch.fmt_amount(r['got0'])} {esc(r.get('sym0') or '?')} + "
+                         f"{ch.fmt_amount(r['got1'])} {esc(r.get('sym1') or '?')}")
+        lines.append("<i>Posisi tetap jalan — liquidity tidak berubah.</i>")
+        lines += step_lines(cid, r["steps"])
         g = await asyncio.to_thread(gas_line, cid)
         if g:
             lines.append(g)
@@ -5188,8 +5197,7 @@ async def finish_rebalance(update, status, cid: int, pid: str, pos, r: dict,
     # Range SESUDAH rebalance wajib disebut: seluruh gunanya rebalance adalah
     # memindahkan range, jadi kartu tanpa angka barunya memaksa user membuka
     # kartu posisi hanya untuk tahu apakah hasilnya sesuai harapan.
-    for lbl, h in r["steps"]:
-        lines.append(f"{lbl}: {ch.tx_link(cid, h)}")
+    lines += step_lines(cid, r["steps"])
     if r["token_id"]:
         lines.append(ch.pos_link_any(cid, new_pid))
     g = await asyncio.to_thread(gas_line, cid)
@@ -5247,6 +5255,40 @@ async def ask_close(update: Update, pid: str):
         f"{detail}\n{swap_note}"), kb)
 
 
+def step_lines(cid: int, steps) -> list[str]:
+    """Baris langkah tx untuk kartu hasil — menerima KEDUA bentuk.
+
+    Mesin EVM mengembalikan `(label, txhash)` dan UI merangkainya jadi link
+    lewat `ch.tx_link`. `sol._steps()` sudah mengembalikan STRING jadi, karena
+    signature Solana bukan hash 0x-hex sehingga `tx_link` tidak berlaku dan
+    explorer-nya dibangun di `sol.py`.
+
+    Tanpa helper ini `for label, h in r["steps"]` MELEDAK untuk tiap kartu hasil
+    DLMM — dan meledaknya SESUDAH tx masuk chain dan event PnL tercatat, jadi
+    user membaca "gagal" untuk aksi yang sebenarnya berhasil. Persis itu yang
+    terjadi pada close DLMM pertama."""
+    out = []
+    for st in steps or []:
+        if isinstance(st, str):
+            out.append(esc(st))
+        else:
+            label, h = st
+            out.append(f"{label}: {ch.tx_link(cid, h)}")
+    return out
+
+
+def step_tx(steps) -> str:
+    """Hash/signature tx PERTAMA, apa pun bentuk `steps`-nya.
+
+    `steps[0][1]` polos mengambil KARAKTER KEDUA kalau langkahnya string — dan
+    itu tersimpan ke `history.json` sebagai tx order yang dieksekusi."""
+    for st in steps or []:
+        if isinstance(st, str):
+            return st.rsplit("/", 1)[-1]
+        return str(st[1])
+    return ""
+
+
 async def do_close(update: Update, pid: str, autoswap: bool):
     async with position_busy(update, pid) as _ok:
         if not _ok:
@@ -5265,7 +5307,7 @@ async def do_close(update: Update, pid: str, autoswap: bool):
         async with TX_LOCK:
             try:
                 r = await with_progress(status, head, lambda: ch.close_any(
-                    cid, pk(), pid, s["slippage_pct"], autoswap))
+                    cid, pk(cid), pid, s["slippage_pct"], autoswap))
             except Exception as e:
                 if isinstance(e, ch.AlreadyClosed):
                     # Bukan kegagalan: tx susulan ditolak, tapi close-nya sendiri
@@ -5276,22 +5318,30 @@ async def do_close(update: Update, pid: str, autoswap: bool):
                 return
 
         ev_tid = ref if ver == 3 else str(pid)
+        waddr = wallet_address(cid)          # alamat EVM ≠ Solana: chain WAJIB disebut
         if ver == 4:
-            store.drop_ref(cid, wallet_address(), "v4", str(ref))
+            store.drop_ref(cid, waddr, "v4", str(ref))
         elif ver == 2:   # dulu tidak pernah dibersihkan — registry & patokan fee jadi basi
-            store.drop_ref(cid, wallet_address(), "v2", str(ref))
-            store.drop_v2_basis(cid, wallet_address(), str(ref))
-        store.record_event(cid, "close", ev_tid, pos["value_usd"] if pos else usd, wallet=wallet_address())
+            store.drop_ref(cid, waddr, "v2", str(ref))
+            store.drop_v2_basis(cid, waddr, str(ref))
+        store.record_event(cid, "close", ev_tid, pos["value_usd"] if pos else usd, wallet=waddr)
         if pos and pos["unclaimed_usd"] > 0:
-            store.record_event(cid, "fees", ev_tid, pos["unclaimed_usd"], wallet=wallet_address())
-        lines = [f"✅ <b>Closed {disp_pid(pid)}</b>",
-                 f"Received ~{ch.fmt_amount(r['got0'])} {esc(r['sym0'])} + {ch.fmt_amount(r['got1'])} {esc(r['sym1'])}"]
+            store.record_event(cid, "fees", ev_tid, pos["unclaimed_usd"], wallet=waddr)
+        lines = [f"✅ <b>Closed {disp_pid(pid)}</b>"]
+        # Baris "Received" dilewati kalau mesinnya tidak mengisinya. Dulu dibaca
+        # dengan `r['got0']` langsung, dan satu mesin yang belum memenuhi kontrak
+        # itu (sol.close_any) membuat close yang SUKSES di chain berakhir
+        # `KeyError: 'got0'` — sesudah event PnL tercatat, jadi user membaca
+        # "gagal" untuk posisi yang dananya sudah ada di wallet.
+        if r.get("got0") is not None and r.get("got1") is not None:
+            lines.append(
+                f"Received ~{ch.fmt_amount(r['got0'])} {esc(r.get('sym0') or '?')} + "
+                f"{ch.fmt_amount(r['got1'])} {esc(r.get('sym1') or '?')}")
         if pos:
             lines.append(f"💰 Fee terklaim: {ch.fmt_amount(pos['fees0'])} {esc(pos['sym0'])} + "
                          f"{ch.fmt_amount(pos['fees1'])} {esc(pos['sym1'])} (~{ch.fmt_usd(pos['unclaimed_usd'])})")
         lines.append(f"Withdrawal value ~{ch.fmt_usd(usd)}")
-        for label, h in r["steps"]:
-            lines.append(f"{label}: {ch.tx_link(cid, h)}")
+        lines += step_lines(cid, r["steps"])
         g = await asyncio.to_thread(gas_line, cid)
         if g:
             lines.append(g)
@@ -6690,12 +6740,11 @@ async def _trigger_order(app, cid: int, o: dict, p: dict, hit: tuple, mc: float)
     if p.get("unclaimed_usd", 0) > 0:
         store.record_event(cid, "fees", ev_tid, p["unclaimed_usd"], wallet=waddr)
     if r.get("steps"):
-        store.update_order(cid, o["id"], tx=r["steps"][0][1])
+        store.update_order(cid, o["id"], tx=step_tx(r["steps"]))
     lines = [f"✅ <b>Order {o['id']} eksekusi</b> — {kind} {esc(meme_sym)} {disp_pid(o['pid'])}",
              f"Close pada MC {ch.fmt_usd(mc)} · withdraw "
              f"~{ch.fmt_usd(p.get('value_usd', 0) + p.get('unclaimed_usd', 0))}"]
-    for label, h in r.get("steps", []):
-        lines.append(f"{label}: {ch.tx_link(cid, h)}")
+    lines += step_lines(cid, r.get("steps"))
     for sym, h in r.get("swaps", []):
         if str(h).startswith("0x"):
             lines.append(f"swap {esc(sym)} → {esc(ch.CHAINS[cid]['wrapped_symbol'])}: "
@@ -6976,7 +7025,7 @@ async def do_claim_all(update: Update):
         ok, gagal = [], []
         for p in target:
             try:
-                ok.append((p, ch.collect_any(cid, pk(), p["pid"])))
+                ok.append((p, ch.collect_any(cid, pk(cid), p["pid"])))
             except Exception as e:
                 gagal.append((p, str(e)[:80]))
         return ok, gagal
@@ -7395,8 +7444,7 @@ async def do_compound(update: Update, pid: str):
                              f"{ch.fmt_amount(r['left1'])} {esc(r['sym1'])} dikirim ke "
                              f"WALLET (bukan hilang) — rasio dua sisi ditentukan range, "
                              f"jadi lazim ada yang tidak muat.</i>")
-        for label, h in r["steps"]:
-            lines.append(f"{label}: {ch.tx_link(cid, h)}")
+        lines += step_lines(cid, r["steps"])
         lines.append(ch.pos_link_any(cid, pid))
         g = await asyncio.to_thread(gas_line, cid)
         if g:
