@@ -481,6 +481,44 @@ dinyatakan `minDeltaId`/`maxDeltaId` terhadap bin aktif dan alurnya milik SDK,
 sedangkan jalur ini harus mengikuti logika EVM. Nilai tambahnya yang nyata
 adalah ATOMISITAS (close/swap/mint sekarang tx terpisah).
 
+**Zap TIDAK bisa dipakai untuk close + auto-swap — programnya memang tidak
+punya sisi itu.** Dipasang dan diperiksa sekali (v1.3.2), lalu dicopot lagi;
+jangan diulang. Daftar instruksi program Zap LENGKAPnya:
+
+```
+close_ledger_account, initialize_ledger_account, set_ledger_balance,
+update_ledger_balance_after_swap, zap_in_damm_v2,
+zap_in_dlmm_for_initialized_position, zap_in_dlmm_for_uninitialized_position,
+zap_out
+```
+
+Zap-**in** punya instruksi POSISI DLMM; zap-**out** tidak. `zap_out` cuma
+menerima dua akun (`user_token_in_account`, `amm_program`) — ia pembungkus CPI
+generik untuk sebuah **swap** yang berangkat dari token yang SUDAH ada di ATA
+user, memakai "ledger" untuk menghitung persentasenya di on-chain.
+`zapOutThroughJupiter/Dlmm/DammV2` seluruhnya kaki SWAP itu, bukan penutup
+posisi. "Zap out of your positions" di README-nya merujuk zap-in yang dibalik,
+bukan satu instruksi close.
+
+Membuatnya atomik berarti merakit sendiri payload CPI `zap_out` berisi
+instruksi `removeLiquidity` DLMM — SDK-nya tidak mengirim satu pun helper untuk
+itu (`getDlmmRemainingAccounts`/`createDlmmSwapPayload`/`AMOUNT_IN_DLMM_OFFSET`
+semuanya untuk SWAP), `docs.md` yang dirujuk README tidak ikut dipaketkan, dan
+jalur itu tidak bisa diuji tanpa mengeluarkan uang sungguhan.
+
+**Dan atomisitasnya sendiri ternyata tidak ada.** `rebalanceDlmmPosition` —
+satu-satunya alur DLMM tingkat-tinggi di SDK itu — mengembalikan **TUJUH
+transaksi** (`setupTransaction`, `initBinArrayTransaction`,
+`rebalancePositionTransaction`, `swapTransaction`, `ledgerTransaction`,
+`zapInTransaction`, `cleanUpTransaction`). Jadi alasan utama memakai Zap
+(close + jual dalam satu tx) tidak pernah ada sejak awal.
+
+Catatan operasional kalau suatu saat tetap dipakai: `jupiterApiUrl` SDK-nya
+menempel `/swap/v1/quote` dan `/swap/v1/swap-instructions`, bentuk yang sama
+dengan `lite-api.jup.ag/swap/v1` yang sudah dipakai sidecar — jadi ia bisa
+diarahkan ke sana dan tidak butuh `JUPITER_API_KEY` (bawaannya `api.jup.ag`
+yang sejak 31 Januari 2026 mewajibkan key).
+
 **Batas bin Zap tidak ada sebagai konstanta.** Dicari di dokumen dan di
 `dist/` SDK-nya: satu-satunya angka yang ada `BINARY_SEARCH_MAX_ITERATIONS = 20`
 dan `SWAP_BIN_ARRAY_COUNT = 4`; tidak ada `MAX_BIN*` apa pun. Yang mengikat
