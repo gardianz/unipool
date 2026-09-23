@@ -801,6 +801,27 @@ masih di atas anggaran, jadi klik pertama menandai Solana "masih dimuat" dan
 klik kedua lengkap — perilaku yang sama dengan chain EVM yang lambat, dan
 task-nya sengaja tidak dibatalkan supaya cache-nya terisi.
 
+**Dua hal lagi yang membuat posisi Solana KADANG tidak muncul di `/list`**, dan
+keduanya soal WAKTU, bukan gagal baca — gejalanya identik dengan dana hilang:
+
+- **`positions_by_key` dulu loop BERURUTAN per pool.** `DLMM.create` itu
+  beberapa round-trip RPC sendiri, dijalankan satu per satu: terukur **14,1
+  detik untuk 8 pool**. Sekarang `DLMM.createMultiple` + `Promise.all`.
+  Instansinya dipetakan lewat `inst.pubkey`, **bukan lewat URUTAN** yang
+  dikembalikan `createMultiple` — urutannya tidak dijanjikan di mana pun, dan
+  salah pasang berarti posisi dibaca dengan desimal + bin step pool LAIN, gagal
+  SENYAP karena angkanya tetap terlihat wajar.
+- **`Connection` web3.js MENUNGGU pada 429** secara default dan menghormati
+  `Retry-After` sebelum mencoba lagi di endpoint yang SAMA — persis jebakan
+  yang sudah tercatat di jalur EVM ("429 jangan pernah ditunggu, rotasi
+  endpoint"). `disableRetryOnRateLimit: true` membuatnya gagal SEKETIKA
+  sehingga loop endpoint di sidecar yang mengambil alih.
+
+Terukur pada 8 posisi, enam pembacaan berturut-turut: **median 8,92 → 4,35
+detik, terburuk 12,54 → 5,68 detik**, jumlah posisi tetap 8. Sisa ayunannya
+memang latensi RPC, jadi klik pertama yang dingin masih bisa kalah dari
+anggaran — tapi sekarang lazimnya tidak.
+
 #### PnL Solana dibaca dari METEORA, bukan `history.json`
 
 Posisi DLMM bisa dienumerasi dari owner-nya, jadi posisi yang dibuat di

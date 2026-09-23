@@ -415,13 +415,38 @@ const CMDS = {
     const groups = req.groups && req.groups.length
       ? req.groups
       : [{ pool: req.pool, positions: req.positions || [] }];
+
+    /* `DLMM.createMultiple` + `Promise.all`, BUKAN loop berurutan.
+     *
+     * `DLMM.create` itu beberapa round-trip RPC sendiri, dan loop lama
+     * menjalankannya satu per satu: terukur **14,1 detik untuk 8 pool** di
+     * wallet ini, padahal `/list` lintas chain punya anggaran 5 detik TOTAL.
+     * Itulah sebabnya posisi Solana KADANG tidak muncul sama sekali — bukan
+     * gagal baca, cuma kalah dari batas waktu lalu ditandai "masih dimuat".
+     *
+     * Instansinya dipetakan lewat `inst.pubkey`, bukan lewat URUTAN yang
+     * dikembalikan `createMultiple` — urutannya tidak dijanjikan di mana pun,
+     * dan salah pasang berarti posisi dibaca dengan desimal + bin step pool
+     * LAIN, yang gagal SENYAP (angkanya wajar, cuma salah). */
+    const insts = await DLMM.createMultiple(
+      conn, groups.map((g) => new PublicKey(String(g.pool))));
+    const byPool = new Map(insts.map((i) => [i.pubkey.toBase58(), i]));
+    const per = await Promise.all(groups.map(async (g) => {
+      const inst = byPool.get(String(g.pool));
+      if (!inst) throw new Error(`Pool ${g.pool} tidak terbaca`);
+      const [active, ps] = await Promise.all([
+        inst.getActiveBin(),
+        Promise.all((g.positions || []).map(
+          (k) => inst.getPosition(new PublicKey(String(k))))),
+      ]);
+      return { g, inst, active, ps,
+               dx: inst.tokenX.mint.decimals, dy: inst.tokenY.mint.decimals };
+    }));
     const out = [];
     let first = null;
-    for (const g of groups) {
-      const { inst, active, dx, dy } = await poolState(conn, g.pool);
+    for (const { g, inst, active, ps, dx, dy } of per) {
       if (!first) first = { active, inst, dx, dy, pool: g.pool };
-      for (const key of g.positions || []) {
-        const p = await inst.getPosition(new PublicKey(String(key)));
+      for (const p of ps) {
         const o = posOut(p, g.pool, inst.lbPair.binStep, dx, dy);
         o.active_bin = active.binId;
         o.mint_x = inst.tokenX.publicKey.toBase58();
@@ -797,7 +822,16 @@ const CMDS = {
     const urls = (req.rpcs && req.rpcs.length ? req.rpcs : [req.rpc]).filter(Boolean);
     let out, lastErr;
     for (const url of urls) {
-      const conn = new Connection(url, { commitment: "confirmed" });
+      // `disableRetryOnRateLimit` WAJIB. Default `Connection` MENUNGGU pada 429
+      // dan menghormati `Retry-After` Alchemy sebelum mencoba lagi di endpoint
+      // yang SAMA — persis jebakan yang sudah tercatat di jalur EVM ("429
+      // jangan pernah ditunggu, rotasi endpoint"). Di sini biayanya terukur:
+      // pembacaan 8 posisi berayun 0,63–12,5 detik tanpa sebab lain, dan
+      // `/list` lintas chain cuma punya anggaran 5 detik TOTAL — itu yang
+      // membuat posisi Solana KADANG tidak muncul. Dengan ini 429 gagal SEKETIKA
+      // dan loop di bawah pindah ke endpoint berikutnya, yang memang gunanya.
+      const conn = new Connection(url, {
+        commitment: "confirmed", disableRetryOnRateLimit: true });
       try {
         out = await fn(req, conn, kp);
         lastErr = null;
