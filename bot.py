@@ -2072,7 +2072,11 @@ async def show_pools_for(status, cid: int, token: str, extra: dict | None = None
                            f"{esc(res['token']['symbol'])} di {esc(cfg['name'])}.{extra}")
         return
 
+    # Pool BUATAN SENDIRI tidak boleh terpotong batas 10. Ia selalu ber-TVL 0 saat
+    # baru lahir (belum ada LP) sehingga selalu di urutan paling buntut — padahal ia
+    # satu-satunya yang tidak bisa ditemukan lewat jalur lain mana pun.
     top = pools[:10]
+    top += [p for p in pools[10:] if p.get("own")]
     tsym = res["token"]["symbol"]
     # Tabel monospace (<pre>) — 42 kolom, muat di layar HP tanpa wrap.
     # V/TVL = volume 24 jam ÷ TVL. Ini yang menunjukkan pool benar-benar dipakai:
@@ -2092,7 +2096,10 @@ async def show_pools_for(status, cid: int, token: str, extra: dict | None = None
         dtag = (p.get("dex") or "")[:1] if len(ch.dex_names(cid)) > 1 else ""
         # `!` = harga menyimpang, `¤` = fee cuma menumpuk di SATU sisi
         # (CollectFeeMode OnlyY). Keduanya boleh muncul bersamaan.
-        warn = ("!" if p.get("deviation") else "") + ("¤" if p.get("fee_only_sym") else "")
+        # `!` = harga menyimpang, `¤` = fee satu sisi, `★` = pool yang DIBUAT dari
+        # bot ini (belum diindeks sumber mana pun — lihat `ch.own_new_pools`).
+        warn = (("!" if p.get("deviation") else "") + ("¤" if p.get("fee_only_sym") else "")
+                + ("★" if p.get("own") else ""))
         # DLMM: yang menentukan presisi range adalah BIN STEP, bukan nomor versi —
         # jadi itu yang ditulis di kolom kiri. "v5" tidak berarti apa pun bagi user.
         tag = f"b{p.get('bin_step')}" if ver == 5 else f"v{ver}{dtag}"
@@ -2118,11 +2125,16 @@ async def show_pools_for(status, cid: int, token: str, extra: dict | None = None
                                              callback_data=f"np|{nk}")])
     buttons.append([InlineKeyboardButton("✖ Cancel", callback_data="cancel")])
     # pool yang disaring — sebutkan, jangan hilang diam-diam
+    n_own = sum(1 for x in top if x.get("own"))
     n_fo = sum(1 for x in top if x.get("fee_only_sym"))
     hooks_n = res.get("hook_pools") or 0
     dead = res.get("dropped_dead") or []
     off = res.get("dropped_offprice") or []
     off_line = ""
+    if n_own:
+        off_line += (f"\n★ {n_own} pool <b>Anda buat sendiri</b> lewat bot ini. Pool baru "
+                     f"tidak ada di Krystal/indexer/GeckoTerminal sampai ia punya volume, "
+                     f"jadi ia ditambahkan dari catatan bot — bukan dari daftar mana pun.")
     if n_fo:
         off_line += (f"\n💠 <b>¤</b> = {n_fo} pool membayar fee hanya di SATU sisi "
                      f"(CollectFeeMode OnlyY) — sisi lawannya tidak pernah menumpuk fee, "
@@ -2151,7 +2163,7 @@ async def show_pools_for(status, cid: int, token: str, extra: dict | None = None
     # menyumbang mayoritas daftar.
     _SRC_NAMA = {"krystal": "Krystal", "uniswap": "indexer Uniswap",
                  "gecko": "GeckoTerminal", "scan": "scan sendiri",
-                 "meteora": "Data API Meteora"}
+                 "meteora": "Data API Meteora", "own": "pool buatan sendiri"}
     parts = [p for p in str(res.get("source") or "").split("+") if p]
     if parts:
         nm = " + ".join(_SRC_NAMA.get(p, p) for p in parts)
@@ -2979,6 +2991,75 @@ NP_ANCHOR_DROP = 3.0
 # sepasang yang layak jadi rujukan — pembuatan DITOLAK.
 NP_ANCHOR_BLOCK = 3.0
 
+# ---- Harga awal DIHITUNG dari harga pasar (jalur cadangan, bukan jalur utama) ----
+# Sumber independen minimal yang harus sepakat sebelum harga pasar boleh jadi harga
+# awal pool. Satu sumber tidak pernah cukup: GMGN/GeckoTerminal bisa telat berjam-jam
+# dan `token_usd_price` bisa membaca pool yang salah.
+NP_DERIVE_MIN_SRC = 2
+# Selisih maksimum antara sumber TERTINGGI dan TERENDAH. Di atas ini harga pasarnya
+# memang tidak diketahui — aturan yang sama dengan `assert_pool_price_sane`: sumber
+# yang menyimpang jauh dari semua yang lain adalah sumbernya yang salah.
+NP_DERIVE_SPREAD = 1.25
+# Salah satu sumber wajib tersambung ke venue yang BENAR-BENAR diperdagangkan:
+# pembacaan on-chain bot sendiri, atau pool terdalam yang volumenya segini.
+NP_DERIVE_MIN_VOL = 1000.0
+
+
+def np_derive(p: dict, tdec: int, anchor: dict) -> tuple[int, str]:
+    """(sqrtPriceX96, keterangan) harga awal yang DIHITUNG dari harga pasar.
+
+    Jalur cadangan untuk pasangan yang tidak punya satu pun pool rujukan yang layak
+    — bukan pengganti "harga awal disalin dari pool yang sudah diperdagangkan".
+    Yang disalin selalu lebih baik: ia harga yang benar-benar terjadi.
+
+    Kenapa ini perlu ada: bot sudah memakai patokan yang sama untuk MEMBLOKIR
+    pembuatan ("harga pasar PONXWORK diketahui … tapi tidak ada pool
+    PONXWORK/USDG yang harganya mendekati itu"). Menolak dengan alasan "harganya
+    diketahui" sambil menolak MEMAKAI harga itu adalah asimetri, bukan penjagaan —
+    dan akibatnya pasangan yang pool sepasangnya cuma satu pool debu (terukur
+    PONXWORK/USDG di Robinhood: fee 99,12%, TVL $1,94, volume 0, harga 34x meleset)
+    tidak bisa dibuat sama sekali, padahal menyalin harga pool debu itu justru yang
+    paling merugikan.
+
+    Syaratnya karena itu ketat, dan ketiganya perlu:
+
+    - **Minimal `NP_DERIVE_MIN_SRC` sumber independen.** Satu API yang telat sendirian
+      tidak boleh menentukan harga pool.
+    - **Sumbernya harus SEPAKAT** dalam `NP_DERIVE_SPREAD`. Kalau tidak, harga pasar
+      memang tidak diketahui dan tidak ada yang bisa dihitung.
+    - **Minimal satu sumber tersambung ke venue nyata** — pembacaan on-chain bot
+      (`own`) atau pool terdalam bervolume ≥ `NP_DERIVE_MIN_VOL`. Dua API yang
+      sama-sama memantulkan angka yang sama bukan dua sumber.
+
+    Angka yang dipakai adalah `per_quote` — median geometrik sumber-sumber itu,
+    yaitu ANGKA YANG SAMA yang kartu tampilkan sebagai "Harga pasar". Memakai satu
+    sumber tertentu akan membuat harga awal berbeda dari yang user baca di layar.
+
+    (0, alasan) kalau tidak memenuhi syarat; pemanggil WAJIB menolak, jangan
+    menyalin pool debu sebagai gantinya."""
+    srcs = [(str(n), float(v)) for n, v in (anchor.get("srcs") or []) if float(v or 0) > 0]
+    ap = float(anchor.get("per_quote") or 0)
+    if ap <= 0:
+        return 0, "harga pasarnya sendiri tidak terbaca"
+    if len(srcs) < NP_DERIVE_MIN_SRC:
+        punya = ", ".join(n for n, _ in srcs) or "tidak ada"
+        return 0, (f"cuma {len(srcs)} sumber harga ({punya}), "
+                   f"butuh {NP_DERIVE_MIN_SRC} yang sepakat")
+    lo = min(v for _, v in srcs)
+    hi = max(v for _, v in srcs)
+    if lo <= 0 or hi / lo > NP_DERIVE_SPREAD:
+        return 0, (f"sumber harganya tidak sepakat ({hi / lo:.1f}x: "
+                   + ", ".join(f"{n} ${ch.fmt_price(v)}" for n, v in srcs) + ")")
+    if (float(anchor.get("own") or 0) <= 0
+            and float(anchor.get("deep_vol") or 0) < NP_DERIVE_MIN_VOL):
+        return 0, ("tidak ada sumber yang tersambung ke pool yang benar-benar "
+                   "diperdagangkan")
+    try:
+        sq = ch.price_to_sqrt_x96(ap, p["quote_is_token1"], tdec, p["quote_decimals"])
+    except Exception as e:
+        return 0, str(e)
+    return int(sq), ", ".join(n for n, _ in srcs)
+
 
 def gmgn_price_usd(cid: int, token: str, _cache={}) -> float:
     """Harga USD token dari GMGN, 0 kalau tidak tersedia. Dipanggil di thread.
@@ -3005,7 +3086,7 @@ def gmgn_price_usd(cid: int, token: str, _cache={}) -> float:
     return px
 
 
-def np_anchor(ctx: dict, p: dict) -> dict:
+def np_anchor(ctx: dict, p: dict, fresh: bool = False) -> dict:
     """Patokan harga INDEPENDEN untuk kartu pembuatan pool. Dipanggil di thread.
 
     Menggabungkan GMGN, pool terdalam GeckoTerminal (pasangan apa pun, termasuk
@@ -3015,12 +3096,22 @@ def np_anchor(ctx: dict, p: dict) -> dict:
     cid = ctx["chain"]
     tok = ctx["token"]["address"]
     extra = [("GMGN", gmgn_price_usd(cid, tok))]
-    return ch.token_anchor_price(cid, tok, p.get("quote_sym"), extra=extra)
+    # SALINAN: `token_anchor_price` mengembalikan objek yang ia cache sendiri, dan
+    # `np_build` menempelkan keterangan jalur harga ke dict ini.
+    return dict(ch.token_anchor_price(cid, tok, p.get("quote_sym"),
+                                      extra=extra, fresh=fresh))
 
 
-def np_build(ctx: dict) -> tuple[dict, int, dict | None, str | None, float, list, dict]:
+def np_build(ctx: dict, fresh: bool = False
+             ) -> tuple[dict, int, dict | None, str | None, float, list, dict]:
     """(pool_info, sqrtPrice rujukan, pool rujukan, alasan ditolak, deviasi,
-    kandidat, anchor). Dipanggil di thread."""
+    kandidat, anchor). Dipanggil di thread.
+
+    `fresh=True` melewati cache patokan harga — WAJIB di jalur eksekusi. Untuk
+    harga yang DISALIN itu tidak penting (sqrtPrice pool selalu dibaca on-chain
+    saat itu juga), tapi harga yang DIHITUNG berasal dari patokan, jadi patokan
+    basi = harga pool basi. Cache di bawahnya (`token_usd_price` 120 detik,
+    GeckoTerminal 45 detik) tetap berlaku."""
     cid = ctx["chain"]
     w3 = ch.get_w3(cid)
     fee, sp = int(ctx["fee"]), np_spacing(ctx)
@@ -3035,7 +3126,7 @@ def np_build(ctx: dict) -> tuple[dict, int, dict | None, str | None, float, list
     # sepasang saja pernah dihitung dari tiga pool debu (volume $8,04 / $0,76 /
     # $0,06) yang harganya berselisih 100× — lihat `ch.token_anchor_price`.
     try:
-        anchor = np_anchor(ctx, p)
+        anchor = np_anchor(ctx, p, fresh=fresh)
     except Exception:
         anchor = {"usd": 0.0, "per_quote": 0.0, "srcs": [], "deep": "", "deep_vol": 0.0}
     ap = float(anchor.get("per_quote") or 0)
@@ -3119,6 +3210,18 @@ def np_build(ctx: dict) -> tuple[dict, int, dict | None, str | None, float, list
             sq, ref = pick["sq"], pick["pool"]
             pick_px = pick["price"]
             dev = pick_px / med - 1
+
+    # Tidak ada pool sepasang yang layak jadi rujukan. Dulu ini selalu berarti
+    # DITOLAK — termasuk saat harga pasarnya justru diketahui dengan baik, yang
+    # membuat pesan penolakannya sendiri menyebut harga yang tidak boleh dipakai.
+    # Sekarang harga awalnya DIHITUNG dari patokan itu, dengan syarat ketat di
+    # `np_derive`. Menyalin pool debu tetap TIDAK pernah jadi cadangan.
+    why = ""
+    if (no_ref or sq <= 0) and ap > 0:
+        dsq, why = np_derive(p, td, anchor)
+        if dsq > 0:
+            sq, ref, no_ref, dev, pick_px = dsq, None, False, 0.0, ap
+            anchor["derived"] = why
     bad = ch.v4_check_new_pool(w3, cid, p["key"], sq)
 
     # Di atas ambang ini pembuatan DITOLAK, bukan sekadar diperingatkan — harga
@@ -3152,8 +3255,9 @@ def np_build(ctx: dict) -> tuple[dict, int, dict | None, str | None, float, list
         bad = (f"Harga pasar {ctx['token']['symbol']} diketahui ({ch.fmt_price(ap)} "
                f"{p['quote_sym']} — {', '.join(n for n, _ in anchor.get('srcs') or [])}) "
                f"tapi tidak ada pool {ctx['token']['symbol']}/{p['quote_sym']} yang "
-               f"harganya mendekati itu. Menyalin harga dari pool yang ada = pool baru "
-               f"lahir salah harga. Pilih quote lain.")
+               f"harganya mendekati itu, dan harga awal tidak bisa dihitung dari harga "
+               f"pasar itu: {why or 'syarat tidak terpenuhi'}. Menyalin harga dari pool "
+               f"yang ada = pool baru lahir salah harga. Pilih quote lain.")
     if not bad and sq <= 0 and ap <= 0:
         bad = "Harga awal tidak diketahui — tidak ada pool rujukan untuk pasangan ini."
     return p, sq, ref, bad, dev, cands, anchor
@@ -3204,6 +3308,25 @@ def np_text(ctx: dict, p: dict, sq: int, ref: dict | None, bad: str | None,
             L.append(f"<i>Pool sepasang yang ada volumenya: {esc(lain)}</i>")
         if abs(dev) > 0.10 and live:
             L.append(f"⚠️ Harga rujukan <b>{dev * 100:+.0f}%</b> dari median pool di atas.")
+    elif sq > 0 and (anchor or {}).get("derived"):
+        # Harga awal DIHITUNG, bukan disalin — kartu wajib mengatakannya apa adanya
+        # berikut sumbernya. Ini jalur cadangan: pasangan ini tidak punya pool
+        # rujukan yang layak, dan menyalin pool debu yang ada justru lebih buruk.
+        harga = np_price(p, int(ctx["token"].get("decimals") or 18), sq)
+        pool_debu = [c for c in (cands or []) if c.get("price")]
+        L.append(f"\nHarga awal: <b>{ch.fmt_price(harga)} {esc(p['quote_sym'])}</b>/{esc(tsym)}\n"
+                 f"<i>DIHITUNG dari harga pasar ({esc(anchor['derived'])}) — "
+                 f"pasangan ini belum punya pool yang layak jadi rujukan.</i>")
+        if pool_debu:
+            lain = ", ".join(
+                (("🪝 " if c.get("hooked") else "")
+                 + (f"{c['pool'].get('fee', 0) / 1e4:g}%" if c["pool"].get("fee") else "hook")
+                 + f" ({ch.fmt_usd(c['vol'])}) → {ch.fmt_price(c.get('price') or 0)}")
+                for c in sorted(pool_debu, key=lambda x: -x["vol"])[:6])
+            L.append(f"<i>Pool {esc(tsym)}/{esc(p['quote_sym'])} yang ada — TIDAK dipakai "
+                     f"(terlalu jauh dari harga pasar): {esc(lain)}</i>")
+        L.append("⚠️ <b>Harga disalin dari pool yang diperdagangkan selalu lebih baik.</b> "
+                 "Kalau pasangan lain punya pool yang ramai, buat di situ.")
     # Patokan independen selalu disebut, juga saat semuanya rapat: user perlu bisa
     # membandingkan harga awal pool dengan harga yang ia lihat di GMGN sendiri.
     ap = float((anchor or {}).get("per_quote") or 0)
@@ -3292,7 +3415,7 @@ def np_refresh_sqrt(ctx_data: dict) -> tuple[int, str]:
     ctx = {"chain": cid, "token": ctx_data["token"], "pools": res.get("pools") or [],
            "quote_addr": p0["quote_addr"], "fee": p0["fee"],
            "spacing": p0["tick_spacing"]}
-    p, sq, ref, bad, dev, _c, _a = np_build(ctx)
+    p, sq, ref, bad, dev, _c, _a = np_build(ctx, fresh=True)
     if bad:
         return 0, bad
     if sq <= 0:

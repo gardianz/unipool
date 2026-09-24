@@ -2843,9 +2843,9 @@ SESUDAH tx masuk blok — receipt sukses bukan bukti pool-nya jadi.
 meleset, arbitraser mengambil selisihnya dari deposit pertama — milik si pembuat.
 `v4_ref_sqrt_price()` mengumpulkan semua pool yang pasangan currency-nya PERSIS
 sama (v3 maupun v4) dan memakai sqrtPrice-nya apa adanya: angka itu rasio
-token1-per-token0 dalam WEI, tidak bergantung fee maupun spacing. Tanpa pool
-rujukan, UI **menolak** — pasangan yang sama sekali belum punya pool memang tidak
-bisa dibuat dari bot ini, dan itu disengaja.
+token1-per-token0 dalam WEI, tidak bergantung fee maupun spacing. Kalau tidak ada
+pool rujukan yang layak, harga awalnya DIHITUNG dari patokan pasar — dengan syarat
+ketat, lihat `np_derive` di bawah.
 
 **TVL terbesar BUKAN patokan harga — itu sudah merugikan sekali.** Pool DOT/USDC
 5% di Arc dibuat dengan harga salinan dari pool fee 20% ber-TVL $89 yang harganya
@@ -2916,6 +2916,94 @@ angka yang masuk `initialize()` tetap sqrtPrice yang dibaca on-chain. Urutannya:
 
 Hasil terukur sesudahnya: BEORN/USDG **+0,5%** dan LONG/USDC Arc **+0,3%** dari
 harga pasar, dari yang sebelumnya diblokir "+859%".
+
+### Tanpa pool rujukan, harga awal DIHITUNG — bukan ditolak
+
+Aturan lama "harga awal disalin, tidak pernah ditebak" menolak pasangan yang tidak
+punya pool rujukan layak. Itu **asimetri, bukan penjagaan**: bot memblokir dengan
+kalimat yang menyebut harga pasarnya sendiri —
+
+> ❌ Harga pasar PONXWORK diketahui (0,0₃121 USDG — GMGN, pool terdalam, bot) tapi
+> tidak ada pool PONXWORK/USDG yang harganya mendekati itu.
+
+— lalu menolak MEMAKAI angka yang baru saja ia sebut. Terukur pada PONXWORK di
+Robinhood: quote WETH bisa dibuat (ada pool ber-hook bervolume $141,8k yang
+harganya rapat), quote USDG **tidak bisa sama sekali**, karena satu-satunya pool
+PONXWORK/USDG yang ada adalah fee **99,12%, TVL $1,94, volume 0** dengan harga
+0,0₅296 — **34× meleset**. Menyalin pool debu itu justru pilihan yang paling
+merugikan, jadi "tidak ada rujukan" tidak boleh berarti "tidak bisa dibuat".
+
+`np_derive()` menghitungnya, dan **syaratnya tiga, ketiganya perlu**:
+
+- **Minimal `NP_DERIVE_MIN_SRC` (2) sumber independen.** Satu API yang telat
+  sendirian tidak boleh menentukan harga pool.
+- **Sumbernya SEPAKAT** dalam `NP_DERIVE_SPREAD` (1,25×). Kalau tidak, harga
+  pasarnya memang tidak diketahui — aturan yang sama dengan
+  `assert_pool_price_sane`.
+- **Minimal satu sumber tersambung ke venue NYATA** — pembacaan on-chain bot
+  (`anchor["own"]`) atau pool terdalam bervolume ≥ `NP_DERIVE_MIN_VOL` ($1.000).
+  Dua API yang sama-sama memantulkan angka yang sama bukan dua sumber.
+
+Angka yang dipakai `per_quote`, yaitu **ANGKA YANG SAMA** yang kartu tampilkan
+sebagai "Harga pasar". Memakai satu sumber tertentu akan membuat harga awal
+berbeda dari yang user baca di layar.
+
+`ch.price_to_sqrt_x96()` yang mengubahnya jadi sqrtPriceX96 — **tidak lewat tick**:
+sqrtPrice itu kontinu, jadi membulatkannya ke tick dulu cuma menambah galat
+sebesar setengah kisi. Akarnya `Decimal` presisi 80; di harga 1e-16 (pasangan
+desimal 18/6 untuk token semurah 1e-4) float64 sudah kehabisan digit dan galatnya
+langsung jadi harga pool. Terukur round-trip harga→sqrt→harga: **galat 2,2e-16**
+(epsilon float) untuk kedua orientasi quote, desimal 18/6, 18/18, dan 6/18.
+
+Terukur sesudahnya pada PONXWORK/USDG: harga awal **0,0₃108** vs patokan
+0,0₃108 — **−0,003%** — sementara jalur WETH tetap MENYALIN pool ber-hook
+bervolume $148,3k seperti sebelumnya. Salin selalu menang kalau ada; hitung
+hanya jalur cadangan, dan kartu MENGATAKAN yang mana yang dipakai berikut
+sumbernya, plus daftar pool sepasang yang sengaja TIDAK dipakai.
+
+**Patokan DISEGARKAN di jalur eksekusi.** `np_build(ctx, fresh=True)` dari
+`np_refresh_sqrt` melewati cache `token_anchor_price` (60 detik). Untuk harga yang
+DISALIN itu tidak penting — sqrtPrice pool selalu dibaca on-chain saat itu juga —
+tapi harga yang DIHITUNG berasal dari patokan, jadi patokan basi = harga pool
+basi. Cache di bawahnya (`token_usd_price` 120 detik, GeckoTerminal 45 detik)
+tetap berlaku.
+
+**`np_anchor` mengembalikan SALINAN.** `token_anchor_price` mengembalikan objek
+yang ia cache sendiri, dan `np_build` menempelkan `anchor["derived"]` ke dict itu —
+tanpa salinan, keterangan jalur harga bocor ke pemanggil lain lewat cache.
+
+### Pool yang DIBUAT dari bot ini tidak ada di daftar mana pun
+
+Pool baru tidak diindeks Krystal (saringan ≥$1K TVL), indexer Uniswap, maupun
+GeckoTerminal, **dan** `_drop_dead_pools()` membuangnya karena belum punya volume.
+Akibatnya user membuat pool sendiri, menempel CA-nya, dan pool itu tidak ada —
+satu-satunya jalan masuk hilang padahal pool-nya sehat on-chain.
+
+`store.add_new_pool()` dicatat **di dalam `v4_init_pool()`**, bukan di UI: itu
+satu-satunya tempat sebuah pool benar-benar lahir, jadi bot dan web ikut tanpa
+menulis apa pun. Isinya MINIMAL — hanya PoolKey (c0/c1/fee/spacing) — karena
+`v4_new_pool_info()` bisa membangun dict pool_info lengkap dari situ secara LOKAL
+(poolId = keccak, nol sumber luar). Tidak ada angka pasar yang disimpan; kalau
+indexer menyusul, entri indexer yang menang.
+
+`own_new_pools()` mengembalikannya dan `discover_any()` (pembungkus tipis di atas
+`_discover_any()`) meng-union-nya **paling akhir, sesudah semua saringan**.
+Empat hal yang wajib ikut:
+
+- **Tiap entri diverifikasi `v4_pool_exists()`** — pembuatan yang gagal atau chain
+  yang di-reset tidak boleh memunculkan pool hantu. Diuji: entri palsu
+  (fee 4242, kisi 777) dilewati, entri asli muncul.
+- **Native dan wrapped diterima dua-duanya** saat mencocokkan sisi: PoolKey pool
+  ETH memakai `address(0)` sementara user menempel alamat ERC20-nya. Jebakan yang
+  sama sudah menggigit di `_v4_key_from_krystal`.
+- **Cocok dari KEDUA sisi.** Menempel alamat quote-nya juga menemukan pool itu.
+- **`top = pools[:10]` tidak boleh memotongnya.** Pool baru selalu ber-TVL 0
+  sehingga selalu di urutan paling buntut — padahal ia satu-satunya yang tidak
+  bisa ditemukan lewat jalur lain mana pun. `show_pools_for` menambahkannya di
+  luar batas 10, menandainya **★**, dan menyebutkannya di legenda.
+
+`res["source"]` bertambah slug **`own`** (`krystal+uniswap+own`), jadi pembacanya
+tetap `split("+")` seperti aturan yang sudah ada — jangan dicocokkan persis.
 
 **`v4_hook_price_refs()` TIDAK BOLEH menebak tafsir.** Versi pertama memakai
 setiap pool token itu apa adanya lalu memilih satu dari empat tafsir (quote di

@@ -24,6 +24,8 @@ from web3 import Web3
 from web3.exceptions import ContractLogicError
 from web3.providers.rpc.utils import ExceptionRetryConfiguration
 
+import store
+
 try:    # BSC itu PoA: extraData 280 byte, jauh di atas 32 byte yang divalidasi web3.
     from web3.middleware import ExtraDataToPOAMiddleware as _POA   # web3 v7
 except ImportError:                                                # pragma: no cover
@@ -3238,7 +3240,76 @@ def _drop_offprice_pools(pools: list, token_dec: int, token_addr: str) -> tuple[
     return kept, dropped
 
 
+def own_new_pools(chain_id: int, token_addr: str) -> list[dict]:
+    """pool_info untuk pool v4 yang DIBUAT dari bot ini dan memuat `token_addr`.
+
+    Dibangun LOKAL dari PoolKey lewat `v4_new_pool_info` — poolId-nya keccak, jadi
+    tidak ada sumber luar yang perlu mengindeksnya lebih dulu. Itu memang intinya:
+    pool yang baru lahir tidak ada di Krystal/indexer/GeckoTerminal dan juga dibuang
+    `_drop_dead_pools()` karena belum punya volume, sehingga user yang baru membuat
+    pool sendiri menempel CA-nya dan pool itu tidak ada di daftar sama sekali.
+
+    Native dan wrapped diterima dua-duanya saat mencocokkan sisi — PoolKey pool ETH
+    memakai `address(0)` sementara user menempel alamat ERC20-nya (jebakan yang sama
+    sudah menggigit di `_v4_key_from_krystal`)."""
+    if is_solana(chain_id) or not any_has_v4(chain_id):
+        return []
+    try:
+        rows = store.new_pools(chain_id)
+    except Exception:
+        return []
+    if not rows:
+        return []
+    tok = _norm_currency(token_addr).lower()
+    ok = {tok}
+    wrapped = _norm_currency(CHAINS[chain_id]["wrapped"]).lower()
+    if tok in (wrapped, V4_NATIVE.lower()):
+        ok |= {wrapped, V4_NATIVE.lower()}
+    w3 = get_w3(chain_id)
+    out = []
+    for r in rows:
+        try:
+            c0, c1 = str(r["c0"]), str(r["c1"])
+            if c0.lower() in ok:
+                me, other = c0, c1
+            elif c1.lower() in ok:
+                me, other = c1, c0
+            else:
+                continue
+            p = v4_new_pool_info(w3, chain_id, me, other, int(r["fee"]), int(r["sp"]))
+            if not v4_pool_exists(w3, chain_id, p["pool_id"]):
+                continue           # gagal dibuat / chain di-reset
+            p["basis"] = "buatan sendiri"
+            p["own"] = True
+            out.append(p)
+        except Exception:
+            continue
+    return out
+
+
 def discover_any(chain_id: int, token_addr: str) -> dict:
+    """`_discover_any` + pool v4 yang DIBUAT dari bot ini.
+
+    Pool sendiri ditambahkan PALING AKHIR, sesudah semua saringan: entri dari
+    indexer menang kalau pool-nya sudah terindeks (statistiknya lebih lengkap),
+    dan yang belum tetap muncul alih-alih hilang diam-diam."""
+    res = _discover_any(chain_id, token_addr)
+    try:
+        own = own_new_pools(chain_id, token_addr)
+        if own:
+            seen = {str(p.get("pool")).lower() for p in (res.get("pools") or [])}
+            add = [p for p in own if str(p["pool"]).lower() not in seen]
+            if add:
+                res["pools"] = (res.get("pools") or []) + add
+                res["own_pools"] = len(add)
+                res["source"] = "+".join(
+                    x for x in [res.get("source") or "", "own"] if x)
+    except Exception as e:
+        log.warning("Pool buatan sendiri gagal digabung: %s", e)
+    return res
+
+
+def _discover_any(chain_id: int, token_addr: str) -> dict:
     """Discovery pool untuk SEMUA UI (bot & web).
 
     Krystal, indexer Uniswap, dan GeckoTerminal dijalankan BERSAMAAN lalu di-union;
@@ -6499,6 +6570,48 @@ def v4_ref_sqrt_price(w3: Web3, chain_id: int, c0: str, c1: str,
     return best["sq"], best["pool"], cands
 
 
+# Harga awal yang lebih mepet batas kisi dari ini ditolak. Di rasio harga ~1e38 satu
+# wei sisi lawan bernilai ~1e20 token, jadi modal yang masuk ke sana tidak bisa
+# kembali — sebab yang sama dengan `assert_range_recoverable`.
+_NEW_POOL_TICK_MARGIN = 1000
+
+
+def price_to_sqrt_x96(price_q: float, q_is_t1: bool, mdec: int, qdec: int) -> int:
+    """sqrtPriceX96 dari HARGA meme (satuan quote manusia per 1 meme).
+
+    Kebalikan `_meme_price_at_tick`, tapi TIDAK lewat tick: sqrtPrice itu kontinu,
+    jadi membulatkannya ke tick dulu cuma menambah galat sebesar setengah kisi
+    tanpa guna apa pun.
+
+    Dipakai HANYA oleh jalur "buat pool baru" saat pasangan ini tidak punya satu pun
+    pool rujukan yang layak. Aturan lamanya "harga awal disalin, tidak pernah
+    ditebak" tetap berlaku untuk angka yang MASUK ke sini: pemanggil wajib
+    menyodorkan harga yang sudah disepakati beberapa sumber independen, bukan
+    tebakan. Lihat `np_derive` di bot.py.
+
+    `Decimal` dipakai untuk akar: di harga 1e-16 (pasangan desimal 18/6 untuk token
+    semurah 1e-4) float64 sudah kehabisan digit, dan galatnya langsung jadi harga
+    pool."""
+    if not (price_q > 0):
+        raise RuntimeError("Harga rujukan terbaca 0.")
+    scale = 10 ** (int(mdec) - int(qdec))
+    raw = (price_q / scale) if q_is_t1 else (scale / price_q)
+    if not (1e-36 < raw < 1e36):
+        raise RuntimeError("Harga rujukan di luar rentang yang bisa jadi harga pool.")
+    tick = math.log(raw) / math.log(1.0001)
+    if abs(tick) >= MAX_TICK - _NEW_POOL_TICK_MARGIN:
+        raise RuntimeError(
+            f"Harga rujukan mentok di batas kisi (tick {tick:.0f}, batas \u00b1{MAX_TICK}) "
+            f"\u2014 pool di harga itu tidak bisa mengembalikan modal.")
+    from decimal import localcontext
+    with localcontext() as c:
+        c.prec = 80
+        sq = int((Decimal(raw).sqrt() * Decimal(Q96)).to_integral_value())
+    if sq <= 0:
+        raise RuntimeError("Harga rujukan tidak masuk akal.")
+    return sq
+
+
 # ---------- Harga rujukan INDEPENDEN (anchor) ----------
 # Longgar disengaja: yang dikejar harga yang OMONG KOSONG (faktor puluhan), bukan
 # pool yang kebetulan 30% mahal. Anchor-nya sendiri bisa telat beberapa persen.
@@ -6584,7 +6697,7 @@ def gecko_deep_price_usd(chain_id: int, token: str) -> tuple[float, str, float]:
 
 
 def token_anchor_price(chain_id: int, token: str, quote_sym: str | None = None,
-                       extra: list | None = None, _cache={}) -> dict:
+                       extra: list | None = None, fresh: bool = False, _cache={}) -> dict:
     """Patokan harga yang TIDAK berasal dari pool sepasang yang sedang dinilai.
 
     Median pool sepasang saja tidak cukup, dan itu sudah merugikan: kartu pembuatan
@@ -6604,7 +6717,7 @@ def token_anchor_price(chain_id: int, token: str, quote_sym: str | None = None,
     key = (chain_id, str(token).lower(), str(quote_sym or "").upper(),
            tuple(sorted((str(n), round(float(v), 12)) for n, v in (extra or []) if v)))
     hit = _cache.get(key)
-    if hit and time.time() - hit[1] < 60:
+    if hit and not fresh and time.time() - hit[1] < 60:
         return hit[0]
     srcs = [(str(n), float(v)) for n, v in (extra or []) if float(v or 0) > 0]
     deep_px, deep_nm, deep_vol = gecko_deep_price_usd(chain_id, token)
@@ -6625,8 +6738,12 @@ def token_anchor_price(chain_id: int, token: str, quote_sym: str | None = None,
                 per_quote = usd / q
         except Exception:
             pass
+    # `own` (pembacaan on-chain bot sendiri) dan `quote_usd` ikut keluar: jalur
+    # "buat pool tanpa rujukan" perlu tahu apakah salah satu sumbernya benar-benar
+    # dari pool on-chain, bukan cuma dua API yang kebetulan sepakat.
     out = {"usd": usd, "per_quote": per_quote, "srcs": srcs,
-           "deep": deep_nm, "deep_vol": deep_vol}
+           "deep": deep_nm, "deep_vol": deep_vol,
+           "own": own, "quote_usd": (usd / per_quote) if per_quote > 0 else 0.0}
     _cache[key] = (out, time.time())
     return out
 
@@ -6843,6 +6960,14 @@ def v4_init_pool(chain_id: int, pk: str, key: tuple, sqrt_price: int) -> list[tu
     if not v4_pool_exists(w3, chain_id, pid):
         raise RuntimeError("Tx buat pool masuk blok tapi pool tetap belum ter-initialize "
                            "— PoolKey ditolak PoolManager.")
+    # Dicatat DI SINI, bukan di UI: ini satu-satunya tempat sebuah pool benar-benar
+    # lahir, jadi bot & web ikut tanpa menulis apa pun. Tanpa catatan ini pool yang
+    # baru dibuat tidak muncul di daftar mana pun — belum diindeks Krystal/indexer/
+    # GeckoTerminal DAN dibuang `_drop_dead_pools()` karena belum punya volume.
+    try:
+        store.add_new_pool(chain_id, key[0], key[1], int(key[2]), int(key[3]))
+    except Exception as e:
+        log.warning("Pool v4 baru gagal dicatat ke registry: %s", e)
     return [("buat pool v4", h)]
 
 

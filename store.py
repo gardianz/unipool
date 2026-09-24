@@ -419,6 +419,35 @@ def drop_ref(chain_id: int, wallet: str, kind: str, ref: str):
             _write(HISTORY_FILE, h)
 
 
+# ---------- Pool v4 yang DIBUAT dari bot ini ----------
+# Pool yang baru lahir tidak ada di satu pun sumber daftar pool: Krystal menyaring
+# >=$1K TVL, indexer Uniswap dan GeckoTerminal belum mengindeksnya, dan
+# `_drop_dead_pools()` juga membuangnya karena belum punya volume. Jadi user
+# membuat pool sendiri lalu menempel CA-nya dan pool itu TIDAK ADA di daftar —
+# satu-satunya jalan masuk hilang, padahal pool-nya sehat on-chain.
+#
+# Registry ini menutup lubang itu, dan bentuknya sengaja MINIMAL: cukup PoolKey-nya,
+# karena `chain.v4_new_pool_info()` bisa membangun dict pool_info lengkap dari situ
+# secara lokal (poolId = keccak). Tidak ada angka pasar yang disimpan — kalau suatu
+# saat indexer menyusul, entri indexer yang menang.
+def add_new_pool(chain_id: int, c0: str, c1: str, fee: int, spacing: int):
+    with _hist_write():
+        h = _hist(fresh=True)
+        lst = h.setdefault("new_pools", {}).setdefault(str(chain_id), [])
+        row = {"c0": str(c0).lower(), "c1": str(c1).lower(),
+               "fee": int(fee), "sp": int(spacing), "ts": int(time.time())}
+        for x in lst:
+            if (x.get("c0"), x.get("c1"), x.get("fee"), x.get("sp")) == \
+                    (row["c0"], row["c1"], row["fee"], row["sp"]):
+                return
+        lst.append(row)
+        _write(HISTORY_FILE, h)
+
+
+def new_pools(chain_id: int) -> list[dict]:
+    return list(_hist().get("new_pools", {}).get(str(chain_id), []))
+
+
 # ---------- Patokan fee posisi V2 ----------
 # LP v2 tidak punya "fee unclaimed" — fee mengendap ke reserve, jadi jumlah LP token
 # tetap tapi nilainya naik. Patokannya √k per LP saat masuk (k = reserve0×reserve1):
