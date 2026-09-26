@@ -7165,7 +7165,17 @@ def token_anchor_price(chain_id: int, token: str, quote_sym: str | None = None,
         srcs.append(("pool utama", main["usd"]))
         if any(max(v / main["usd"], main["usd"] / v) <= _MAIN_AGREE for v in others):
             primary = "pool utama"
-    usd = main["usd"] if primary == "pool utama" else geo_median([v for _, v in srcs])
+    # Tanpa pool utama yang terbaca (bonding curve, GMGN tidak menunjuk pool, pool
+    # tak dikenal), harga GMGN yang jadi patokan — bukan median. Median memasukkan
+    # harga TRANSAKSI GeckoTerminal yang terukur telat +12,7%, padahal GMGN cocok
+    # dengan slot0 pool utama dalam ±1,2% di 26 dari 26 pool yang bisa dibaca.
+    # Syaratnya sama dengan pool utama: dikonfirmasi minimal satu sumber lain.
+    gm = next((v for n, v in srcs if n == "GMGN"), 0.0)
+    if primary != "pool utama" and gm > 0:
+        if any(max(v / gm, gm / v) <= _MAIN_AGREE for n, v in srcs if n != "GMGN"):
+            primary = "GMGN"
+    usd = (main["usd"] if primary == "pool utama" else gm if primary == "GMGN"
+           else geo_median([v for _, v in srcs]))
     per_quote = 0.0
     if usd > 0 and quote_sym:
         try:

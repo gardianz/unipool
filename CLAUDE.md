@@ -3013,6 +3013,25 @@ tidak tahu venue mana yang sebenarnya menentukan harga.
 `gmgn_token()` men-cache `token_info` 120 detik dan dipakai bersama harga GMGN +
 hint + badge (satu request untuk ketiganya); kegagalannya TIDAK di-cache.
 
+**Tanpa pool utama yang terbaca, GMGN yang jadi patokan — bukan median.** Urutan
+`anchor["primary"]`: `"pool utama"` (slot0 on-chain) → `"GMGN"` → `"median"`.
+Median memasukkan harga TRANSAKSI GeckoTerminal (terukur telat +12,7%) padahal
+GMGN cocok dengan slot0 pool utama dalam ±1,2% di SEMUA 26 pool yang bisa dibaca.
+Syaratnya sama dengan pool utama: dikonfirmasi minimal satu sumber lain dalam
+`_MAIN_AGREE`. Nama sumbernya dicocokkan lewat label `"GMGN"` di `extra` —
+`chain.py` sendiri tetap tidak pernah memanggil GMGN.
+
+Kenapa pool utama tetap dibaca on-chain walau GMGN akurat: angka yang masuk
+`initialize()` harus keadaan pool PADA SAAT tx dibangun, sedangkan harga API punya
+jeda (bot sendiri men-cache GMGN 120 detik), dan data API — seakurat apa pun —
+tidak pernah otoritatif untuk membangun transaksi (aturan yang sama dengan
+Krystal/indexer; DexScreener pernah mengirim harga token LAIN, FATCOIN meleset
+56.726×).
+
+**Rate limit GMGN terbukti mudah tersentuh saat menguji**: `rank` + `token_info`
+untuk ~30 token berturut-turut memicu `RATE_LIMIT_BANNED` ±1 menit untuk IP mesin
+itu (bukan VPS). Jangan diulang sebelum `reset_at` — tiap retry menambah ban.
+
 ### Tanpa pool rujukan, harga awal DIHITUNG — bukan ditolak
 
 Aturan lama "harga awal disalin, tidak pernah ditebak" menolak pasangan yang tidak

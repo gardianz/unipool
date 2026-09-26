@@ -3110,6 +3110,12 @@ def np_derive(p: dict, tdec: int, anchor: dict) -> tuple[int, str]:
     # Pool UTAMA dibaca on-chain dan sudah dikonfirmasi sumber lain di
     # `ch.token_anchor_price` — itu harga yang dipakai, bukan median API. Ketiga
     # syarat di bawah dibuat untuk angka yang cuma berasal dari API.
+    if anchor.get("primary") == "GMGN":
+        try:
+            sq = ch.price_to_sqrt_x96(ap, p["quote_is_token1"], tdec, p["quote_decimals"])
+        except Exception as e:
+            return 0, str(e)
+        return int(sq), "GMGN, dikonfirmasi sumber lain"
     if anchor.get("primary") == "pool utama":
         m = anchor.get("main") or {}
         try:
@@ -3548,6 +3554,10 @@ def np_text(ctx: dict, p: dict, sq: int, ref: dict | None, bad: str | None,
                      f"({esc(m.get('exchange') or '?')}, {besar}, ditunjuk "
                      f"{esc(m.get('src') or '?')}) — harganya dibaca on-chain{conv}. "
                      f"Pembanding: {src}</i>")
+        elif anchor.get("primary") == "GMGN":
+            L.append(f"\n<b>Harga pasar:</b> {ch.fmt_price(ap)} {esc(p['quote_sym'])}/{esc(tsym)}\n"
+                     f"<i>dari GMGN (pool utama tidak bisa dibaca on-chain), "
+                     f"dikonfirmasi sumber lain. Pembanding: {src}</i>")
         else:
             L.append(f"\n<b>Harga pasar (di luar pool sepasang):</b> {ch.fmt_price(ap)} "
                      f"{esc(p['quote_sym'])}/{esc(tsym)}\n<i>{src}"
