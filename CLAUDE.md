@@ -3012,14 +3012,31 @@ selisih dengan pasar karena mereka UNTUNG dari likuiditas itu. Pool yang
 likuiditas aktifnya nol (atau debu) tidak menawarkan apa pun, jadi harganya
 berhenti di angka saat pool dibuat, berapa pun pasar bergerak sesudahnya.
 
-Kejadian nyata: XGAS.DEV/USDG 5% (`0x5296812f…`) dibuat **06:11:11 UTC** di
-0,000362 — BENAR saat itu (OHLCV menit yang sama di pool terdalam
-0,000372–0,000420). Mint-nya tidak pernah masuk, token naik **2,2×** dalam 25
-menit, dan pool kosong itu tetap 0,000362. Kartu mint lalu menulis
-*"Current price 0,000362 · MC $362k"* sementara GMGN $813k — dan setoran Wide di
-sana berarti menjual separuh posisi ke arbitraser di ~45% harga pasar.
+Kejadian nyata: XGAS.DEV/USDG 5% kisi 500 (`0x5296812f…`) dibuat **pihak lain**
+— `0xF1eFd3ba…`, lewat `posm.multicall` (initialize + mint dalam SATU tx
+`0x79992b68…`, blok 72859134, 06:11:11 UTC; bot sendiri tidak pernah memakai
+multicall). Harganya 0,000362, BENAR saat itu (OHLCV menit yang sama di pool
+terdalam 0,000372–0,000420); posisinya satu sisi USDG sehingga likuiditas AKTIF
+di tick itu nol. Token lalu naik ~2× dan pool itu tetap 0,000362.
+
+User menekan **➕ Buat pool baru** saat MC sudah $700k+, dengan fee 5% dan kisi
+BAWAAN 500 — PoolKey yang PERSIS sama. Kartu pembuatan menampilkan harga pasar
+lalu *"✅ Pool ini sudah ada — langsung ke kartu mint"*, dan kartu mint menulis
+*"Current price 0,000362 · MC $362k"* sementara GMGN $813k. Dari sisi user itu
+terbaca "bot salah baca harga saat membuat pool". Setoran Wide di sana berarti
+menjual separuh posisi ke arbitraser di ~45% harga pasar.
 `assert_pool_price_sane` tidak menangkapnya: ambangnya 20× (dibuat untuk pool
 RUSAK, bukan pool basi).
+
+**Kartu pembuatan pool karena itu WAJIB membedakan "pool baru" dari "PoolKey yang
+sudah ada".** Kisi bawaan (`fee/100`) adalah pola yang paling banyak dipakai
+pembuat pool lain, jadi tabrakan ini lazim, bukan kebetulan. Kalau PoolKey sudah
+ada, `np_text` menulis HARGA POOL ITU (yang dipakai kartu mint), bukan harga awal
+hitungan bot; kalau pool itu basi, kartunya ❌ menyebut pembuatnya pihak lain,
+selisihnya, dan `np_free_spacings()` menawarkan kisi yang BELUM ada untuk fee yang
+sama (tetangga ±1 dulu — kotaknya praktis sama lebar) sebagai tombol
+`🆕 kisi N (pool baru)`. Terukur pada kasus ini: kisi 501/499/250 bebas, dan
+kisi 501 memberi harga awal −6,4% dari pasar.
 
 `stale_pool_state()` menilainya, dan tiga angkanya disengaja:
 

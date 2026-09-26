@@ -3332,12 +3332,43 @@ def np_text(ctx: dict, p: dict, sq: int, ref: dict | None, bad: str | None,
     cid = ctx["chain"]
     tsym = ctx["token"]["symbol"]
     fee, sp = int(ctx["fee"]), np_spacing(ctx)
-    ada = ch.v4_pool_exists(ch.get_w3(cid), cid, p["pool_id"])
+    w3 = ch.get_w3(cid)
+    td = int(ctx["token"].get("decimals") or 18)
+    ada = ch.v4_pool_exists(w3, cid, p["pool_id"])
+    # PoolKey = (token, quote, fee, kisi). Fee + kisi bawaan bisa PERSIS sama dengan
+    # pool yang dibuat orang lain, dan "buat pool" lalu jatuh ke pool itu. Harga yang
+    # akan dipakai kartu mint adalah harga POOL ITU — bukan harga awal yang dihitung
+    # di bawah — jadi keduanya wajib dibedakan. Kejadian nyata: XGAS.DEV/USDG fee 5%
+    # kisi 500 sudah dibuat `0xF1eFd3ba…` 25 menit sebelumnya dan KOSONG; kartu ini
+    # menampilkan harga pasar lalu "✅ sudah ada", dan kartu mint sesudahnya menulis
+    # MC $362k sementara pasar $700k+.
+    h_ada, st = 0.0, None
+    ctx["_np_stale"], ctx["_np_alts"] = False, []
+    if ada:
+        try:
+            h_ada = np_price(p, td, ch.v4_slot0(w3, cid, p["pool_id"])[0])
+        except Exception:
+            h_ada = 0.0
+        try:
+            st = ch.stale_pool_state_of(w3, cid, p)
+        except Exception:
+            st = None
+        if st:
+            ctx["_np_stale"] = True
+            ctx["_np_alts"] = np_free_spacings(ctx, p, fee, sp)
     L = [f"<b>➕ Buat pool v4 baru · {esc(ch.CHAINS[cid]['name'])}</b>",
          f"{esc(tsym)}/{esc(p['quote_sym'])} · fee <b>{fee / 1e4:g}%</b> · "
          f"tick spacing <b>{sp}</b> (kisi {box_pct(p):.4f}%)",
          f"poolId: <code>{esc(p['pool'])}</code>"]
-    if ref is not None and sq > 0:
+    if ada:
+        # Pool yang SUDAH ada tidak punya "harga awal" — harganya sudah dipasang orang
+        # lain, dan itulah yang dipakai kartu mint.
+        L.append(f"\nHarga pool yang SUDAH ADA: <b>{ch.fmt_price(h_ada)} "
+                 f"{esc(p['quote_sym'])}</b>/{esc(tsym)}"
+                 + (f" · MC {ch.fmt_usd(h_ada * float(p.get('quote_usd') or 0) * ch.token_supply(w3, ctx['token']['address']))}"
+                    if h_ada > 0 and p.get("quote_usd") else "")
+                 + "\n<i>harga ini yang dipakai kartu mint — bukan harga hitungan bot.</i>")
+    elif ref is not None and sq > 0:
         # Harga dihitung lewat `_meme_price` yang SAMA dengan kartu mint, bukan
         # rumus tersendiri. Versi pertama menuliskannya ulang dan tandanya terbalik
         # saat quote jadi currency0 (`10**(qd-td)` bukan `10**(td-qd)`): pool
@@ -3406,19 +3437,33 @@ def np_text(ctx: dict, p: dict, sq: int, ref: dict | None, bad: str | None,
                  f"{esc(p['quote_sym'])}/{esc(tsym)}\n<i>{src}"
                  + (f" · pool terdalam {esc(deep)} (vol {ch.fmt_usd(anchor.get('deep_vol'))})"
                     if deep else "") + "</i>")
-        if sq > 0 and ref is not None:
-            h = np_price(p, int(ctx["token"].get("decimals") or 18), sq)
-            if h > 0:
-                L.append(f"<i>Harga awal di atas {h / ap - 1:+.1%} dari itu.</i>")
-                # Diperingatkan, tidak diblokir: patokan ini BISA telat beberapa
-                # puluh persen (terukur di Arc GeckoTerminal melaporkan CRCL $67,77
-                # saat pool terdalam on-chain $202,56). Yang memblokir tetap dua
-                # ambang yang dihitung dari pembacaan on-chain serentak.
-                if abs(math.log(h / ap)) > math.log(1.25):
-                    L.append(f"⚠️ Selisihnya di atas 25%. Kalau harga pasar di atas yang "
-                             f"benar, arbitraser mengambil {abs(h / ap - 1) * 100:.0f}% "
-                             f"dari deposit pertama Anda. Bandingkan dulu di GMGN.")
-    if ada:
+        h, nm = ((h_ada, "Harga pool yang sudah ada") if ada else
+                 (np_price(p, td, sq), "Harga awal") if (sq > 0 and ref is not None)
+                 else (0.0, ""))
+        if h > 0:
+            L.append(f"<i>{nm} di atas {h / ap - 1:+.1%} dari itu.</i>")
+            # Diperingatkan, tidak diblokir: patokan ini BISA telat beberapa
+            # puluh persen (terukur di Arc GeckoTerminal melaporkan CRCL $67,77
+            # saat pool terdalam on-chain $202,56). Yang memblokir tetap dua
+            # ambang yang dihitung dari pembacaan on-chain serentak.
+            if abs(math.log(h / ap)) > math.log(1.25):
+                L.append(f"⚠️ Selisihnya di atas 25%. Kalau harga pasar di atas yang "
+                         f"benar, arbitraser mengambil {abs(h / ap - 1) * 100:.0f}% "
+                         f"dari deposit pertama Anda. Bandingkan dulu di GMGN.")
+    if ada and st:
+        L.append(f"\n❌ <b>Pool dengan fee {fee / 1e4:g}% · kisi {sp} SUDAH ADA — dibuat "
+                 f"pihak lain, dan KOSONG.</b> Harganya beku di "
+                 f"{ch.fmt_price(st['pool_px'])} sejak dibuat, pasar sekarang "
+                 f"{ch.fmt_price(st['mkt'])} ({st['dev'] * 100:+.0f}%). Kartu mint pool ini "
+                 f"memakai harga beku itu, dan setoran yang melintasi selisihnya DITOLAK.")
+        alts = ctx.get("_np_alts") or []
+        if alts:
+            L.append("<i>Pool BARU di harga pasar = PoolKey lain. Kisi yang belum ada untuk "
+                     f"fee ini: {', '.join(str(v) for v in alts)} — tombol 🆕 di bawah.</i>")
+        else:
+            L.append("<i>Pool BARU di harga pasar = PoolKey lain: ganti fee atau "
+                     "✏️ Kisi lain….</i>")
+    elif ada:
         L.append("\n✅ Pool ini <b>sudah ada</b> — tidak ada tx pembuatan, "
                  "tombol di bawah langsung ke kartu mint.")
     elif bad:
@@ -3436,10 +3481,41 @@ def np_text(ctx: dict, p: dict, sq: int, ref: dict | None, bad: str | None,
     return "\n".join(L)
 
 
+def np_free_spacings(ctx: dict, p: dict, fee: int, sp: int, n: int = 3) -> list[int]:
+    """Kisi untuk fee ini yang PoolKey-nya BELUM ada — jalan keluar kalau fee + kisi
+    pilihan user kebetulan sama dengan pool orang lain yang basi. Tetangga ±1 ikut
+    dicoba lebih dulu: kotaknya praktis sama lebarnya dengan pilihan user.
+    Dipanggil di thread; satu `getSlot0` per kandidat."""
+    cid = ctx["chain"]
+    w3 = ch.get_w3(cid)
+    cands = [sp + 1, sp - 1] + [v for v, _ in np_spacing_presets(fee)]
+    out, seen = [], {sp}
+    for v in cands:
+        if v in seen or not (ch.V4_SPACING_MIN <= v <= ch.V4_SPACING_MAX):
+            continue
+        seen.add(v)
+        try:
+            k = ch.v4_pool_key(ctx["token"]["address"], p["quote_addr"], int(fee), int(v))
+            if not ch.v4_pool_exists(w3, cid, ch.v4_pool_id(k)):
+                out.append(v)
+        except Exception:
+            continue
+        if len(out) >= n:
+            break
+    return out
+
+
 def np_kb(key: str, ctx: dict, p: dict, bad: str | None, ada: bool) -> InlineKeyboardMarkup:
     fee, sp = int(ctx["fee"]), np_spacing(ctx)
     rows = []
-    if ada:
+    if ada and ctx.get("_np_stale"):
+        alts = ctx.get("_np_alts") or []
+        if alts:
+            rows.append([InlineKeyboardButton(f"🆕 kisi {v} (pool baru)",
+                                              callback_data=f"nps|{key}|{v}") for v in alts[:3]])
+        rows.append([InlineKeyboardButton("⚠️ Tetap ke kartu mint (pool basi)",
+                                          callback_data=f"npgo|{key}")])
+    elif ada:
         rows.append([InlineKeyboardButton("➡️ Ke kartu mint", callback_data=f"npgo|{key}")])
     elif not bad:
         rows.append([InlineKeyboardButton("➡️ Siapkan mint (pool dibuat saat Confirm)",
