@@ -3353,9 +3353,10 @@ def np_text(ctx: dict, p: dict, sq: int, ref: dict | None, bad: str | None,
             st = ch.stale_pool_state_of(w3, cid, p)
         except Exception:
             st = None
-        if st:
-            ctx["_np_stale"] = True
-            ctx["_np_alts"] = np_free_spacings(ctx, p, fee, sp)
+        ctx["_np_stale"] = bool(st)
+        # Dihitung untuk SEMUA PoolKey yang sudah ada, bukan cuma yang basi: user
+        # yang menekan "Buat pool" berhak memilih tetap membuat pool sendiri.
+        ctx["_np_alts"] = np_free_spacings(ctx, p, fee, sp)
     L = [f"<b>➕ Buat pool v4 baru · {esc(ch.CHAINS[cid]['name'])}</b>",
          f"{esc(tsym)}/{esc(p['quote_sym'])} · fee <b>{fee / 1e4:g}%</b> · "
          f"tick spacing <b>{sp}</b> (kisi {box_pct(p):.4f}%)",
@@ -3456,16 +3457,23 @@ def np_text(ctx: dict, p: dict, sq: int, ref: dict | None, bad: str | None,
                  f"{ch.fmt_price(st['pool_px'])} sejak dibuat, pasar sekarang "
                  f"{ch.fmt_price(st['mkt'])} ({st['dev'] * 100:+.0f}%). Kartu mint pool ini "
                  f"memakai harga beku itu, dan setoran yang melintasi selisihnya DITOLAK.")
-        alts = ctx.get("_np_alts") or []
-        if alts:
-            L.append("<i>Pool BARU di harga pasar = PoolKey lain. Kisi yang belum ada untuk "
-                     f"fee ini: {', '.join(str(v) for v in alts)} — tombol 🆕 di bawah.</i>")
-        else:
-            L.append("<i>Pool BARU di harga pasar = PoolKey lain: ganti fee atau "
-                     "✏️ Kisi lain….</i>")
     elif ada:
-        L.append("\n✅ Pool ini <b>sudah ada</b> — tidak ada tx pembuatan, "
-                 "tombol di bawah langsung ke kartu mint.")
+        L.append(f"\nℹ️ Pool dengan fee {fee / 1e4:g}% · kisi {sp} <b>sudah ada</b> "
+                 f"(likuiditasnya aktif, harganya dijaga pasar).")
+    if ada:
+        alts = ctx.get("_np_alts") or []
+        # PoolKey yang sama TIDAK bisa dibuat dua kali — PoolManager menolaknya
+        # (`PoolAlreadyInitialized`). "Tetap buat" karena itu berarti PoolKey lain,
+        # dan yang paling dekat adalah kisi tetangga: kotaknya praktis sama lebar.
+        if alts:
+            L.append(f"<b>Pilihan:</b> pakai pool yang sudah ada, atau <b>tetap buat pool "
+                     f"sendiri</b> dengan kisi {alts[0]} (kotak {box_pct(dict(p, tick_spacing=alts[0])):.4f}% "
+                     f"vs {box_pct(p):.4f}%). Pool yang sama persis tidak bisa dibuat dua "
+                     f"kali — PoolManager menolaknya — jadi pool baru selalu PoolKey "
+                     f"lain, dan likuiditas token ini terpecah di dua pool.")
+        else:
+            L.append("<i>Untuk pool sendiri: ganti fee atau ✏️ Kisi lain… — PoolKey yang "
+                     "sama tidak bisa dibuat dua kali.</i>")
     elif bad:
         L.append(f"\n❌ {esc(bad)}")
     else:
@@ -3508,15 +3516,19 @@ def np_free_spacings(ctx: dict, p: dict, fee: int, sp: int, n: int = 3) -> list[
 def np_kb(key: str, ctx: dict, p: dict, bad: str | None, ada: bool) -> InlineKeyboardMarkup:
     fee, sp = int(ctx["fee"]), np_spacing(ctx)
     rows = []
-    if ada and ctx.get("_np_stale"):
+    if ada:
         alts = ctx.get("_np_alts") or []
+        stale = ctx.get("_np_stale")
         if alts:
-            rows.append([InlineKeyboardButton(f"🆕 kisi {v} (pool baru)",
-                                              callback_data=f"nps|{key}|{v}") for v in alts[:3]])
-        rows.append([InlineKeyboardButton("⚠️ Tetap ke kartu mint (pool basi)",
-                                          callback_data=f"npgo|{key}")])
-    elif ada:
-        rows.append([InlineKeyboardButton("➡️ Ke kartu mint", callback_data=f"npgo|{key}")])
+            # Langsung ke kartu konfirmasi pool BARU — bukan render ulang kartu ini.
+            rows.append([InlineKeyboardButton(f"🆕 Tetap buat pool baru · kisi {alts[0]}",
+                                              callback_data=f"npnew|{key}|{alts[0]}")])
+        rows.append([InlineKeyboardButton(
+            "⚠️ Pakai pool yang sudah ada (basi)" if stale else "➡️ Pakai pool yang sudah ada",
+            callback_data=f"npgo|{key}")])
+        if len(alts) > 1:
+            rows.append([InlineKeyboardButton(f"lihat kisi {v}", callback_data=f"nps|{key}|{v}")
+                         for v in alts[1:3]])
     elif not bad:
         rows.append([InlineKeyboardButton("➡️ Siapkan mint (pool dibuat saat Confirm)",
                                           callback_data=f"npok|{key}")])
@@ -6116,6 +6128,20 @@ async def _route_callback(update: Update):
             await edit(q.message, "⚠️ Tombol kadaluarsa. Paste alamat lagi.")
             return
         await show_pools_for(q.message, ctx["chain"], ctx["token"]["address"])
+        return
+    if data.startswith("npnew|"):
+        # "Tetap buat pool baru": PoolKey pilihan user sudah ada, jadi kisinya diganti
+        # ke tetangga yang BELUM ada lalu langsung ke kartu konfirmasi pool baru.
+        # `do_newpool` menghitung ulang semuanya lewat `np_build` — tidak ada angka
+        # dari kartu sebelumnya yang dipakai.
+        _, k, val = data.split("|", 2)
+        ctx = NEWPOOL.get(k)
+        if not ctx:
+            await edit(q.message, "⚠️ Tombol kadaluarsa (bot sempat restart). Paste alamat lagi.")
+            return
+        ctx["spacing"] = int(val)
+        await q.edit_message_reply_markup(None)
+        await do_newpool(update, k)
         return
     if data.startswith(("npok|", "npgo|")):
         await q.edit_message_reply_markup(None)

@@ -3032,11 +3032,21 @@ RUSAK, bukan pool basi).
 sudah ada".** Kisi bawaan (`fee/100`) adalah pola yang paling banyak dipakai
 pembuat pool lain, jadi tabrakan ini lazim, bukan kebetulan. Kalau PoolKey sudah
 ada, `np_text` menulis HARGA POOL ITU (yang dipakai kartu mint), bukan harga awal
-hitungan bot; kalau pool itu basi, kartunya ❌ menyebut pembuatnya pihak lain,
-selisihnya, dan `np_free_spacings()` menawarkan kisi yang BELUM ada untuk fee yang
-sama (tetangga ±1 dulu — kotaknya praktis sama lebar) sebagai tombol
-`🆕 kisi N (pool baru)`. Terukur pada kasus ini: kisi 501/499/250 bebas, dan
-kisi 501 memberi harga awal −6,4% dari pasar.
+hitungan bot; kalau pool itu basi, kartunya ❌ menyebut pembuatnya pihak lain dan
+selisihnya.
+
+**PoolKey yang sudah ada = DUA pilihan eksplisit, basi atau tidak**:
+`🆕 Tetap buat pool baru · kisi N` (`npnew|<key>|<N>` — langsung ke kartu
+konfirmasi pool baru, dihitung ulang seluruhnya lewat `do_newpool`/`np_build`)
+dan `➡️ Pakai pool yang sudah ada` (`npgo|`, berlabel "(basi)" kalau basi). Dulu
+cuma ada tombol kedua, dan user yang menekan "Buat pool" tidak pernah diberi
+pilihan membuat pool sendiri. "Tetap buat" tidak bisa berarti PoolKey yang SAMA —
+PoolManager menolak `PoolAlreadyInitialized` — jadi `np_free_spacings()` mencari
+kisi yang BELUM ada untuk fee yang sama, tetangga ±1 dulu (kotaknya praktis sama
+lebar: 5,1376% vs 5,1271% untuk 501 vs 500), dan kartunya menyebut bahwa
+likuiditas token itu jadi terpecah di dua pool. Terukur pada kasus ini: kisi
+501/499/250 bebas, kisi 501 memberi harga awal −1,3% dari pasar (disalin dari
+pool yang ramai).
 
 `stale_pool_state()` menilainya, dan tiga angkanya disengaja:
 
