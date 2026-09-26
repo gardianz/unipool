@@ -6864,6 +6864,146 @@ def gecko_deep_price_usd(chain_id: int, token: str) -> tuple[float, str, float]:
     return best
 
 
+# Harga pool utama (dibaca on-chain) harus dikonfirmasi minimal satu sumber lain
+# dalam rasio ini sebelum ia jadi harga pasar. Pool ber-hook bisa menghitung harga
+# swap sendiri (custom accounting) sehingga slot0-nya tidak berarti apa pun — dan
+# itu cuma kelihatan dari ketidaksepakatan dengan sumber lain.
+_MAIN_AGREE = 1.25
+# slot0 dibandingkan dengan harga transaksi GeckoTerminal untuk pool YANG SAMA.
+# Longgar karena harga transaksi memuat fee hook (PONS: terukur +12,7%), tapi
+# cukup untuk menangkap orientasi terbalik — itu meleset faktor harga².
+_MAIN_ORIENT_MAX = 1.5
+
+
+def _quote_sym_of(chain_id: int, addr: str) -> str | None:
+    """Simbol quote TETAP untuk alamat currency (native/wrapped → wrapped_symbol)."""
+    cfg = CHAINS[chain_id]
+    a = _norm_currency(addr).lower()
+    if a in (V4_NATIVE.lower(), _norm_currency(cfg["wrapped"]).lower()):
+        return cfg["wrapped_symbol"]
+    for sym, qa in cfg["quotes"].items():
+        if str(qa).lower() == a:
+            return sym
+    return None
+
+
+def main_pool_price(chain_id: int, token: str) -> dict | None:
+    """Harga token dari POOL UTAMA-nya — pool bervolume terbesar di GeckoTerminal,
+    pasangan apa pun, TERMASUK pool launchpad ber-hook — dibaca ON-CHAIN.
+
+    Sebelum ini tidak ada satu pun sumber patokan yang membaca pool utama langsung:
+    "pool terdalam" memakai harga GeckoTerminal untuk pool itu, dan itu harga
+    TRANSAKSI terakhir — memuat fee hook dan telat. Terukur pada XGAS.DEV (pool
+    utama XGAS.DEV/ETH di PONS, $1,18jt/24 jam): slot0 on-chain $0,00052946,
+    GMGN $0,00052975 (beda 0,05%), GeckoTerminal $0,00059661 (+12,7%).
+
+    Membaca slot0 pool ber-hook itu pembacaan murni StateView — hook-nya tidak
+    dijalankan. Menaruh DANA di sana tetap tidak pernah dilakukan.
+
+    Orientasi v4 diturunkan dari aturan PoolKey (currency0 = alamat lebih kecil,
+    native = `address(0)`), lalu DIBUKTIKAN terhadap harga GeckoTerminal untuk pool
+    yang sama: orientasi terbalik meleset faktor harga², jadi mustahil lolos
+    `_MAIN_ORIENT_MAX`. Kalau gagal, pasangan native↔wrapped dicoba (GT dan Krystal
+    pernah melaporkan yang satu untuk PoolKey yang lain). v2/v3 memakai `token0()`
+    kontraknya sendiri — tidak ada yang ditebak.
+
+    Pool tanpa likuiditas aktif dilewati: harganya beku, bukan harga pasar (lihat
+    `stale_pool_state`). Quote yang bukan quote tetap chain ini juga dilewati —
+    mengonversinya ke USD butuh harga yang tidak bisa dibaca on-chain dengan pasti.
+
+    None kalau tidak ada pool yang lolos. Dict: `usd`, `per` (harga dalam quote pool
+    itu), `quote_addr`, `quote_sym`, `name`, `vol`, `pool`, `ver`."""
+    rows = _gecko_token_pools(chain_id, token)
+    if not rows:
+        return None
+    tl = str(token).lower()
+    w3 = get_w3(chain_id)
+
+    def vol(r):
+        return float(((r.get("attributes") or {}).get("volume_usd") or {}).get("h24") or 0)
+
+    for row in sorted(rows, key=lambda r: -vol(r))[:3]:
+        try:
+            at = row.get("attributes") or {}
+            rel = row.get("relationships") or {}
+
+            def side(nm):
+                return str((((rel.get(nm) or {}).get("data") or {}).get("id") or "")
+                           ).split("_")[-1].lower()
+            b, q = side("base_token"), side("quote_token")
+            if b == tl:
+                other, gt_per = q, float(at.get("base_token_price_quote_token") or 0)
+            elif q == tl:
+                other, gt_per = b, float(at.get("quote_token_price_base_token") or 0)
+            else:
+                continue
+            qsym = _quote_sym_of(chain_id, other)
+            if not qsym or gt_per <= 0:
+                continue
+            ref = str(row.get("id") or "").split("_", 1)[-1]
+            h = ref[2:] if ref.startswith("0x") else ref
+            mdec = token_info(w3, Web3.to_checksum_address(token))["decimals"]
+            per = 0.0
+            if len(h) == 64:                                   # v4 poolId
+                pid = bytes.fromhex(h)
+                sv = _v4c(w3, chain_id, "v4_stateview", V4_STATEVIEW_ABI)
+                sq = int(sv.functions.getSlot0(pid).call()[0])
+                if sq <= 0 or int(sv.functions.getLiquidity(pid).call()) <= 0:
+                    continue
+                raw = (sq / Q96) ** 2
+                fam = [_norm_currency(other)]
+                cfg = CHAINS[chain_id]
+                wr = _norm_currency(cfg["wrapped"]).lower()
+                if fam[0].lower() in (V4_NATIVE.lower(), wr):
+                    fam.append(V4_NATIVE if fam[0].lower() == wr else cfg["wrapped"])
+                for cur in fam:
+                    qdec = _v4_currency_info(w3, chain_id, cur)["decimals"]
+                    tok_is_c0 = int(tl, 16) < int(_norm_currency(cur).lower(), 16)
+                    cand = ((raw if tok_is_c0 else (1 / raw if raw else 0))
+                            * 10 ** (mdec - qdec))
+                    if cand > 0 and max(cand / gt_per, gt_per / cand) <= _MAIN_ORIENT_MAX:
+                        per = cand
+                        break
+                ver = 4
+            elif len(h) == 40:                                 # v2 / v3
+                addr = Web3.to_checksum_address("0x" + h)
+                qdec = token_info(w3, Web3.to_checksum_address(_norm_currency(other)
+                                  if _norm_currency(other) != V4_NATIVE
+                                  else CHAINS[chain_id]["wrapped"]))["decimals"]
+                try:
+                    pc = w3.eth.contract(address=addr, abi=POOL_ABI)
+                    s0 = pc.functions.slot0().call()
+                    if int(pc.functions.liquidity().call()) <= 0:
+                        continue
+                    raw = (int(s0[0]) / Q96) ** 2
+                    t0 = pc.functions.token0().call().lower()
+                    ver = 3
+                except Exception:
+                    pc = w3.eth.contract(address=addr, abi=V2_PAIR_ABI)
+                    r0, r1, _ = pc.functions.getReserves().call()
+                    if r0 <= 0 or r1 <= 0:
+                        continue
+                    raw = r1 / r0
+                    t0 = pc.functions.token0().call().lower()
+                    ver = 2
+                cand = ((raw if t0 == tl else (1 / raw if raw else 0)) * 10 ** (mdec - qdec))
+                if cand > 0 and max(cand / gt_per, gt_per / cand) <= _MAIN_ORIENT_MAX:
+                    per = cand
+            else:
+                continue
+            if per <= 0:
+                continue
+            qusd = quote_usd_price(w3, chain_id, qsym)
+            if qusd <= 0:
+                continue
+            return {"usd": per * qusd, "per": per, "quote_addr": other, "quote_sym": qsym,
+                    "name": str(at.get("name") or ""), "vol": vol(row),
+                    "pool": ref, "ver": ver}
+        except Exception:
+            continue
+    return None
+
+
 def token_anchor_price(chain_id: int, token: str, quote_sym: str | None = None,
                        extra: list | None = None, fresh: bool = False, _cache={}) -> dict:
     """Patokan harga yang TIDAK berasal dari pool sepasang yang sedang dinilai.
@@ -6890,14 +7030,28 @@ def token_anchor_price(chain_id: int, token: str, quote_sym: str | None = None,
     srcs = [(str(n), float(v)) for n, v in (extra or []) if float(v or 0) > 0]
     deep_px, deep_nm, deep_vol = gecko_deep_price_usd(chain_id, token)
     if deep_px > 0 and deep_vol >= _ANCHOR_MIN_VOL:
-        srcs.append(("pool terdalam", deep_px))
+        srcs.append(("GeckoTerminal", deep_px))   # harga TRANSAKSI, bukan slot0
     try:
         own = token_usd_price(get_w3(chain_id), chain_id, token)
     except Exception:
         own = 0.0
     if own > 0:
         srcs.append(("bot", own))
-    usd = geo_median([v for _, v in srcs])
+    # Pool UTAMA dibaca on-chain dan jadi harga pasar kalau dikonfirmasi minimal
+    # satu sumber lain. Median API saja memasukkan harga TRANSAKSI GeckoTerminal
+    # yang memuat fee hook (+12,7% pada XGAS.DEV) ke angka yang lalu jadi harga
+    # awal pool.
+    try:
+        main = main_pool_price(chain_id, token)
+    except Exception:
+        main = None
+    primary = "median"
+    others = [v for _, v in srcs]
+    if main and main["usd"] > 0:
+        srcs.append(("pool utama", main["usd"]))
+        if any(max(v / main["usd"], main["usd"] / v) <= _MAIN_AGREE for v in others):
+            primary = "pool utama"
+    usd = main["usd"] if primary == "pool utama" else geo_median([v for _, v in srcs])
     per_quote = 0.0
     if usd > 0 and quote_sym:
         try:
@@ -6911,7 +7065,8 @@ def token_anchor_price(chain_id: int, token: str, quote_sym: str | None = None,
     # dari pool on-chain, bukan cuma dua API yang kebetulan sepakat.
     out = {"usd": usd, "per_quote": per_quote, "srcs": srcs,
            "deep": deep_nm, "deep_vol": deep_vol,
-           "own": own, "quote_usd": (usd / per_quote) if per_quote > 0 else 0.0}
+           "own": own, "quote_usd": (usd / per_quote) if per_quote > 0 else 0.0,
+           "primary": primary, "main": main}
     _cache[key] = (out, time.time())
     return out
 

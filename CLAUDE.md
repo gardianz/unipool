@@ -2917,6 +2917,56 @@ angka yang masuk `initialize()` tetap sqrtPrice yang dibaca on-chain. Urutannya:
 Hasil terukur sesudahnya: BEORN/USDG **+0,5%** dan LONG/USDC Arc **+0,3%** dari
 harga pasar, dari yang sebelumnya diblokir "+859%".
 
+### Harga pasar = POOL UTAMA dibaca on-chain, bukan median API
+
+Tidak ada alasan patokan harus dari pasangan yang sama — yang disalin apa adanya
+memang harus sepasang (sqrtPriceX96 itu rasio wei dua currency tertentu), tapi
+HARGA PASAR boleh diambil dari pasangan apa pun lalu dikonversi. Dulu tidak ada
+satu pun sumber patokan yang membaca pool utama langsung: "pool terdalam" adalah
+harga GeckoTerminal untuk pool itu — harga TRANSAKSI terakhir, memuat fee hook dan
+telat. Terukur pada XGAS.DEV (pool utama XGAS.DEV/ETH native di launchpad PONS,
+$1,18jt/24 jam):
+
+| sumber | harga |
+|---|---|
+| slot0 pool utama on-chain | $0,00052946 |
+| GMGN | $0,00052975 (beda 0,05%) |
+| bot `token_usd_price` | $0,0005233 (−1,2%) |
+| GeckoTerminal pool yang sama | $0,00059661 (**+12,7%**) |
+| slot0 pool USDG 6,5% / 10% | +2,6% / +6,4% |
+
+`main_pool_price()` memilih pool bervolume terbesar di GeckoTerminal (pasangan apa
+pun, TERMASUK ber-hook — `getSlot0` itu pembacaan murni StateView, hook-nya tidak
+jalan), membaca harganya on-chain, lalu mengonversinya lewat `quote_usd_price`
+on-chain. Empat penjagaan:
+
+- **Orientasi DIBUKTIKAN, bukan cuma diturunkan.** v4 memakai aturan PoolKey
+  (currency0 = alamat lebih kecil, native = `address(0)`), lalu hasilnya wajib
+  dalam `_MAIN_ORIENT_MAX` (1,5×) dari harga GeckoTerminal untuk pool YANG SAMA —
+  orientasi terbalik meleset faktor harga², jadi mustahil lolos. Gagal → pasangan
+  native↔wrapped dicoba. v2/v3 memakai `token0()` kontraknya.
+- **Pool tanpa likuiditas aktif dilewati** — harganya beku (lihat bagian pool
+  kosong di bawah).
+- **Quote yang bukan quote tetap chain itu dilewati** (BEORN/SHROOM): mengonversinya
+  butuh harga yang tidak bisa dibaca on-chain dengan pasti.
+- **Wajib dikonfirmasi minimal satu sumber lain dalam `_MAIN_AGREE` (1,25×)**
+  sebelum jadi harga pasar (`anchor["primary"] = "pool utama"`). Pool ber-hook bisa
+  menghitung harga swap sendiri (custom accounting) sehingga slot0-nya tidak
+  berarti apa pun, dan itu cuma kelihatan dari ketidaksepakatan.
+
+Label sumber GeckoTerminal di `srcs` sekarang "GeckoTerminal", bukan "pool
+terdalam" — angkanya harga transaksi, bukan pembacaan pool, dan berdampingan
+dengan "pool utama" label lama menyesatkan.
+
+Dengan patokan dari pool utama, `np_build` hanya MENYALIN pool sepasang yang
+dalam `NP_COPY_MAX_DEV_MAIN` (2%) — pool sepasang ber-fee besar boleh duduk sejauh
+fee-nya dari venue utama tanpa diarbitrase, dan pool BARU tidak perlu mewarisi
+selisih itu. `np_derive` memakai harga pool utama langsung (tiga syarat lamanya
+dibuat untuk angka yang cuma dari API). Terukur: XGAS.DEV/ETH menyalin pool utama
+PONS itu sendiri (sqrtPrice persis), XGAS.DEV/USDG menyalin pool USDG 10% yang
+−1,55% dari pool utama, PONXWORK/USDG dihitung −0,00%. `stale_pool_state` ikut
+memakai patokan yang sama.
+
 ### Tanpa pool rujukan, harga awal DIHITUNG — bukan ditolak
 
 Aturan lama "harga awal disalin, tidak pernah ditebak" menolak pasangan yang tidak

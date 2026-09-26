@@ -3054,6 +3054,11 @@ NP_DERIVE_MIN_VOL = 1000.0
 # selama ia memang mencerminkan pasar; pool sepasang yang tertinggal (token naik
 # 2,2× dalam 25 menit, terukur XGAS.DEV) bukan harga pasar lagi.
 NP_COPY_MAX_DEV = 0.10
+# Kalau patokannya POOL UTAMA on-chain (bukan median API), pool sepasang cuma disalin
+# kalau praktis identik. Pool sepasang ber-fee besar boleh duduk sejauh fee-nya dari
+# venue utama tanpa diarbitrase — terukur XGAS.DEV/USDG fee 10% +6,4% dan 6,5%
+# +2,6% dari pool utama — dan pool BARU tidak perlu mewarisi selisih itu.
+NP_COPY_MAX_DEV_MAIN = 0.02
 
 
 def np_derive(p: dict, tdec: int, anchor: dict) -> tuple[int, str]:
@@ -3092,6 +3097,18 @@ def np_derive(p: dict, tdec: int, anchor: dict) -> tuple[int, str]:
     ap = float(anchor.get("per_quote") or 0)
     if ap <= 0:
         return 0, "harga pasarnya sendiri tidak terbaca"
+    # Pool UTAMA dibaca on-chain dan sudah dikonfirmasi sumber lain di
+    # `ch.token_anchor_price` — itu harga yang dipakai, bukan median API. Ketiga
+    # syarat di bawah dibuat untuk angka yang cuma berasal dari API.
+    if anchor.get("primary") == "pool utama":
+        m = anchor.get("main") or {}
+        try:
+            sq = ch.price_to_sqrt_x96(ap, p["quote_is_token1"], tdec, p["quote_decimals"])
+        except Exception as e:
+            return 0, str(e)
+        return int(sq), (f"pool utama {m.get('name') or ''} on-chain"
+                         + (f" × {m.get('quote_sym')}→{p['quote_sym']} on-chain"
+                            if m.get("quote_sym") and m.get("quote_sym") != p["quote_sym"] else ""))
     if len(srcs) < NP_DERIVE_MIN_SRC:
         punya = ", ".join(n for n, _ in srcs) or "tidak ada"
         return 0, (f"cuma {len(srcs)} sumber harga ({punya}), "
@@ -3271,8 +3288,10 @@ def np_build(ctx: dict, fresh: bool = False
     # pilihan yang cuma dekat MEDIAN pool sepasang lolos walau 50% di bawah pasar
     # (`NP_DEV_BLOCK` baru menolak kalau jauh dari median DAN dari patokan) — dan di
     # token yang sedang naik cepat, median pool sepasang justru ikut tertinggal.
+    tol_copy = (NP_COPY_MAX_DEV_MAIN if anchor.get("primary") == "pool utama"
+                else NP_COPY_MAX_DEV)
     if (ref is not None and sq > 0 and ap > 0 and pick_px > 0
-            and abs(math.log(pick_px / ap)) > math.log(1 + NP_COPY_MAX_DEV)):
+            and abs(math.log(pick_px / ap)) > math.log(1 + tol_copy)):
         dsq, why_c = np_derive(p, td, anchor)
         if dsq > 0:
             anchor["derived"] = why_c
@@ -3434,10 +3453,18 @@ def np_text(ctx: dict, p: dict, sq: int, ref: dict | None, bad: str | None,
         # WETH/BEORN padahal itu USD — meleset 2.600x di quote ETH.
         src = ", ".join(f"{esc(n)} ${ch.fmt_price(v)}" for n, v in (anchor.get("srcs") or []))
         deep = anchor.get("deep")
-        L.append(f"\n<b>Harga pasar (di luar pool sepasang):</b> {ch.fmt_price(ap)} "
-                 f"{esc(p['quote_sym'])}/{esc(tsym)}\n<i>{src}"
-                 + (f" · pool terdalam {esc(deep)} (vol {ch.fmt_usd(anchor.get('deep_vol'))})"
-                    if deep else "") + "</i>")
+        m = anchor.get("main") or {}
+        if anchor.get("primary") == "pool utama":
+            conv = (f", dikonversi lewat harga {esc(m.get('quote_sym'))} on-chain"
+                    if m.get("quote_sym") and m.get("quote_sym") != p["quote_sym"] else "")
+            L.append(f"\n<b>Harga pasar:</b> {ch.fmt_price(ap)} {esc(p['quote_sym'])}/{esc(tsym)}\n"
+                     f"<i>dari pool utama {esc(m.get('name') or '')} — dibaca on-chain "
+                     f"(vol {ch.fmt_usd(m.get('vol'))}){conv}. Pembanding: {src}</i>")
+        else:
+            L.append(f"\n<b>Harga pasar (di luar pool sepasang):</b> {ch.fmt_price(ap)} "
+                     f"{esc(p['quote_sym'])}/{esc(tsym)}\n<i>{src}"
+                     + (f" · pool terdalam {esc(deep)} (vol {ch.fmt_usd(anchor.get('deep_vol'))})"
+                        if deep else "") + "</i>")
         h, nm = ((h_ada, "Harga pool yang sudah ada") if ada else
                  (np_price(p, td, sq), "Harga awal") if (sq > 0 and ref is not None)
                  else (0.0, ""))
