@@ -3005,6 +3005,72 @@ Empat hal yang wajib ikut:
 `res["source"]` bertambah slug **`own`** (`krystal+uniswap+own`), jadi pembacanya
 tetap `split("+")` seperti aturan yang sudah ada — jangan dicocokkan persis.
 
+### Pool KOSONG: harganya BEKU, bukan harga pasar
+
+Harga pool hanya berarti kalau ada likuiditas yang menjaganya — arbitraser menutup
+selisih dengan pasar karena mereka UNTUNG dari likuiditas itu. Pool yang
+likuiditas aktifnya nol (atau debu) tidak menawarkan apa pun, jadi harganya
+berhenti di angka saat pool dibuat, berapa pun pasar bergerak sesudahnya.
+
+Kejadian nyata: XGAS.DEV/USDG 5% (`0x5296812f…`) dibuat **06:11:11 UTC** di
+0,000362 — BENAR saat itu (OHLCV menit yang sama di pool terdalam
+0,000372–0,000420). Mint-nya tidak pernah masuk, token naik **2,2×** dalam 25
+menit, dan pool kosong itu tetap 0,000362. Kartu mint lalu menulis
+*"Current price 0,000362 · MC $362k"* sementara GMGN $813k — dan setoran Wide di
+sana berarti menjual separuh posisi ke arbitraser di ~45% harga pasar.
+`assert_pool_price_sane` tidak menangkapnya: ambangnya 20× (dibuat untuk pool
+RUSAK, bukan pool basi).
+
+`stale_pool_state()` menilainya, dan tiga angkanya disengaja:
+
+- **Basi = menggeser harga ke pasar lewat likuiditas AKTIF butuh <
+  `_STALE_MOVE_USD` ($25)**, bukan cuma `liquidity == 0` — pool debu sama
+  basinya. Likuiditas posisi lain di antara keduanya tidak dihitung, jadi angkanya
+  batas BAWAH; arah itu aman karena hasilnya tetap harus lewat toleransi.
+- **Toleransi = fee pool + 10%, maks 25%.** Di dalam fee, arbitrase tidak
+  menguntungkan, jadi selisih sebesar itu memang tidak akan pernah ditutup.
+- **Sumber pasar yang tidak sepakat >1,5× = tidak memblokir apa pun.** Harga
+  pasar yang tidak diketahui tidak boleh jadi dasar penolakan.
+
+Terukur: 4 pool XGAS.DEV yang ramai (fee 6,5–10%, TVL $384–$12k) → aman; 3 pool
+debu → basi (−27%, −44%, −81,5%), `move_usd` $0,00 semuanya.
+
+**Yang ditolak bukan poolnya, tapi RANGE yang melintasi selisihnya**
+(`stale_overlaps`). Range seluruhnya di luar rentang tick [harga pool, harga
+pasar] aman: kalau pool beku di BAWAH pasar, range yang mulai di atas harga pasar
+cuma memegang meme, dan pembeli harus lebih dulu menggeser harga menembus tick
+kosong sampai tepi range — jadi mereka membayar ≥ harga pasar. Range di sisi lain
+cuma memegang quote dan baru terisi kalau pasar sendiri bergerak ke sana.
+Dinyatakan dalam TICK, jadi sama untuk kedua orientasi quote. Terukur pada pool
+XGAS.DEV itu: Wide ditolak, Lower (seluruhnya di bawah harga beku) lolos.
+
+`assert_not_stale()` dipasang di EMPAT jalur setoran — `mint_v4`,
+`mint_position`, `increase_v4`, `increase_position` — **SEBELUM fase 1**, bukan
+di titik `assert_range_recoverable`: swap komposisi sudah memindahkan dana di
+fase 1, dan menolak sesudahnya meninggalkan meme yang dibeli di harga pasar tanpa
+posisi. Diuji dengan wallet kosong sekali pakai: `mint_v4` Wide ke pool itu
+ditolak di penjagaan ini, sebelum satu tx pun dibangun.
+
+**`skip_sqrtp` = harga yang BARU SAJA kita pasang** lewat `v4_init_pool` di alur
+yang sama (`strategy["init_sqrtp"]`, diisi `do_mint`). Pool yang baru di-
+initialize memang kosong; harganya dipilih `np_build` detik sebelumnya dari
+patokan LENGKAP (termasuk GMGN), sedangkan penjagaan ini memakai patokan
+`chain.py` yang tanpa GMGN. Menilainya ulang bisa menolak mint SESUDAH pool
+dibuat — persis cara pool kosong yang basi lahir. Dilewati hanya kalau
+`sqrtPrice` pool PERSIS sama; digeser siapa pun sesudah initialize = dinilai.
+
+Kartu mint menyebutnya lebih dulu (`stale_note`): dua harga berdampingan dalam
+MC, apakah range yang dipilih akan ditolak, dan range mana yang aman.
+
+**`np_build` juga tidak lagi menyalin pool yang tertinggal.** Pilihan salinan
+yang >`NP_COPY_MAX_DEV` (10%) dari patokan yang lolos `np_derive` kalah dari
+harga HITUNGAN patokan itu. Sebelumnya pilihan yang cuma dekat MEDIAN pool
+sepasang lolos walau jauh dari pasar, karena `NP_DEV_BLOCK` baru menolak kalau
+jauh dari median DAN dari patokan — dan di token yang bergerak cepat, median pool
+sepasang justru ikut tertinggal. Terukur pada PONXWORK/USDG: kode lama akan
+menyalin pool **+177%** di atas pasar; sesudahnya harga awal −0,0% dari patokan,
+sementara PONXWORK/WETH tetap MENYALIN (−1,6%).
+
 **`v4_hook_price_refs()` TIDAK BOLEH menebak tafsir.** Versi pertama memakai
 setiap pool token itu apa adanya lalu memilih satu dari empat tafsir (quote di
 currency0/1 × desimal ERC20/18) yang paling dekat median pool yang sudah

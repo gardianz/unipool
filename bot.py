@@ -2697,6 +2697,39 @@ def compound_card_dlmm(cid: int, pid: str, r: dict) -> str:
     return "\n".join(L)
 
 
+def stale_note(st: dict, p: dict, tsym: str, supply: float, lo_t: int, hi_t: int) -> str:
+    """Baris kartu untuk pool KOSONG yang harganya beku jauh dari pasar.
+
+    Menyebut dua harga berdampingan (pool vs pasar, dalam MC kalau supply
+    terbaca), apakah range yang sedang dipilih akan DITOLAK mesin, dan range mana
+    yang aman — tanpa itu user cuma tahu "ditolak" tanpa tahu harus ke mana."""
+    qs, qusd = p["quote_sym"], float(p.get("quote_usd") or 0)
+
+    def lbl(px: float) -> str:
+        if supply and qusd:
+            return f"MC {ch.fmt_usd(px * qusd * supply)}"
+        return f"{ch.fmt_price(px)} {esc(qs)}"
+
+    src = ", ".join(n for n, _ in st.get("srcs") or [])
+    lines = [f"⚠️ <b>Pool ini KOSONG — harga di atas BEKU sejak pool dibuat, bukan harga "
+             f"pasar.</b> Pool {lbl(st['pool_px'])} vs pasar {lbl(st['mkt'])} "
+             f"({esc(src)}) — selisih <b>{st['dev'] * 100:+.0f}%</b>. Menggeser harganya "
+             f"cuma butuh ~${st['move_usd']:.2f}, jadi tidak ada arbitraser yang "
+             f"menjaganya."]
+    lo_px, hi_px = sorted((st["pool_px"], st["mkt"]))
+    if ch.stale_overlaps(st, lo_t, hi_t):
+        lines.append(f"❌ <b>Range ini melintasi selisih itu — mint akan DITOLAK</b> "
+                     f"(setorannya dijual ke arbitraser di harga beku).")
+    else:
+        lines.append("✅ Range ini seluruhnya di luar selisih itu — tidak ada yang bisa "
+                     "diambil arbitraser dari harga beku.")
+    lines.append(f"<i>Range aman: seluruhnya di atas {lbl(hi_px)} (hanya {esc(tsym)}, "
+                 f"pembeli harus membayar ≥ harga itu) atau seluruhnya di bawah "
+                 f"{lbl(lo_px)} (hanya {esc(qs)}). Atau ⬅️ Pool lain → ➕ Buat pool "
+                 f"baru: harga awalnya diambil dari pasar sekarang.</i>")
+    return "\n".join(lines) + "\n"
+
+
 def build_preview(ctx_data: dict) -> str:
     """Kartu konfirmasi mint (dipanggil di thread)."""
     cid = ctx_data["chain"]
@@ -2740,6 +2773,18 @@ def build_preview(ctx_data: dict) -> str:
         supply = ch.token_supply(w3, _meme_addr(p))
     except Exception:
         supply = 0
+
+    # Pool KOSONG: harga yang ditulis "Current price" di bawah itu BEKU sejak pool
+    # dibuat, bukan harga pasar. Disebut di kartu SEBELUM tombol ditekan; mesinnya
+    # (`ch.assert_not_stale`) yang menolak kalau range melintasi selisihnya.
+    stale_txt = ""
+    if not ctx_data.get("init_sqrtp"):
+        try:
+            st = ch.stale_pool_state_of(w3, cid, p)
+        except Exception:
+            st = None
+        if st:
+            stale_txt = stale_note(st, p, tsym, supply, lo_t, hi_t)
 
     # deskripsi range + rencana aksi per mode
     if mode == "lower":
@@ -2857,6 +2902,7 @@ def build_preview(ctx_data: dict) -> str:
            f"Range: {ch.fmt_price(lo)}–{ch.fmt_price(hi)} (now {ch.fmt_price(now)})\n")
         + f"Current price: {ch.fmt_price(now)} {esc(p['quote_sym'])}/{esc(tsym)}"
         + (f" · MC {ch.fmt_usd(now * p['quote_usd'] * supply)}" if supply else "") + "\n"
+        + stale_txt +
         f"{side_line}{extra}\n\n"
         f"<i>Price strategies:\n"
         f"· Stable ±6% — pair stabil / volatilitas rendah\n"
@@ -3003,6 +3049,11 @@ NP_DERIVE_SPREAD = 1.25
 # Salah satu sumber wajib tersambung ke venue yang BENAR-BENAR diperdagangkan:
 # pembacaan on-chain bot sendiri, atau pool terdalam yang volumenya segini.
 NP_DERIVE_MIN_VOL = 1000.0
+# Pool sepasang yang DISALIN lebih jauh dari ini terhadap patokan yang lolos
+# `np_derive` kalah dari harga hitungan patokan itu. Salinan hanya lebih baik
+# selama ia memang mencerminkan pasar; pool sepasang yang tertinggal (token naik
+# 2,2× dalam 25 menit, terukur XGAS.DEV) bukan harga pasar lagi.
+NP_COPY_MAX_DEV = 0.10
 
 
 def np_derive(p: dict, tdec: int, anchor: dict) -> tuple[int, str]:
@@ -3216,6 +3267,18 @@ def np_build(ctx: dict, fresh: bool = False
     # membuat pesan penolakannya sendiri menyebut harga yang tidak boleh dipakai.
     # Sekarang harga awalnya DIHITUNG dari patokan itu, dengan syarat ketat di
     # `np_derive`. Menyalin pool debu tetap TIDAK pernah jadi cadangan.
+    # Salinan yang jauh dari patokan SOLID kalah dari hitungan patokan itu. Dulu
+    # pilihan yang cuma dekat MEDIAN pool sepasang lolos walau 50% di bawah pasar
+    # (`NP_DEV_BLOCK` baru menolak kalau jauh dari median DAN dari patokan) — dan di
+    # token yang sedang naik cepat, median pool sepasang justru ikut tertinggal.
+    if (ref is not None and sq > 0 and ap > 0 and pick_px > 0
+            and abs(math.log(pick_px / ap)) > math.log(1 + NP_COPY_MAX_DEV)):
+        dsq, why_c = np_derive(p, td, anchor)
+        if dsq > 0:
+            anchor["derived"] = why_c
+            anchor["copy_off"] = pick_px / ap - 1
+            sq, ref, dev, pick_px = dsq, None, 0.0, ap
+
     why = ""
     if (no_ref or sq <= 0) and ap > 0:
         dsq, why = np_derive(p, td, anchor)
@@ -3314,9 +3377,12 @@ def np_text(ctx: dict, p: dict, sq: int, ref: dict | None, bad: str | None,
         # rujukan yang layak, dan menyalin pool debu yang ada justru lebih buruk.
         harga = np_price(p, int(ctx["token"].get("decimals") or 18), sq)
         pool_debu = [c for c in (cands or []) if c.get("price")]
+        co = anchor.get("copy_off")
+        alasan = (f"pool sepasang terbaik {co * 100:+.0f}% dari pasar — tertinggal, "
+                  f"jadi tidak disalin" if co is not None else
+                  "pasangan ini belum punya pool yang layak jadi rujukan")
         L.append(f"\nHarga awal: <b>{ch.fmt_price(harga)} {esc(p['quote_sym'])}</b>/{esc(tsym)}\n"
-                 f"<i>DIHITUNG dari harga pasar ({esc(anchor['derived'])}) — "
-                 f"pasangan ini belum punya pool yang layak jadi rujukan.</i>")
+                 f"<i>DIHITUNG dari harga pasar ({esc(anchor['derived'])}) — {alasan}.</i>")
         if pool_debu:
             lain = ", ".join(
                 (("🪝 " if c.get("hooked") else "")
@@ -4114,6 +4180,9 @@ async def do_mint(update: Update, ctx_data: dict):
             await reply(update, f"❌ Harga rujukan tidak bisa disegarkan: {esc(why)}")
             return
         ctx_data["init_sqrtp"] = fresh
+        # `mint_v4` melewati penjagaan pool-kosong HANYA untuk harga yang persis
+        # baru kita pasang di alur ini — lihat `ch.assert_not_stale`.
+        strategy["init_sqrtp"] = int(fresh)
 
     # Sama persis dengan kartu konfirmasi: untuk `amount_src="meme"` budget-nya
     # bergantung rasio range, jadi tick harus ikut dihitung — kalau tidak, jumlah

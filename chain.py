@@ -913,6 +913,166 @@ def assert_pool_price_sane(w3: Web3, chain_id: int, pool_info: dict) -> None:
             f"Mint dibatalkan, dana masih utuh di wallet.")
 
 
+# ---------- Pool KOSONG: harganya BEKU, bukan harga pasar ----------
+# Kalau menggeser harga pool ke harga pasar cuma butuh segini (USD), tidak ada yang
+# menjaga harganya: arbitraser tidak mendapat apa-apa dari pool tanpa likuiditas,
+# jadi harganya tinggal di angka saat terakhir disentuh.
+_STALE_MOVE_USD = 25.0
+# Toleransi harga pool kosong terhadap harga pasar = fee pool + ini, maks CAP.
+# Di dalam fee pool arbitrase tidak menguntungkan, jadi selisih sebesar itu memang
+# tidak akan pernah ditutup; di luarnya, selisihnya diambil dari deposit pertama.
+_STALE_DEV_BASE = 0.10
+_STALE_DEV_CAP = 0.25
+# Kalau sumber harga pasar sendiri tidak sepakat sejauh ini, harga pasarnya tidak
+# diketahui — penjagaan ini tidak boleh memblokir apa pun berdasarkan tebakan.
+_STALE_SRC_SPREAD = 1.5
+
+
+def stale_pool_state(w3: Web3, chain_id: int, ver: int, pool_ref, meme: str,
+                     quote: str, q_is_t1: bool, quote_sym: str, fee: int,
+                     fresh: bool = False) -> dict | None:
+    """Keadaan pool yang harganya BEKU jauh dari pasar, atau None kalau aman.
+
+    Harga pool hanya berarti kalau ada likuiditas yang menjaganya: arbitraser
+    menutup selisih dengan pasar karena mereka UNTUNG dari likuiditas itu. Pool yang
+    likuiditas aktifnya nol (atau debu) tidak menawarkan apa pun, jadi harganya
+    berhenti di angka saat pool dibuat — berapa pun pasar bergerak sesudahnya.
+
+    Kejadian nyata: XGAS.DEV/USDG 5% di Robinhood dibuat 06:11 UTC di 0,000362 —
+    BENAR saat itu (menit yang sama pasar 0,000372–0,000420). Mint-nya tidak pernah
+    masuk, token naik 2,2× dalam 25 menit, dan pool yang kosong tetap di 0,000362.
+    Kartu mint lalu menulis "Current price 0,000362 · MC $362k" sementara GMGN
+    $813k, dan setoran Wide di sana berarti menjual separuh posisi ke arbitraser di
+    harga ~45% pasar.
+
+    None kalau: pool belum di-initialize, menggeser harganya ke pasar butuh ≥
+    `_STALE_MOVE_USD` (harganya dijaga), harga pasar tidak terbaca / sumbernya
+    tidak sepakat, atau selisihnya masih dalam toleransi.
+
+    Dict: `sqrtp`, `tick`, `pool_px`/`mkt` (quote per 1 meme), `dev`, `tol`,
+    `move_usd`, `band` (rentang tick antara harga pool dan harga pasar — range yang
+    menyentuhnya dijual ke arbitraser), `srcs`."""
+    if ver == 4:
+        sv = _v4c(w3, chain_id, "v4_stateview", V4_STATEVIEW_ABI)
+        sqrtp, tick = v4_slot0(w3, chain_id, pool_ref)
+        if sqrtp <= 0:
+            return None                          # belum di-initialize
+        liq = int(sv.functions.getLiquidity(pool_ref).call())
+        qdec = _v4_currency_info(w3, chain_id, quote)["decimals"]
+    elif ver == 3:
+        pc = w3.eth.contract(address=Web3.to_checksum_address(pool_ref), abi=POOL_ABI)
+        s0 = pc.functions.slot0().call()
+        sqrtp, tick = int(s0[0]), int(s0[1])
+        if sqrtp <= 0:
+            return None
+        liq = int(pc.functions.liquidity().call())
+        qdec = token_info(w3, Web3.to_checksum_address(quote))["decimals"]
+    else:
+        return None
+    mdec = token_info(w3, Web3.to_checksum_address(meme))["decimals"]
+    try:
+        a = token_anchor_price(chain_id, meme, quote_sym, fresh=fresh)
+    except Exception:
+        return None
+    mkt = float(a.get("per_quote") or 0)
+    srcs = [float(v) for _, v in (a.get("srcs") or []) if float(v or 0) > 0]
+    if mkt <= 0 or not srcs:
+        return None
+    if len(srcs) >= 2 and max(srcs) / min(srcs) > _STALE_SRC_SPREAD:
+        return None
+    raw = (sqrtp / Q96) ** 2
+    pool_px = (raw if q_is_t1 else (1 / raw if raw else 0.0)) * 10 ** (mdec - qdec)
+    if pool_px <= 0:
+        return None
+    mkt_tick = _tick_at_meme_price(mkt, q_is_t1, mdec, qdec)
+    # Ongkos menggeser harga pool ke pasar lewat likuiditas AKTIF saja. Likuiditas
+    # posisi lain di antara keduanya tidak dihitung, jadi angkanya batas BAWAH — dan
+    # itu arah yang aman: lebih mudah dianggap basi, lalu tetap harus lolos toleransi.
+    move_usd = 0.0
+    if liq > 0:
+        s_now, s_mkt = sqrtp / Q96, 1.0001 ** (mkt_tick / 2)
+        usd_meme = float(a.get("usd") or 0)
+        usd_quote = float(a.get("quote_usd") or 0) or (usd_meme / mkt if mkt else 0)
+        d0, d1 = (mdec, qdec) if q_is_t1 else (qdec, mdec)
+        u0, u1 = (usd_meme, usd_quote) if q_is_t1 else (usd_quote, usd_meme)
+        if s_mkt > s_now:                        # token1 yang masuk
+            move_usd = liq * (s_mkt - s_now) / 10 ** d1 * u1
+        else:                                    # token0 yang masuk
+            move_usd = liq * (1 / s_mkt - 1 / s_now) / 10 ** d0 * u0
+        if move_usd >= _STALE_MOVE_USD:
+            return None
+    fee_frac = (int(fee) / 1e6) if 0 <= int(fee or 0) < 0x800000 else 0.0
+    tol = min(_STALE_DEV_CAP, _STALE_DEV_BASE + fee_frac)
+    if abs(math.log(pool_px / mkt)) <= math.log(1 + tol):
+        return None
+    mt = int(round(mkt_tick))
+    return {"sqrtp": int(sqrtp), "tick": int(tick), "liq": liq, "move_usd": move_usd,
+            "pool_px": pool_px, "mkt": mkt, "dev": pool_px / mkt - 1, "tol": tol,
+            "mkt_tick": mt, "band": (min(int(tick), mt), max(int(tick), mt)),
+            "srcs": a.get("srcs") or [], "usd": float(a.get("usd") or 0),
+            "quote_sym": quote_sym}
+
+
+def stale_pool_state_of(w3: Web3, chain_id: int, pool_info: dict,
+                        fresh: bool = False) -> dict | None:
+    """`stale_pool_state` untuk dict pool_info (v3/v4); None untuk versi lain."""
+    ver = pool_info.get("ver", 3)
+    if ver not in (3, 4):
+        return None
+    q_is_t1 = bool(pool_info.get("quote_is_token1"))
+    t0, t1 = pool_info.get("token0"), pool_info.get("token1")
+    meme, quote = (t0, t1) if q_is_t1 else (t1, t0)
+    ref = pool_info["pool_id"] if ver == 4 else pool_info["pool"]
+    return stale_pool_state(w3, chain_id, ver, ref, meme, quote, q_is_t1,
+                            pool_info.get("quote_sym") or "", int(pool_info.get("fee") or 0),
+                            fresh=fresh)
+
+
+def stale_overlaps(st: dict, tick_lower: int, tick_upper: int) -> bool:
+    """Apakah range menyentuh rentang antara harga pool yang beku dan harga pasar.
+
+    Range yang seluruhnya DI LUAR rentang itu aman, dan ini bukan kebetulan:
+    kalau pool beku di BAWAH pasar, range yang mulai di atas harga pasar hanya
+    memegang meme, dan pembeli harus lebih dulu menggeser harga menembus tick kosong
+    sampai tepi range — jadi mereka membayar ≥ harga pasar. Range seluruhnya di
+    sisi lain hanya memegang quote dan baru terisi kalau pasar sendiri bergerak ke
+    sana. Sama untuk kedua orientasi quote, karena rentangnya dinyatakan dalam
+    TICK, bukan dalam arah harga."""
+    lo, hi = st["band"]
+    return not (int(tick_upper) <= lo or int(tick_lower) >= hi)
+
+
+def assert_not_stale(st: dict | None, tick_lower: int, tick_upper: int,
+                     skip_sqrtp: int = 0) -> None:
+    """Tolak setoran yang rangenya melintasi selisih harga pool KOSONG vs pasar.
+    Panggil SEBELUM tx apa pun.
+
+    `skip_sqrtp`: harga yang BARU SAJA kita pasang lewat `v4_init_pool` di alur yang
+    sama. Harga itu sudah dipilih `np_build` dari patokan lengkap (termasuk GMGN)
+    detik sebelumnya; menilainya ulang dengan patokan yang lebih miskin bisa
+    menolak mint SESUDAH pool dibuat — dan itu persis cara pool kosong yang basi
+    lahir."""
+    if not st:
+        return
+    if skip_sqrtp and int(st["sqrtp"]) == int(skip_sqrtp):
+        return
+    if not stale_overlaps(st, tick_lower, tick_upper):
+        return
+    q = st.get("quote_sym") or "quote"
+    src = ", ".join(n for n, _ in st.get("srcs") or [])
+    arah = ("arbitraser membeli meme Anda DI BAWAH harga pasar"
+            if st["pool_px"] < st["mkt"] else
+            "arbitraser menjual meme ke Anda DI ATAS harga pasar")
+    raise RuntimeError(
+        f"Pool ini KOSONG (menggeser harganya ke pasar cuma butuh "
+        f"~${st['move_usd']:.2f}), jadi harganya BEKU di {fmt_price(st['pool_px'])} {q} "
+        f"— bukan harga pasar. Pasar sekarang {fmt_price(st['mkt'])} {q} ({src}), "
+        f"selisih {st['dev'] * 100:+.0f}%. Range Anda melintasi selisih itu: {arah}, "
+        f"dan selisihnya keluar dari deposit Anda. Mint dibatalkan sebelum tx apa pun, "
+        f"dana utuh di wallet. Pilih pool lain, buat pool baru (harga awalnya diambil "
+        f"dari pasar sekarang), atau pakai range yang seluruhnya di luar selisih itu.")
+
+
 def assert_range_recoverable(lq: int, tick_lower: int, tick_upper: int,
                              sym0: str = "token0", sym1: str = "token1") -> None:
     """Tolak rentang yang modalnya TIDAK AKAN PERNAH bisa kembali.
@@ -4798,6 +4958,12 @@ def mint_position(chain_id: int, pk: str, pool_info: dict, budget: float,
     # dict pool bisa datang dari indexer (API Uniswap) → verifikasi orientasi DAN
     # kepemilikan DEX on-chain dulu; kalau tak cocok, batal sebelum dana bergerak.
     assert_pool_orientation(w3, pool_info, chain_id)
+    # Pool KOSONG = harga beku; lihat `stale_pool_state`. Sebelum tx apa pun.
+    _st = stale_pool_state_of(w3, chain_id, pool_info, fresh=True)
+    if _st:
+        _lo, _hi, _ = _range_of(strategy, _st["tick"], pool_info["fee"], q_is_t1,
+                                pool_info.get("tick_spacing"))
+        assert_not_stale(_st, _lo, _hi)
     steps = []
     slip = (100 - slippage_pct) / 100
 
@@ -5611,6 +5777,8 @@ def increase_position(chain_id: int, pk: str, token_id: int, budget_quote: float
     factory = w3.eth.contract(address=Web3.to_checksum_address(cfg["factory"]), abi=FACTORY_ABI)
     pool_addr = factory.functions.getPool(t0, t1, fee).call()
     pool = w3.eth.contract(address=Web3.to_checksum_address(pool_addr), abi=POOL_ABI)
+    assert_not_stale(stale_pool_state(w3, chain_id, 3, pool_addr, meme, quote, q_is_t1,
+                                      qsym, int(fee), fresh=True), tick_lo, tick_hi)
 
     steps = []
     slip = (100 - slippage_pct) / 100
@@ -7584,6 +7752,14 @@ def mint_v4(chain_id: int, pk: str, pool_info: dict, budget: float,
     # Harga pool diperiksa SEBELUM tx apa pun (termasuk approve/permit2): pool yang
     # harganya rusak menelan modal tanpa jejak, dan itu tidak terlihat dari kartu.
     assert_pool_price_sane(w3, chain_id, pool_info)
+    # Pool KOSONG: harganya beku sejak dibuat, bukan harga pasar. Dicek SEBELUM
+    # fase 1 — swap komposisi sudah memindahkan dana, dan menolak sesudahnya
+    # meninggalkan meme yang dibeli di harga pasar tanpa posisi.
+    _st = stale_pool_state_of(w3, chain_id, pool_info, fresh=True)
+    if _st:
+        _lo, _hi, _ = _range_of(strategy, _st["tick"], pool_info["fee"],
+                                bool(pool_info["quote_is_token1"]), pool_info["tick_spacing"])
+        assert_not_stale(_st, _lo, _hi, int(strategy.get("init_sqrtp") or 0))
     account = w3.eth.account.from_key(pk)
     posm_addr = Web3.to_checksum_address(cfg["v4_posm"])
     posm = _v4c(w3, chain_id, "v4_posm", V4_POSM_ABI)
@@ -8079,6 +8255,10 @@ def increase_v4(chain_id: int, pk: str, tid: int, budget_quote: float,
     budget_wei = int(Decimal(str(budget_quote)) * Decimal(10) ** qdec)
     if budget_wei <= 0:
         raise RuntimeError("Amount 0.")
+    # Range posisi sudah tetap; yang dinilai apakah ia melintasi selisih harga pool
+    # KOSONG vs pasar. Sebelum tx apa pun.
+    assert_not_stale(stale_pool_state(w3, chain_id, 4, pid, meme, quote, q_is_t1, qsym,
+                                      int(key[2]), fresh=True), tick_lo, tick_hi)
 
     steps = _v4_ensure_funds(w3, chain_id, pk, quote, budget_wei, slippage_pct)
     avail = _v4_balance(w3, quote, account.address)
