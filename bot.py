@@ -2184,11 +2184,21 @@ async def show_pools_for(status, cid: int, token: str, extra: dict | None = None
     # `b<n>` — bin step, knob yang menentukan serapat apa range bisa disetel.
     legend = ("bNN = bin step (basis point per bin; makin kecil makin rapat) · "
               if ch.is_solana(cid) else "P=PancakeSwap · U=Uniswap · ")
+    # Launchpad + pool utama seperti badge GMGN. Pool utama launchpad lazimnya
+    # ber-hook sehingga TIDAK ada di tabel di atas — tanpa baris ini user tidak
+    # tahu venue mana yang sebenarnya menentukan harga token ini.
+    ll = ""
+    if not ch.is_solana(cid):
+        try:
+            ll = await asyncio.to_thread(launch_line, cid, token)
+        except Exception:
+            ll = ""
     text = (f"Found {len(pools)} pool(s) untuk <b>{esc(tsym)}</b> ({_t.time() - t0:.1f}s):\n"
             f"<pre>{esc(chr(10).join(rows))}</pre>\n"
             f"<i>{legend}! = harga menyimpang · TVL/volume USD · "
             f"APR estimasi · V/TVL = volume 24j ÷ TVL (makin tinggi makin produktif) "
-            f"· – = belum terindeks</i>\n<i>{src_line}</i>{off_line}")
+            f"· – = belum terindeks</i>\n<i>{src_line}</i>"
+            + (f"\n{ll}" if ll else "") + off_line)
     if extra:
         try:
             text += "\n" + "\n".join(lp_suggestion(cid, res, extra))
@@ -3129,29 +3139,100 @@ def np_derive(p: dict, tdec: int, anchor: dict) -> tuple[int, str]:
     return int(sq), ", ".join(n for n, _ in srcs)
 
 
-def gmgn_price_usd(cid: int, token: str, _cache={}) -> float:
-    """Harga USD token dari GMGN, 0 kalau tidak tersedia. Dipanggil di thread.
+def gmgn_token(cid: int, token: str, _cache={}) -> dict:
+    """`token_info` GMGN mentah (cache 120 detik), {} kalau tidak tersedia.
+    Dipanggil di thread.
 
-    Dipakai sebagai salah satu sumber `ch.token_anchor_price`. Sengaja berdiri di
-    `bot.py`, bukan di `chain.py`: kunci GMGN tidak boleh pernah lewat
-    `ch._cf_request` — jalur itu meneruskan header ke operator proxy pihak ketiga.
-    Klien scanner dipakai ulang supaya throttle per-IP-nya tetap satu penghitung."""
+    Sengaja berdiri di `bot.py`, bukan di `chain.py`: kunci GMGN tidak boleh pernah
+    lewat `ch._cf_request` — jalur itu meneruskan header ke operator proxy pihak
+    ketiga. Klien scanner dipakai ulang supaya throttle per-IP-nya tetap satu
+    penghitung. Kegagalan TIDAK di-cache: kalau tidak, satu timeout membuat harga
+    GMGN hilang dua menit penuh."""
     if not ch.CHAINS[cid].get("gmgn"):
-        return 0.0
+        return {}
     key = (cid, str(token).lower())
     hit = _cache.get(key)
     if hit and time.time() - hit[1] < 120:
         return hit[0]
-    px = 0.0
     try:
         cl = _scan_client(float((scanner_cfg().get("pace") or 1.0)))
-        if cl is not None:
-            d = cl.token_info(ch.CHAINS[cid]["gmgn"], str(token).lower()) or {}
-            px = float(((d.get("price") or {}).get("price")) or 0)
+        if cl is None:
+            return {}
+        d = cl.token_info(ch.CHAINS[cid]["gmgn"], str(token).lower()) or {}
     except Exception:
-        px = 0.0
-    _cache[key] = (px, time.time())
-    return px
+        return hit[0] if hit else {}
+    _cache[key] = (d, time.time())
+    return d
+
+
+def gmgn_price_usd(cid: int, token: str) -> float:
+    """Harga USD token dari GMGN, 0 kalau tidak tersedia. Dipanggil di thread."""
+    try:
+        return float(((gmgn_token(cid, token).get("price") or {}).get("price")) or 0)
+    except Exception:
+        return 0.0
+
+
+def gmgn_pool_hint(cid: int, token: str) -> dict | None:
+    """Launchpad + POOL UTAMA token ini menurut GMGN — penanda yang sama dengan
+    yang ditampilkan GMGN sendiri ("UNISWAP_V4 Pool Info", badge launchpad).
+
+    Dipakai karena GeckoTerminal sering BELUM mengindeks token segar: terukur pada
+    30 token trending di Robinhood/Base/Arc/HyperEVM/BSC, pool bervolume terbesar
+    GeckoTerminal cocok dengan pool utama GMGN cuma di 5 — 19 kosong sama sekali
+    dan 3 menunjuk pool lain — sedangkan GMGN punya penandanya untuk hampir semua.
+
+    `curve` = token masih di bonding curve launchpad (belum migrasi). Harganya ada,
+    tapi "pool utama"-nya kontrak kurva milik launchpad, bukan pool DEX yang bisa
+    dibaca slot0-nya. Terukur: VIBE (pons_v2, status 0) dan 币安时代 (flap, status
+    0, exchange "币安时代/BNB").
+
+    GMGN cuma MENUNJUK pool-nya. Harganya tetap dibaca on-chain oleh
+    `ch.main_pool_price`, yang juga membuktikan orientasinya terhadap harga GMGN."""
+    d = gmgn_token(cid, token)
+    if not d:
+        return None
+    pool = d.get("pool") or {}
+    lp = str(d.get("launchpad") or d.get("launchpad_platform") or "")
+    status = d.get("launchpad_status")
+    curve = bool(lp) and str(status) != "1" and not d.get("migrated_pool")
+    qr = float(pool.get("quote_reserve") or 0)
+    qv = float(pool.get("quote_reserve_value") or 0)
+    try:
+        prog = float(d.get("launchpad_progress") or 0)
+    except Exception:
+        prog = 0.0
+    return {"pool_address": str(pool.get("pool_address") or d.get("biggest_pool_address") or ""),
+            "exchange": str(pool.get("exchange") or ""),
+            "token0": str(pool.get("token0_address") or ""),
+            "token1": str(pool.get("token1_address") or ""),
+            "quote_address": str(pool.get("quote_address") or ""),
+            "quote_symbol": str(pool.get("quote_symbol") or ""),
+            "quote_usd": (qv / qr) if qr > 0 else 0.0,
+            "liquidity": float(pool.get("liquidity") or d.get("liquidity") or 0),
+            "launchpad": lp, "curve": curve, "progress": prog,
+            "price_usd": gmgn_price_usd(cid, token), "symbol": str(d.get("symbol") or "")}
+
+
+def launch_line(cid: int, token: str) -> str:
+    """Satu baris kartu: launchpad token ini dan pool utamanya, seperti badge
+    GMGN. Kosong kalau GMGN tidak tahu apa-apa. Dipanggil di thread."""
+    try:
+        h = gmgn_pool_hint(cid, token)
+    except Exception:
+        h = None
+    if not h:
+        return ""
+    pair = f"{esc(h['symbol'])}/{esc(h['quote_symbol'] or '?')}"
+    ex = esc(h["exchange"] or "?")
+    lp = esc(h["launchpad"]) if h["launchpad"] else ""
+    if h["curve"]:
+        return (f"🚀 Launchpad <b>{lp}</b> · MASIH di bonding curve "
+                f"({h['progress'] * 100:.0f}%) — belum ada pool DEX; harga pasar dari "
+                f"GMGN/bot, bukan dari pool.")
+    head = f"🚀 Launchpad <b>{lp}</b> · sudah migrasi · " if lp else "🏦 "
+    return (f"{head}pool utama {pair} ({ex}, likuiditas {ch.fmt_usd(h['liquidity'])}) "
+            f"<i>— menurut GMGN</i>")
 
 
 def np_anchor(ctx: dict, p: dict, fresh: bool = False) -> dict:
@@ -3166,8 +3247,8 @@ def np_anchor(ctx: dict, p: dict, fresh: bool = False) -> dict:
     extra = [("GMGN", gmgn_price_usd(cid, tok))]
     # SALINAN: `token_anchor_price` mengembalikan objek yang ia cache sendiri, dan
     # `np_build` menempelkan keterangan jalur harga ke dict ini.
-    return dict(ch.token_anchor_price(cid, tok, p.get("quote_sym"),
-                                      extra=extra, fresh=fresh))
+    return dict(ch.token_anchor_price(cid, tok, p.get("quote_sym"), extra=extra,
+                                      fresh=fresh, hint=gmgn_pool_hint(cid, tok)))
 
 
 def np_build(ctx: dict, fresh: bool = False
@@ -3380,6 +3461,9 @@ def np_text(ctx: dict, p: dict, sq: int, ref: dict | None, bad: str | None,
          f"{esc(tsym)}/{esc(p['quote_sym'])} · fee <b>{fee / 1e4:g}%</b> · "
          f"tick spacing <b>{sp}</b> (kisi {box_pct(p):.4f}%)",
          f"poolId: <code>{esc(p['pool'])}</code>"]
+    ll = launch_line(cid, ctx["token"]["address"])
+    if ll:
+        L.append(ll)
     if ada:
         # Pool yang SUDAH ada tidak punya "harga awal" — harganya sudah dipasang orang
         # lain, dan itulah yang dipakai kartu mint.
@@ -3457,9 +3541,13 @@ def np_text(ctx: dict, p: dict, sq: int, ref: dict | None, bad: str | None,
         if anchor.get("primary") == "pool utama":
             conv = (f", dikonversi lewat harga {esc(m.get('quote_sym'))} on-chain"
                     if m.get("quote_sym") and m.get("quote_sym") != p["quote_sym"] else "")
+            besar = (f"likuiditas {ch.fmt_usd(m.get('liq'))}" if m.get("liq")
+                     else f"vol {ch.fmt_usd(m.get('vol'))}")
             L.append(f"\n<b>Harga pasar:</b> {ch.fmt_price(ap)} {esc(p['quote_sym'])}/{esc(tsym)}\n"
-                     f"<i>dari pool utama {esc(m.get('name') or '')} — dibaca on-chain "
-                     f"(vol {ch.fmt_usd(m.get('vol'))}){conv}. Pembanding: {src}</i>")
+                     f"<i>dari pool utama {esc(m.get('name') or '')} "
+                     f"({esc(m.get('exchange') or '?')}, {besar}, ditunjuk "
+                     f"{esc(m.get('src') or '?')}) — harganya dibaca on-chain{conv}. "
+                     f"Pembanding: {src}</i>")
         else:
             L.append(f"\n<b>Harga pasar (di luar pool sepasang):</b> {ch.fmt_price(ap)} "
                      f"{esc(p['quote_sym'])}/{esc(tsym)}\n<i>{src}"

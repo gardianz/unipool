@@ -6887,7 +6887,104 @@ def _quote_sym_of(chain_id: int, addr: str) -> str | None:
     return None
 
 
-def main_pool_price(chain_id: int, token: str) -> dict | None:
+def _pool_raw_price(w3: Web3, chain_id: int, addr_or_id: str) -> tuple[float, str | None, int]:
+    """(raw token1/token0, token0 on-chain atau None untuk v4, versi) — 0 kalau
+    pool tidak punya likuiditas aktif / tidak terbaca.
+
+    Tiga bentuk, semuanya dibaca dari kontraknya sendiri: poolId v4 (StateView),
+    pool gaya v3 (`slot0`, jatuh ke `globalState` untuk fork Algebra yang tidak
+    punya slot0), dan pair v2 (`getReserves`)."""
+    h = addr_or_id[2:] if addr_or_id.startswith("0x") else addr_or_id
+    if len(h) == 64:
+        pid = bytes.fromhex(h)
+        sv = _v4c(w3, chain_id, "v4_stateview", V4_STATEVIEW_ABI)
+        sq = int(sv.functions.getSlot0(pid).call()[0])
+        if sq <= 0 or int(sv.functions.getLiquidity(pid).call()) <= 0:
+            return 0.0, None, 4
+        return (sq / Q96) ** 2, None, 4
+    if len(h) != 40:
+        return 0.0, None, 0
+    addr = Web3.to_checksum_address("0x" + h)
+    pc = w3.eth.contract(address=addr, abi=POOL_ABI)
+    try:
+        t0 = pc.functions.token0().call().lower()
+    except Exception:
+        return 0.0, None, 0
+    try:
+        sq = int(pc.functions.slot0().call()[0])
+    except Exception:
+        sq = 0
+        try:   # Algebra: globalState() → (uint160 price, int24 tick, …)
+            raw = w3.eth.call({"to": addr, "data": "0xe76c01e4"})
+            sq = int.from_bytes(bytes(raw)[:32], "big") if len(raw) >= 32 else 0
+        except Exception:
+            sq = 0
+    if sq > 0:
+        try:
+            if int(pc.functions.liquidity().call()) <= 0:
+                return 0.0, t0, 3
+        except Exception:
+            pass
+        return (sq / Q96) ** 2, t0, 3
+    try:
+        r0, r1, _ = w3.eth.contract(address=addr, abi=V2_PAIR_ABI).functions.getReserves().call()
+    except Exception:
+        return 0.0, t0, 0
+    return ((r1 / r0) if r0 > 0 and r1 > 0 else 0.0), t0, 2
+
+
+def _main_from_hint(w3: Web3, chain_id: int, token: str, hint: dict) -> dict | None:
+    """Pool utama yang DITUNJUK GMGN, dibaca on-chain. None kalau tidak lolos.
+
+    GMGN cuma menunjuk alamat + currency pool-nya; harganya dibaca dari kontrak.
+    Orientasi: v2/v3 dari `token0()` kontrak, v4 dari aturan PoolKey (currency0 =
+    alamat lebih kecil). Lalu DIBUKTIKAN terhadap harga GMGN sendiri —
+    `_MAIN_ORIENT_MAX` — karena orientasi terbalik meleset faktor harga².
+
+    Quote di luar quote tetap chain (terukur: Agrippa/musebook, MEME/AMC,
+    MAME/BNCB) dikonversi dengan valuasi GMGN untuk quote itu
+    (`quote_reserve_value / quote_reserve`) — harga dalam quote tetap dari chain,
+    dan hasilnya tetap harus dikonfirmasi sumber lain di `token_anchor_price`."""
+    if not hint or hint.get("curve"):
+        return None
+    pa = str(hint.get("pool_address") or "").lower()
+    tl = str(token).lower()
+    t0h, t1h = (_norm_currency(hint.get("token0") or "").lower(),
+                _norm_currency(hint.get("token1") or "").lower())
+    if not pa or tl not in (t0h, t1h):
+        return None
+    other = t1h if t0h == tl else t0h
+    raw, t0_chain, ver = _pool_raw_price(w3, chain_id, pa)
+    if raw <= 0 or not (1e-36 < raw < 1e36):
+        return None
+    if ver == 4:
+        tok_is_c0 = int(tl, 16) < int(other, 16)
+        qdec = _v4_currency_info(w3, chain_id, other)["decimals"]
+    else:
+        if t0_chain not in (tl, other):
+            return None                     # pool ini bukan pasangan yang ditunjuk
+        tok_is_c0 = t0_chain == tl
+        qdec = token_info(w3, Web3.to_checksum_address(
+            other if other != V4_NATIVE.lower() else CHAINS[chain_id]["wrapped"]))["decimals"]
+    mdec = token_info(w3, Web3.to_checksum_address(token))["decimals"]
+    per = (raw if tok_is_c0 else 1 / raw) * 10 ** (mdec - qdec)
+    qsym = _quote_sym_of(chain_id, other)
+    qusd = quote_usd_price(w3, chain_id, qsym) if qsym else float(hint.get("quote_usd") or 0)
+    if per <= 0 or qusd <= 0:
+        return None
+    usd = per * qusd
+    gp = float(hint.get("price_usd") or 0)
+    if gp > 0 and max(usd / gp, gp / usd) > _MAIN_ORIENT_MAX:
+        return None
+    return {"usd": usd, "per": per, "quote_addr": other,
+            "quote_sym": qsym or str(hint.get("quote_symbol") or "?"),
+            "name": f"{hint.get('symbol') or '?'} / {hint.get('quote_symbol') or '?'}",
+            "vol": 0.0, "liq": float(hint.get("liquidity") or 0), "pool": pa, "ver": ver,
+            "src": "GMGN", "exchange": hint.get("exchange") or "",
+            "launchpad": hint.get("launchpad") or ""}
+
+
+def main_pool_price(chain_id: int, token: str, hint: dict | None = None) -> dict | None:
     """Harga token dari POOL UTAMA-nya — pool bervolume terbesar di GeckoTerminal,
     pasangan apa pun, TERMASUK pool launchpad ber-hook — dibaca ON-CHAIN.
 
@@ -6912,7 +7009,20 @@ def main_pool_price(chain_id: int, token: str) -> dict | None:
     mengonversinya ke USD butuh harga yang tidak bisa dibaca on-chain dengan pasti.
 
     None kalau tidak ada pool yang lolos. Dict: `usd`, `per` (harga dalam quote pool
-    itu), `quote_addr`, `quote_sym`, `name`, `vol`, `pool`, `ver`."""
+    itu), `quote_addr`, `quote_sym`, `name`, `vol`, `pool`, `ver`, `src`.
+
+    `hint` (dari GMGN, dioper `bot.py`) dicoba DULU: GMGN tahu launchpad dan pool
+    utama token segar yang belum diindeks GeckoTerminal. Pemilihan lewat volume
+    GeckoTerminal di bawah jadi cadangan."""
+    if hint:
+        try:
+            got = _main_from_hint(get_w3(chain_id), chain_id, token, hint)
+        except Exception:
+            got = None
+        if got:
+            return got
+        if hint.get("curve"):
+            return None          # masih di bonding curve: tidak ada pool DEX utama
     rows = _gecko_token_pools(chain_id, token)
     if not rows:
         return None
@@ -6996,16 +7106,19 @@ def main_pool_price(chain_id: int, token: str) -> dict | None:
             qusd = quote_usd_price(w3, chain_id, qsym)
             if qusd <= 0:
                 continue
+            dex = str((((rel.get("dex") or {}).get("data") or {}).get("id")) or "")
             return {"usd": per * qusd, "per": per, "quote_addr": other, "quote_sym": qsym,
                     "name": str(at.get("name") or ""), "vol": vol(row),
-                    "pool": ref, "ver": ver}
+                    "pool": ref, "ver": ver, "src": "GeckoTerminal", "exchange": dex,
+                    "launchpad": ""}
         except Exception:
             continue
     return None
 
 
 def token_anchor_price(chain_id: int, token: str, quote_sym: str | None = None,
-                       extra: list | None = None, fresh: bool = False, _cache={}) -> dict:
+                       extra: list | None = None, fresh: bool = False,
+                       hint: dict | None = None, _cache={}) -> dict:
     """Patokan harga yang TIDAK berasal dari pool sepasang yang sedang dinilai.
 
     Median pool sepasang saja tidak cukup, dan itu sudah merugikan: kartu pembuatan
@@ -7023,7 +7136,8 @@ def token_anchor_price(chain_id: int, token: str, quote_sym: str | None = None,
 
     {"usd", "per_quote", "srcs": [(nama, harga)], "deep", "deep_vol"}."""
     key = (chain_id, str(token).lower(), str(quote_sym or "").upper(),
-           tuple(sorted((str(n), round(float(v), 12)) for n, v in (extra or []) if v)))
+           tuple(sorted((str(n), round(float(v), 12)) for n, v in (extra or []) if v)),
+           str((hint or {}).get("pool_address") or "").lower())
     hit = _cache.get(key)
     if hit and not fresh and time.time() - hit[1] < 60:
         return hit[0]
@@ -7042,7 +7156,7 @@ def token_anchor_price(chain_id: int, token: str, quote_sym: str | None = None,
     # yang memuat fee hook (+12,7% pada XGAS.DEV) ke angka yang lalu jadi harga
     # awal pool.
     try:
-        main = main_pool_price(chain_id, token)
+        main = main_pool_price(chain_id, token, hint=hint)
     except Exception:
         main = None
     primary = "median"

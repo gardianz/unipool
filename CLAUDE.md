@@ -2967,6 +2967,52 @@ PONS itu sendiri (sqrtPrice persis), XGAS.DEV/USDG menyalin pool USDG 10% yang
 −1,55% dari pool utama, PONXWORK/USDG dihitung −0,00%. `stale_pool_state` ikut
 memakai patokan yang sama.
 
+### Pool utama & launchpad DITUNJUK GMGN, harganya tetap dibaca on-chain
+
+Memilih pool utama lewat volume terbesar GeckoTerminal gagal justru untuk token
+yang paling sering dipakai membuat pool: token segar. Terukur pada 30 token
+trending (Robinhood/Base/Arc/HyperEVM/BSC): pool bervolume terbesar GeckoTerminal
+cocok dengan pool utama GMGN cuma di **5** — **19 kosong** (belum diindeks) dan 3
+menunjuk pool lain. GMGN mengirim penandanya untuk hampir semua, sama dengan badge
+di UI mereka: `launchpad` (`pons_v2`, `bankr`, `longxyz`, `o1`, `argus`,
+`radardex`, `minara`, `motion_meme`, `altfun`, `flap`, `geniusfun`, …),
+`launchpad_status`, `migrated_pool`, dan `pool.{pool_address, exchange, token0_address,
+token1_address, quote_address, quote_reserve(_value), liquidity}`.
+
+`bot.gmgn_pool_hint()` merangkumnya dan dioper ke `ch.token_anchor_price(hint=…)`
+→ `main_pool_price(hint=…)` → `_main_from_hint()`. Hint dibaca di `bot.py` karena
+kunci GMGN tidak boleh lewat `ch._cf_request` (aturan yang sama dengan harga GMGN).
+
+**GMGN cuma MENUNJUK; harganya tetap dibaca dari kontrak** lewat `_pool_raw_price`:
+poolId v4 (StateView), pool gaya v3 (`slot0`, jatuh ke `globalState()` selector
+`0xe76c01e4` untuk fork Algebra seperti projectx/nest), pair v2 (`getReserves`).
+Orientasi v2/v3 dari `token0()` kontrak (dan pool yang token0-nya bukan pasangan
+yang ditunjuk DITOLAK), v4 dari aturan PoolKey — lalu dibuktikan terhadap harga
+GMGN dalam `_MAIN_ORIENT_MAX`. Terukur: **26 dari 30 lolos, semuanya dalam ±1,2%
+dari GMGN**, lintas v2/v3/v4/Algebra dan kelima chain.
+
+Tiga kasus khusus:
+
+- **Bonding curve** (`launchpad` ada, `launchpad_status != 1`, tanpa
+  `migrated_pool`): "pool"-nya kontrak kurva milik launchpad, tidak dibaca sama
+  sekali, dan jalur GeckoTerminal juga TIDAK dicoba — harga pasar jatuh ke median
+  sumber lain. Terukur 4 token (VIBE pons_v2, ATTENTION argus, HYPER altfun,
+  币安时代 flap). Kartu menyebutnya "MASIH di bonding curve (N%)".
+- **Quote non-tetap** (Agrippa/musebook, MEME/AMC, BLUECHIP/NVDAc, MAME/BNCB):
+  harga dalam quote tetap dari chain, dikonversi dengan valuasi GMGN untuk quote itu
+  (`quote_reserve_value / quote_reserve`). Tetap wajib dikonfirmasi sumber lain.
+- **Hint gagal** (terukur pPOLY, exchange `pPOLY/U`): jatuh ke pemilihan
+  GeckoTerminal lalu ke median — tidak pernah jadi error.
+
+`launch_line()` menaruh badge yang sama di daftar pool dan kartu pembuatan pool:
+*"🚀 Launchpad pons_v2 · sudah migrasi · pool utama XGAS.DEV/ETH (uniswap_v4,
+likuiditas $64.1k) — menurut GMGN"*. Di daftar pool itu penting: pool utama
+launchpad lazimnya ber-hook sehingga TIDAK ada di tabel, dan tanpa baris ini user
+tidak tahu venue mana yang sebenarnya menentukan harga.
+
+`gmgn_token()` men-cache `token_info` 120 detik dan dipakai bersama harga GMGN +
+hint + badge (satu request untuk ketiganya); kegagalannya TIDAK di-cache.
+
 ### Tanpa pool rujukan, harga awal DIHITUNG — bukan ditolak
 
 Aturan lama "harga awal disalin, tidak pernah ditebak" menolak pasangan yang tidak
